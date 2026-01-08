@@ -15,6 +15,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -56,12 +57,40 @@ func main() {
 		os.Exit(1)
 	}
 
+	exportCfg, err := loadExportConfig(*configPath)
+	if err != nil {
+		logger.Error("export_config_load_failed", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	exporter, err := newExporter(logger, exportCfg)
+	if err != nil {
+		logger.Error("export_init_failed", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	if exporter != nil {
+		defer exporter.Close()
+	}
+
+	incidentCfg, err := loadIncidentConfig(*configPath)
+	if err != nil {
+		logger.Error("incident_config_load_failed", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	incidentMgr, err := newIncidentManager(logger, incidentCfg)
+	if err != nil {
+		logger.Error("incident_init_failed", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	if incidentMgr != nil {
+		defer incidentMgr.Close()
+	}
+
 	rceCfg, err := loadRCEConfig(*configPath)
 	if err != nil {
 		logger.Error("rce_config_load_failed", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
-	rce := newRCE(logger, rceCfg)
+	rce := newRCE(logger, rceCfg, exporter, incidentMgr)
 
 	logger.Info("master_consumer_starting", slog.Any("config", cfg.Summary()))
 
@@ -189,7 +218,9 @@ func processMsg(logger *slog.Logger, msg *nats.Msg, lane string, stream string, 
 		slog.String("subject", msg.Subject),
 	)
 
-	emitNormalizedEvents(logger, msg.Subject, stream, jsSeq, lane, &batch, rce)
+	if err := emitNormalizedEvents(logger, msg.Subject, stream, jsSeq, lane, &batch, rce); err != nil {
+		return
+	}
 
 	if err := msg.Ack(); err != nil {
 		logger.Error("consume_ack_failed",
@@ -200,7 +231,7 @@ func processMsg(logger *slog.Logger, msg *nats.Msg, lane string, stream string, 
 	}
 }
 
-func emitNormalizedEvents(logger *slog.Logger, subject string, stream string, jsSeq *uint64, fallbackLane string, batch *pb.Batch, rce *RCE) {
+func emitNormalizedEvents(logger *slog.Logger, subject string, stream string, jsSeq *uint64, fallbackLane string, batch *pb.Batch, rce *RCE) error {
 	lane := deriveLane(batch.GetLane(), subject, fallbackLane)
 	seqStart := batch.GetSeqStart()
 	seqEnd := batch.GetSeqEnd()
@@ -214,6 +245,7 @@ func emitNormalizedEvents(logger *slog.Logger, subject string, stream string, js
 	}
 	eventCount := len(records)
 
+	var exportErr error
 	for i, record := range records {
 		observedAt := time.Now().UnixMilli()
 		rawHash := sha256.Sum256(record)
@@ -263,7 +295,7 @@ func emitNormalizedEvents(logger *slog.Logger, subject string, stream string, js
 		logger.LogAttrs(context.Background(), slog.LevelInfo, "normalized_event", fields...)
 
 		if rce != nil {
-			rce.Process(NormalizedRecord{
+			if err := rce.Process(NormalizedRecord{
 				Lane:              lane,
 				Subject:           subject,
 				Stream:            stream,
@@ -282,9 +314,12 @@ func emitNormalizedEvents(logger *slog.Logger, subject string, stream string, js
 				Fields:            jsonFields,
 				RawSHA256:         hex.EncodeToString(rawHash[:]),
 				SizeBytes:         len(record),
-			})
+			}); err != nil && exportErr == nil {
+				exportErr = err
+			}
 		}
 	}
+	return exportErr
 }
 
 func deriveLane(batchLane, subject, fallbackLane string) string {
@@ -434,6 +469,769 @@ func normalizeScalar(val any) (any, bool) {
 	return nil, false
 }
 
+type ExportConfig struct {
+	Enabled  bool
+	Path     string
+	Include  ExportIncludeConfig
+	Required bool
+	Flush    bool
+}
+
+type ExportIncludeConfig struct {
+	Alerts             bool
+	CorrelationMatches bool
+}
+
+type exportConfigRaw struct {
+	Enabled  bool             `yaml:"enabled"`
+	Path     string           `yaml:"path"`
+	Include  exportIncludeRaw `yaml:"include"`
+	Required *bool            `yaml:"required"`
+	Flush    *bool            `yaml:"flush"`
+}
+
+type exportIncludeRaw struct {
+	Alerts             *bool `yaml:"alerts"`
+	CorrelationMatches *bool `yaml:"correlation_matches"`
+}
+
+type Exporter struct {
+	logger *slog.Logger
+	cfg    ExportConfig
+	mu     sync.Mutex
+	file   *os.File
+}
+
+type ExportMeta struct {
+	Msg      string
+	RuleID   string
+	AlertKey string
+}
+
+const defaultExportPath = "exports/alerts.jsonl"
+
+func loadExportConfig(path string) (*ExportConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read config: %w", err)
+	}
+	var wrapper struct {
+		Export *exportConfigRaw `yaml:"export"`
+	}
+	if err := yaml.Unmarshal(data, &wrapper); err != nil {
+		return nil, fmt.Errorf("parse export config: %w", err)
+	}
+	if wrapper.Export == nil {
+		return nil, nil
+	}
+	cfg := resolveExportConfig(*wrapper.Export)
+	if !cfg.Enabled {
+		return nil, nil
+	}
+	return &cfg, nil
+}
+
+func resolveExportConfig(raw exportConfigRaw) ExportConfig {
+	cfg := ExportConfig{
+		Enabled:  raw.Enabled,
+		Path:     strings.TrimSpace(raw.Path),
+		Required: true,
+		Flush:    true,
+		Include: ExportIncludeConfig{
+			Alerts:             true,
+			CorrelationMatches: false,
+		},
+	}
+	if raw.Required != nil {
+		cfg.Required = *raw.Required
+	}
+	if raw.Flush != nil {
+		cfg.Flush = *raw.Flush
+	}
+	if raw.Include.Alerts != nil {
+		cfg.Include.Alerts = *raw.Include.Alerts
+	}
+	if raw.Include.CorrelationMatches != nil {
+		cfg.Include.CorrelationMatches = *raw.Include.CorrelationMatches
+	}
+	if cfg.Path == "" {
+		cfg.Path = defaultExportPath
+	}
+	return cfg
+}
+
+func newExporter(logger *slog.Logger, cfg *ExportConfig) (*Exporter, error) {
+	if cfg == nil || !cfg.Enabled {
+		return nil, nil
+	}
+	dir := filepath.Dir(cfg.Path)
+	if dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, fmt.Errorf("create export dir: %w", err)
+		}
+	}
+	file, err := os.OpenFile(cfg.Path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("open export file: %w", err)
+	}
+	return &Exporter{
+		logger: logger,
+		cfg:    *cfg,
+		file:   file,
+	}, nil
+}
+
+func (e *Exporter) Close() {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.file != nil {
+		_ = e.file.Close()
+		e.file = nil
+	}
+}
+
+func (e *Exporter) IncludeAlerts() bool {
+	return e != nil && e.cfg.Enabled && e.cfg.Include.Alerts
+}
+
+func (e *Exporter) IncludeCorrelationMatches() bool {
+	return e != nil && e.cfg.Enabled && e.cfg.Include.CorrelationMatches
+}
+
+func (e *Exporter) WriteJSONL(obj map[string]any, meta ExportMeta) error {
+	if e == nil || !e.cfg.Enabled {
+		return nil
+	}
+	payload, err := json.Marshal(obj)
+	if err != nil {
+		e.logError(err, meta)
+		if e.cfg.Required {
+			return err
+		}
+		return nil
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.file == nil {
+		err = fmt.Errorf("export file not available")
+		e.logError(err, meta)
+		if e.cfg.Required {
+			return err
+		}
+		return nil
+	}
+	if _, err := e.file.Write(append(payload, '\n')); err != nil {
+		e.logError(err, meta)
+		if e.cfg.Required {
+			return err
+		}
+		return nil
+	}
+	if e.cfg.Flush {
+		if err := e.file.Sync(); err != nil {
+			e.logError(err, meta)
+			if e.cfg.Required {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (e *Exporter) logError(err error, meta ExportMeta) {
+	attrs := []slog.Attr{
+		slog.String("path", e.cfg.Path),
+		slog.String("error", err.Error()),
+	}
+	if meta.Msg != "" {
+		attrs = append(attrs, slog.String("export_msg", meta.Msg))
+	}
+	if meta.RuleID != "" {
+		attrs = append(attrs, slog.String("rule_id", meta.RuleID))
+	}
+	if meta.AlertKey != "" {
+		attrs = append(attrs, slog.String("alert_key", meta.AlertKey))
+	}
+	e.logger.LogAttrs(context.Background(), slog.LevelError, "export_error", attrs...)
+}
+
+type IncidentConfig struct {
+	Enabled           bool
+	MaxOpenIncidents  int
+	InactivityTTLMS   int64
+	CleanupIntervalMS int64
+	RecentEvidenceMax int
+	Export            IncidentExportConfig
+}
+
+type IncidentExportConfig struct {
+	Enabled  bool
+	Required bool
+	Path     string
+	Flush    bool
+}
+
+type incidentConfigRaw struct {
+	Enabled           bool                 `yaml:"enabled"`
+	MaxOpenIncidents  int                  `yaml:"max_open_incidents"`
+	InactivityTTLMS   int64                `yaml:"inactivity_ttl_ms"`
+	CleanupIntervalMS int64                `yaml:"cleanup_interval_ms"`
+	RecentEvidenceMax int                  `yaml:"recent_evidence_max"`
+	Export            incidentExportConfig `yaml:"export"`
+}
+
+type incidentExportConfig struct {
+	Enabled  bool   `yaml:"enabled"`
+	Required *bool  `yaml:"required"`
+	Path     string `yaml:"path"`
+	Flush    *bool  `yaml:"flush"`
+}
+
+type IncidentManager struct {
+	logger  *slog.Logger
+	cfg     IncidentConfig
+	mu      sync.Mutex
+	state   map[string]*IncidentState
+	export  *IncidentExporter
+	closing chan struct{}
+}
+
+type IncidentState struct {
+	IncidentID        string
+	IncidentKey       string
+	RuleID            string
+	RuleKind          string
+	GroupBy           string
+	GroupKey          string
+	SeverityCurrent   string
+	OpenedAtUnixMs    int64
+	LastUpdatedUnixMs int64
+	AlertCountTotal   int
+	LastAlertKey      string
+	LastJSSeq         *uint64
+	LastSubject       string
+	LastLane          string
+	LastAgentID       string
+	RecentEvidence    []IncidentEvidence
+}
+
+type IncidentEvidence struct {
+	EmittedAtUnixMs          int64  `json:"emitted_at_unix_ms"`
+	AlertKey                 string `json:"alert_key"`
+	RawSHA256                string `json:"raw_sha256"`
+	CorrelationEvidenceCount int    `json:"correlation_evidence_count"`
+}
+
+type IncidentAlert struct {
+	RuleID                   string
+	RuleKind                 string
+	Severity                 string
+	GroupBy                  string
+	GroupKey                 string
+	AlertKey                 string
+	EmittedAtUnixMs          int64
+	CorrelationEvidenceCount int
+	RawSHA256                string
+	Lane                     string
+	Subject                  string
+	Stream                   string
+	Consumer                 string
+	NormalizedVersion        string
+	JSSeq                    *uint64
+	BatchKey                 string
+	AgentID                  string
+}
+
+type IncidentExporter struct {
+	logger *slog.Logger
+	cfg    IncidentExportConfig
+	mu     sync.Mutex
+	file   *os.File
+}
+
+func loadIncidentConfig(path string) (*IncidentConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read config: %w", err)
+	}
+	var wrapper struct {
+		Incidents *incidentConfigRaw `yaml:"incidents"`
+	}
+	if err := yaml.Unmarshal(data, &wrapper); err != nil {
+		return nil, fmt.Errorf("parse incidents config: %w", err)
+	}
+	if wrapper.Incidents == nil {
+		return nil, nil
+	}
+	cfg := resolveIncidentConfig(*wrapper.Incidents)
+	if !cfg.Enabled {
+		return nil, nil
+	}
+	return &cfg, nil
+}
+
+func resolveIncidentConfig(raw incidentConfigRaw) IncidentConfig {
+	cfg := IncidentConfig{
+		Enabled:           raw.Enabled,
+		MaxOpenIncidents:  raw.MaxOpenIncidents,
+		InactivityTTLMS:   raw.InactivityTTLMS,
+		CleanupIntervalMS: raw.CleanupIntervalMS,
+		RecentEvidenceMax: raw.RecentEvidenceMax,
+		Export: IncidentExportConfig{
+			Enabled:  raw.Export.Enabled,
+			Path:     strings.TrimSpace(raw.Export.Path),
+			Required: true,
+			Flush:    true,
+		},
+	}
+	if cfg.MaxOpenIncidents <= 0 {
+		cfg.MaxOpenIncidents = 50000
+	}
+	if cfg.InactivityTTLMS <= 0 {
+		cfg.InactivityTTLMS = 10 * 60 * 1000
+	}
+	if cfg.CleanupIntervalMS <= 0 {
+		cfg.CleanupIntervalMS = 5000
+	}
+	if cfg.RecentEvidenceMax <= 0 {
+		cfg.RecentEvidenceMax = 10
+	}
+	if raw.Export.Required != nil {
+		cfg.Export.Required = *raw.Export.Required
+	}
+	if raw.Export.Flush != nil {
+		cfg.Export.Flush = *raw.Export.Flush
+	}
+	if cfg.Export.Path == "" {
+		cfg.Export.Path = "exports/incidents.jsonl"
+	}
+	return cfg
+}
+
+func newIncidentManager(logger *slog.Logger, cfg *IncidentConfig) (*IncidentManager, error) {
+	if cfg == nil || !cfg.Enabled {
+		return nil, nil
+	}
+	var exporter *IncidentExporter
+	var err error
+	if cfg.Export.Enabled {
+		exporter, err = newIncidentExporter(logger, cfg.Export)
+		if err != nil {
+			return nil, err
+		}
+	}
+	manager := &IncidentManager{
+		logger:  logger,
+		cfg:     *cfg,
+		state:   make(map[string]*IncidentState),
+		export:  exporter,
+		closing: make(chan struct{}),
+	}
+	go manager.cleanupLoop()
+	return manager, nil
+}
+
+func (m *IncidentManager) Close() {
+	if m == nil {
+		return
+	}
+	close(m.closing)
+	if m.export != nil {
+		m.export.Close()
+	}
+}
+
+func (m *IncidentManager) cleanupLoop() {
+	ticker := time.NewTicker(time.Duration(m.cfg.CleanupIntervalMS) * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			m.cleanup()
+		case <-m.closing:
+			return
+		}
+	}
+}
+
+func (m *IncidentManager) cleanup() {
+	now := time.Now().UnixMilli()
+	var closed []*IncidentState
+	m.mu.Lock()
+	for key, state := range m.state {
+		if now-state.LastUpdatedUnixMs > m.cfg.InactivityTTLMS {
+			closed = append(closed, state)
+			delete(m.state, key)
+		}
+	}
+	m.mu.Unlock()
+
+	for _, state := range closed {
+		m.emitIncidentClosed(state, now)
+	}
+}
+
+func (m *IncidentManager) ProcessAlert(alert IncidentAlert) error {
+	if m == nil {
+		return nil
+	}
+	groupKey := alert.GroupKey
+	if groupKey == "" {
+		groupKey = "global"
+	}
+	incidentKey := fmt.Sprintf("inc.%s.%s", alert.RuleID, groupKey)
+	incidentID := incidentIDFromKey(incidentKey)
+	now := alert.EmittedAtUnixMs
+
+	m.mu.Lock()
+	state, exists := m.state[incidentKey]
+	if !exists {
+		if len(m.state) >= m.cfg.MaxOpenIncidents {
+			m.mu.Unlock()
+			m.emitIncidentDrop(alert, incidentKey)
+			return nil
+		}
+		state = &IncidentState{
+			IncidentID:        incidentID,
+			IncidentKey:       incidentKey,
+			RuleID:            alert.RuleID,
+			RuleKind:          alert.RuleKind,
+			GroupBy:           alert.GroupBy,
+			GroupKey:          alert.GroupKey,
+			SeverityCurrent:   alert.Severity,
+			OpenedAtUnixMs:    now,
+			LastUpdatedUnixMs: now,
+			AlertCountTotal:   1,
+			LastAlertKey:      alert.AlertKey,
+			LastJSSeq:         alert.JSSeq,
+			LastSubject:       alert.Subject,
+			LastLane:          alert.Lane,
+			LastAgentID:       alert.AgentID,
+			RecentEvidence:    nil,
+		}
+		state.RecentEvidence = appendIncidentEvidence(state.RecentEvidence, alert, m.cfg.RecentEvidenceMax)
+		m.state[incidentKey] = state
+		m.mu.Unlock()
+		return m.emitIncidentOpened(alert, state)
+	}
+
+	if severityRank(alert.Severity) > severityRank(state.SeverityCurrent) {
+		state.SeverityCurrent = alert.Severity
+	}
+	state.LastUpdatedUnixMs = now
+	state.AlertCountTotal++
+	state.LastAlertKey = alert.AlertKey
+	state.LastJSSeq = alert.JSSeq
+	state.LastSubject = alert.Subject
+	state.LastLane = alert.Lane
+	state.LastAgentID = alert.AgentID
+	state.RecentEvidence = appendIncidentEvidence(state.RecentEvidence, alert, m.cfg.RecentEvidenceMax)
+	m.mu.Unlock()
+	return m.emitIncidentUpdated(alert, state)
+}
+
+func appendIncidentEvidence(existing []IncidentEvidence, alert IncidentAlert, max int) []IncidentEvidence {
+	entry := IncidentEvidence{
+		EmittedAtUnixMs:          alert.EmittedAtUnixMs,
+		AlertKey:                 alert.AlertKey,
+		RawSHA256:                alert.RawSHA256,
+		CorrelationEvidenceCount: alert.CorrelationEvidenceCount,
+	}
+	existing = append(existing, entry)
+	if max > 0 && len(existing) > max {
+		return append([]IncidentEvidence(nil), existing[len(existing)-max:]...)
+	}
+	return existing
+}
+
+func (m *IncidentManager) emitIncidentOpened(alert IncidentAlert, state *IncidentState) error {
+	attrs := m.incidentBaseAttrs(alert, state)
+	attrs = append(attrs,
+		slog.String("severity_current", state.SeverityCurrent),
+		slog.Int64("opened_at_unix_ms", state.OpenedAtUnixMs),
+		slog.Int64("last_updated_at_unix_ms", state.LastUpdatedUnixMs),
+		slog.String("first_alert_key", state.LastAlertKey),
+	)
+	m.logger.LogAttrs(context.Background(), slog.LevelInfo, "incident_opened", attrs...)
+
+	if m.export != nil && m.export.cfg.Enabled {
+		obj := m.incidentOpenedObject(alert, state)
+		if err := m.export.WriteJSONL(obj, ExportMeta{
+			Msg:      "incident_opened",
+			RuleID:   state.RuleID,
+			AlertKey: state.LastAlertKey,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *IncidentManager) emitIncidentUpdated(alert IncidentAlert, state *IncidentState) error {
+	attrs := m.incidentBaseAttrs(alert, state)
+	attrs = append(attrs,
+		slog.String("severity_current", state.SeverityCurrent),
+		slog.Int64("opened_at_unix_ms", state.OpenedAtUnixMs),
+		slog.Int64("last_updated_at_unix_ms", state.LastUpdatedUnixMs),
+		slog.Int("alert_count_total", state.AlertCountTotal),
+		slog.String("last_alert_key", state.LastAlertKey),
+		slog.Any("recent_evidence", state.RecentEvidence),
+	)
+	m.logger.LogAttrs(context.Background(), slog.LevelInfo, "incident_updated", attrs...)
+
+	if m.export != nil && m.export.cfg.Enabled {
+		obj := m.incidentUpdatedObject(alert, state)
+		if err := m.export.WriteJSONL(obj, ExportMeta{
+			Msg:      "incident_updated",
+			RuleID:   state.RuleID,
+			AlertKey: state.LastAlertKey,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *IncidentManager) emitIncidentClosed(state *IncidentState, now int64) {
+	duration := now - state.OpenedAtUnixMs
+	attrs := []slog.Attr{
+		slog.String("incident_id", state.IncidentID),
+		slog.String("incident_key", state.IncidentKey),
+		slog.String("rule_id", state.RuleID),
+		slog.String("rule_kind", state.RuleKind),
+		slog.String("severity_current", state.SeverityCurrent),
+		slog.Int64("opened_at_unix_ms", state.OpenedAtUnixMs),
+		slog.Int64("closed_at_unix_ms", now),
+		slog.Int64("duration_ms", duration),
+		slog.Int("alert_count_total", state.AlertCountTotal),
+	}
+	if state.GroupBy != "" && state.GroupKey != "" {
+		attrs = append(attrs, slog.String("group_by", state.GroupBy), slog.String("group_key", state.GroupKey))
+	}
+	m.logger.LogAttrs(context.Background(), slog.LevelInfo, "incident_closed", attrs...)
+
+	if m.export != nil && m.export.cfg.Enabled {
+		obj := map[string]any{
+			"msg":               "incident_closed",
+			"incident_id":       state.IncidentID,
+			"incident_key":      state.IncidentKey,
+			"rule_id":           state.RuleID,
+			"rule_kind":         state.RuleKind,
+			"severity_current":  state.SeverityCurrent,
+			"opened_at_unix_ms": state.OpenedAtUnixMs,
+			"closed_at_unix_ms": now,
+			"duration_ms":       duration,
+			"alert_count_total": state.AlertCountTotal,
+		}
+		if state.GroupBy != "" && state.GroupKey != "" {
+			obj["group_by"] = state.GroupBy
+			obj["group_key"] = state.GroupKey
+		}
+		_ = m.export.WriteJSONL(obj, ExportMeta{
+			Msg:    "incident_closed",
+			RuleID: state.RuleID,
+		})
+	}
+}
+
+func (m *IncidentManager) emitIncidentDrop(alert IncidentAlert, incidentKey string) {
+	attrs := []slog.Attr{
+		slog.String("incident_key", incidentKey),
+		slog.String("rule_id", alert.RuleID),
+		slog.String("alert_key", alert.AlertKey),
+		slog.String("reason", "max_open_incidents"),
+		slog.Int64("observed_at_unix_ms", alert.EmittedAtUnixMs),
+	}
+	if alert.GroupKey != "" {
+		attrs = append(attrs, slog.String("group_key", alert.GroupKey))
+	}
+	m.logger.LogAttrs(context.Background(), slog.LevelWarn, "incident_drop", attrs...)
+}
+
+func (m *IncidentManager) incidentBaseAttrs(alert IncidentAlert, state *IncidentState) []slog.Attr {
+	attrs := []slog.Attr{
+		slog.String("incident_id", state.IncidentID),
+		slog.String("incident_key", state.IncidentKey),
+		slog.String("rule_id", state.RuleID),
+		slog.String("rule_kind", state.RuleKind),
+		slog.String("lane", alert.Lane),
+		slog.String("subject", alert.Subject),
+		slog.String("stream", alert.Stream),
+		slog.String("consumer", alert.Consumer),
+		slog.String("normalized_version", alert.NormalizedVersion),
+		slog.String("batch_key", alert.BatchKey),
+	}
+	if alert.JSSeq != nil {
+		attrs = append(attrs, slog.Uint64("js_seq", *alert.JSSeq))
+	}
+	if alert.AgentID != "" {
+		attrs = append(attrs, slog.String("agent_id", alert.AgentID))
+	}
+	if state.GroupBy != "" && state.GroupKey != "" {
+		attrs = append(attrs, slog.String("group_by", state.GroupBy), slog.String("group_key", state.GroupKey))
+	}
+	return attrs
+}
+
+func (m *IncidentManager) incidentOpenedObject(alert IncidentAlert, state *IncidentState) map[string]any {
+	obj := map[string]any{
+		"msg":                     "incident_opened",
+		"incident_id":             state.IncidentID,
+		"incident_key":            state.IncidentKey,
+		"rule_id":                 state.RuleID,
+		"rule_kind":               state.RuleKind,
+		"severity_current":        state.SeverityCurrent,
+		"opened_at_unix_ms":       state.OpenedAtUnixMs,
+		"last_updated_at_unix_ms": state.LastUpdatedUnixMs,
+		"first_alert_key":         state.LastAlertKey,
+		"lane":                    alert.Lane,
+		"subject":                 alert.Subject,
+		"stream":                  alert.Stream,
+		"consumer":                alert.Consumer,
+		"normalized_version":      alert.NormalizedVersion,
+		"batch_key":               alert.BatchKey,
+	}
+	if alert.JSSeq != nil {
+		obj["js_seq"] = *alert.JSSeq
+	}
+	if alert.AgentID != "" {
+		obj["agent_id"] = alert.AgentID
+	}
+	if state.GroupBy != "" && state.GroupKey != "" {
+		obj["group_by"] = state.GroupBy
+		obj["group_key"] = state.GroupKey
+	}
+	return obj
+}
+
+func (m *IncidentManager) incidentUpdatedObject(alert IncidentAlert, state *IncidentState) map[string]any {
+	obj := map[string]any{
+		"msg":                     "incident_updated",
+		"incident_id":             state.IncidentID,
+		"incident_key":            state.IncidentKey,
+		"rule_id":                 state.RuleID,
+		"rule_kind":               state.RuleKind,
+		"severity_current":        state.SeverityCurrent,
+		"opened_at_unix_ms":       state.OpenedAtUnixMs,
+		"last_updated_at_unix_ms": state.LastUpdatedUnixMs,
+		"alert_count_total":       state.AlertCountTotal,
+		"last_alert_key":          state.LastAlertKey,
+		"recent_evidence":         state.RecentEvidence,
+		"lane":                    alert.Lane,
+		"subject":                 alert.Subject,
+		"stream":                  alert.Stream,
+		"consumer":                alert.Consumer,
+		"normalized_version":      alert.NormalizedVersion,
+		"batch_key":               alert.BatchKey,
+	}
+	if alert.JSSeq != nil {
+		obj["js_seq"] = *alert.JSSeq
+	}
+	if alert.AgentID != "" {
+		obj["agent_id"] = alert.AgentID
+	}
+	if state.GroupBy != "" && state.GroupKey != "" {
+		obj["group_by"] = state.GroupBy
+		obj["group_key"] = state.GroupKey
+	}
+	return obj
+}
+
+func incidentIDFromKey(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:])[:16]
+}
+
+func newIncidentExporter(logger *slog.Logger, cfg IncidentExportConfig) (*IncidentExporter, error) {
+	dir := filepath.Dir(cfg.Path)
+	if dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, fmt.Errorf("create incidents export dir: %w", err)
+		}
+	}
+	file, err := os.OpenFile(cfg.Path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("open incidents export file: %w", err)
+	}
+	return &IncidentExporter{
+		logger: logger,
+		cfg:    cfg,
+		file:   file,
+	}, nil
+}
+
+func (e *IncidentExporter) Close() {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.file != nil {
+		_ = e.file.Close()
+		e.file = nil
+	}
+}
+
+func (e *IncidentExporter) WriteJSONL(obj map[string]any, meta ExportMeta) error {
+	if e == nil || !e.cfg.Enabled {
+		return nil
+	}
+	payload, err := json.Marshal(obj)
+	if err != nil {
+		e.logError(err, meta)
+		if e.cfg.Required {
+			return err
+		}
+		return nil
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.file == nil {
+		err = fmt.Errorf("incident export file not available")
+		e.logError(err, meta)
+		if e.cfg.Required {
+			return err
+		}
+		return nil
+	}
+	if _, err := e.file.Write(append(payload, '\n')); err != nil {
+		e.logError(err, meta)
+		if e.cfg.Required {
+			return err
+		}
+		return nil
+	}
+	if e.cfg.Flush {
+		if err := e.file.Sync(); err != nil {
+			e.logError(err, meta)
+			if e.cfg.Required {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (e *IncidentExporter) logError(err error, meta ExportMeta) {
+	attrs := []slog.Attr{
+		slog.String("path", e.cfg.Path),
+		slog.String("error", err.Error()),
+	}
+	if meta.Msg != "" {
+		attrs = append(attrs, slog.String("export_msg", meta.Msg))
+	}
+	if meta.RuleID != "" {
+		attrs = append(attrs, slog.String("rule_id", meta.RuleID))
+	}
+	if meta.AlertKey != "" {
+		attrs = append(attrs, slog.String("alert_key", meta.AlertKey))
+	}
+	e.logger.LogAttrs(context.Background(), slog.LevelError, "export_error", attrs...)
+}
+
 type RCEConfig struct {
 	Enabled     bool                 `yaml:"enabled"`
 	Dispatch    RCEDispatchConfig    `yaml:"dispatch"`
@@ -506,15 +1304,18 @@ type NormalizedRecord struct {
 type rceWork struct {
 	record NormalizedRecord
 	done   chan struct{}
+	err    error
 }
 
 type RCE struct {
 	logger      *slog.Logger
 	cfg         RCEConfig
-	queue       chan rceWork
+	queue       chan *rceWork
 	mu          sync.Mutex
 	state       map[string]*ruleState
 	suppression map[string]int64
+	exporter    *Exporter
+	incidents   *IncidentManager
 }
 
 type ruleState struct {
@@ -610,34 +1411,38 @@ func applyRCEDefaults(cfg *RCEConfig) {
 	}
 }
 
-func newRCE(logger *slog.Logger, cfg *RCEConfig) *RCE {
+func newRCE(logger *slog.Logger, cfg *RCEConfig, exporter *Exporter, incidents *IncidentManager) *RCE {
 	if cfg == nil {
 		return nil
 	}
 	r := &RCE{
 		logger:      logger,
 		cfg:         *cfg,
-		queue:       make(chan rceWork, cfg.Dispatch.MaxQueue),
+		queue:       make(chan *rceWork, cfg.Dispatch.MaxQueue),
 		state:       make(map[string]*ruleState),
 		suppression: make(map[string]int64),
+		exporter:    exporter,
+		incidents:   incidents,
 	}
 	go r.worker()
 	go r.cleanupLoop()
 	return r
 }
 
-func (r *RCE) Process(record NormalizedRecord) {
+func (r *RCE) Process(record NormalizedRecord) error {
 	if r == nil {
-		return
+		return nil
 	}
 	done := make(chan struct{})
-	r.queue <- rceWork{record: record, done: done}
+	work := &rceWork{record: record, done: done}
+	r.queue <- work
 	<-done
+	return work.err
 }
 
 func (r *RCE) worker() {
 	for work := range r.queue {
-		r.processRecord(work.record)
+		work.err = r.processRecord(work.record)
 		close(work.done)
 	}
 }
@@ -683,13 +1488,13 @@ func (r *RCE) cleanup() {
 	}
 }
 
-func (r *RCE) processRecord(rec NormalizedRecord) {
+func (r *RCE) processRecord(rec NormalizedRecord) error {
 	if r.cfg.Guardrails.MaxEventSizeBytes > 0 && rec.SizeBytes > r.cfg.Guardrails.MaxEventSizeBytes {
-		return
+		return nil
 	}
 	if rec.TsUnixMs != nil && r.cfg.Guardrails.MaxClockSkewMs > 0 {
 		if absInt64(time.Now().UnixMilli()-*rec.TsUnixMs) > r.cfg.Guardrails.MaxClockSkewMs {
-			return
+			return nil
 		}
 	}
 
@@ -702,22 +1507,31 @@ func (r *RCE) processRecord(rec NormalizedRecord) {
 		case "stateless":
 			if r.matchWhen(rule.When, rec) {
 				r.emitRuleMatch(rule, rec, r.groupKey(rule.GroupBy, rec))
-				r.emitAlert(rule, rec, r.groupKey(rule.GroupBy, rec), "stateless", nil)
+				if err := r.emitAlert(rule, rec, r.groupKey(rule.GroupBy, rec), "stateless", nil); err != nil {
+					return err
+				}
 			}
 		case "count":
-			r.evalCount(rule, rec)
+			if err := r.evalCount(rule, rec); err != nil {
+				return err
+			}
 		case "sequence":
 			if degraded {
 				continue
 			}
-			r.evalSequence(rule, rec)
+			if err := r.evalSequence(rule, rec); err != nil {
+				return err
+			}
 		case "join":
 			if degraded {
 				continue
 			}
-			r.evalJoin(rule, rec)
+			if err := r.evalJoin(rule, rec); err != nil {
+				return err
+			}
 		}
 	}
+	return nil
 }
 
 func (r *RCE) isDegraded() bool {
@@ -828,13 +1642,13 @@ func stringField(fields map[string]any, key string) string {
 	return strVal
 }
 
-func (r *RCE) evalCount(rule RCERule, rec NormalizedRecord) {
+func (r *RCE) evalCount(rule RCERule, rec NormalizedRecord) error {
 	if !r.matchWhen(rule.When, rec) {
-		return
+		return nil
 	}
 	groupKey := r.groupKey(rule.GroupBy, rec)
 	if groupKey == "" {
-		return
+		return nil
 	}
 	eventTs := rec.ObservedAt
 	if rec.TsUnixMs != nil {
@@ -850,14 +1664,14 @@ func (r *RCE) evalCount(rule RCERule, rec NormalizedRecord) {
 	state := r.ruleState(rule.ID, "count")
 	if state == nil {
 		r.mu.Unlock()
-		return
+		return nil
 	}
 	st, exists := state.count[groupKey]
 	if !exists {
 		if len(state.count) >= r.cfg.State.MaxKeysPerRule {
 			r.mu.Unlock()
 			r.emitDropState(rule.ID)
-			return
+			return nil
 		}
 		st = &countState{}
 		state.count[groupKey] = st
@@ -877,18 +1691,23 @@ func (r *RCE) evalCount(rule RCERule, rec NormalizedRecord) {
 	r.mu.Unlock()
 
 	if match {
-		r.emitCorrelationMatch(rule, rec, groupKey, matchCount, firstSeen, lastSeen, hashes, rule.Threshold, nil, nil)
-		r.emitAlert(rule, rec, groupKey, "count", hashes)
+		if err := r.emitCorrelationMatch(rule, rec, groupKey, matchCount, firstSeen, lastSeen, hashes, rule.Threshold, nil, nil); err != nil {
+			return err
+		}
+		if err := r.emitAlert(rule, rec, groupKey, "count", hashes); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
-func (r *RCE) evalSequence(rule RCERule, rec NormalizedRecord) {
+func (r *RCE) evalSequence(rule RCERule, rec NormalizedRecord) error {
 	if len(rule.Steps) == 0 {
-		return
+		return nil
 	}
 	groupKey := r.groupKey(rule.GroupBy, rec)
 	if groupKey == "" {
-		return
+		return nil
 	}
 	eventTs := rec.ObservedAt
 	if rec.TsUnixMs != nil {
@@ -903,14 +1722,14 @@ func (r *RCE) evalSequence(rule RCERule, rec NormalizedRecord) {
 	state := r.ruleState(rule.ID, "sequence")
 	if state == nil {
 		r.mu.Unlock()
-		return
+		return nil
 	}
 	st, exists := state.seq[groupKey]
 	if !exists {
 		if len(state.seq) >= r.cfg.State.MaxKeysPerRule {
 			r.mu.Unlock()
 			r.emitDropState(rule.ID)
-			return
+			return nil
 		}
 		st = &sequenceState{step: 0}
 		state.seq[groupKey] = st
@@ -941,18 +1760,23 @@ func (r *RCE) evalSequence(rule RCERule, rec NormalizedRecord) {
 	r.mu.Unlock()
 
 	if match {
-		r.emitCorrelationMatch(rule, rec, groupKey, len(rule.Steps), firstSeen, lastSeen, hashes, 0, rule.Steps, nil)
-		r.emitAlert(rule, rec, groupKey, "sequence", hashes)
+		if err := r.emitCorrelationMatch(rule, rec, groupKey, len(rule.Steps), firstSeen, lastSeen, hashes, 0, rule.Steps, nil); err != nil {
+			return err
+		}
+		if err := r.emitAlert(rule, rec, groupKey, "sequence", hashes); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
-func (r *RCE) evalJoin(rule RCERule, rec NormalizedRecord) {
+func (r *RCE) evalJoin(rule RCERule, rec NormalizedRecord) error {
 	if len(rule.Predicates) == 0 {
-		return
+		return nil
 	}
 	groupKey := r.groupKey(rule.GroupBy, rec)
 	if groupKey == "" {
-		return
+		return nil
 	}
 	eventTs := rec.ObservedAt
 	if rec.TsUnixMs != nil {
@@ -967,7 +1791,7 @@ func (r *RCE) evalJoin(rule RCERule, rec NormalizedRecord) {
 	state := r.ruleState(rule.ID, "join")
 	if state == nil {
 		r.mu.Unlock()
-		return
+		return nil
 	}
 	st, exists := state.join[groupKey]
 	satisfied := map[int]predicateMatch{}
@@ -986,7 +1810,7 @@ func (r *RCE) evalJoin(rule RCERule, rec NormalizedRecord) {
 			if len(state.join) >= r.cfg.State.MaxKeysPerRule {
 				r.mu.Unlock()
 				r.emitDropState(rule.ID)
-				return
+				return nil
 			}
 			st = &joinState{satisfied: make(map[int]predicateMatch)}
 			state.join[groupKey] = st
@@ -1009,9 +1833,14 @@ func (r *RCE) evalJoin(rule RCERule, rec NormalizedRecord) {
 	r.mu.Unlock()
 
 	if match {
-		r.emitCorrelationMatch(rule, rec, groupKey, len(rule.Predicates), firstSeen, lastSeen, hashes, 0, nil, rule.Predicates)
-		r.emitAlert(rule, rec, groupKey, "join", hashes)
+		if err := r.emitCorrelationMatch(rule, rec, groupKey, len(rule.Predicates), firstSeen, lastSeen, hashes, 0, nil, rule.Predicates); err != nil {
+			return err
+		}
+		if err := r.emitAlert(rule, rec, groupKey, "join", hashes); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 func (r *RCE) ruleState(ruleID, kind string) *ruleState {
@@ -1043,7 +1872,7 @@ func (r *RCE) emitRuleMatch(rule RCERule, rec NormalizedRecord, correlationKey s
 	r.logger.LogAttrs(context.Background(), slog.LevelInfo, "rule_match", attrs...)
 }
 
-func (r *RCE) emitCorrelationMatch(rule RCERule, rec NormalizedRecord, groupKey string, matchCount int, firstSeen int64, lastSeen int64, hashes []string, threshold int, steps []RCEWhen, predicates []RCEWhen) {
+func (r *RCE) emitCorrelationMatch(rule RCERule, rec NormalizedRecord, groupKey string, matchCount int, firstSeen int64, lastSeen int64, hashes []string, threshold int, steps []RCEWhen, predicates []RCEWhen) error {
 	attrs := r.baseAttrs(rec)
 	attrs = append(attrs,
 		slog.String("rule_id", rule.ID),
@@ -1068,9 +1897,20 @@ func (r *RCE) emitCorrelationMatch(rule RCERule, rec NormalizedRecord, groupKey 
 		attrs = append(attrs, slog.Any("predicates", predicates))
 	}
 	r.logger.LogAttrs(context.Background(), slog.LevelInfo, "correlation_match", attrs...)
+
+	if r.exporter != nil && r.exporter.IncludeCorrelationMatches() {
+		obj := r.correlationMatchObject(rule, rec, groupKey, matchCount, firstSeen, lastSeen, hashes, threshold, steps, predicates)
+		if err := r.exporter.WriteJSONL(obj, ExportMeta{
+			Msg:    "correlation_match",
+			RuleID: rule.ID,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-func (r *RCE) emitAlert(rule RCERule, rec NormalizedRecord, groupKey string, ruleKind string, correlationHashes []string) {
+func (r *RCE) emitAlert(rule RCERule, rec NormalizedRecord, groupKey string, ruleKind string, correlationHashes []string) error {
 	now := rec.ObservedAt
 	cooldown := rule.CooldownMs
 	if cooldown <= 0 {
@@ -1107,7 +1947,7 @@ func (r *RCE) emitAlert(rule RCERule, rec NormalizedRecord, groupKey string, rul
 			attrs = append(attrs, slog.String("group_by", rule.GroupBy), slog.String("group_key", groupKey))
 		}
 		r.logger.LogAttrs(context.Background(), slog.LevelInfo, "alert_suppressed", attrs...)
-		return
+		return nil
 	}
 	r.suppression[alertKey] = nextAllowed
 	r.mu.Unlock()
@@ -1132,6 +1972,42 @@ func (r *RCE) emitAlert(rule RCERule, rec NormalizedRecord, groupKey string, rul
 		attrs = append(attrs, slog.String("group_by", rule.GroupBy), slog.String("group_key", groupKey))
 	}
 	r.logger.LogAttrs(context.Background(), slog.LevelInfo, "alert", attrs...)
+
+	if r.exporter != nil && r.exporter.IncludeAlerts() {
+		obj := r.alertObject(rule, rec, groupKey, ruleKind, alertKey, cooldown, correlationHashes)
+		if err := r.exporter.WriteJSONL(obj, ExportMeta{
+			Msg:      "alert",
+			RuleID:   rule.ID,
+			AlertKey: alertKey,
+		}); err != nil {
+			return err
+		}
+	}
+	if r.incidents != nil {
+		incidentAlert := IncidentAlert{
+			RuleID:                   rule.ID,
+			RuleKind:                 ruleKind,
+			Severity:                 rule.Severity,
+			GroupBy:                  rule.GroupBy,
+			GroupKey:                 groupKey,
+			AlertKey:                 alertKey,
+			EmittedAtUnixMs:          now,
+			CorrelationEvidenceCount: len(correlationHashes),
+			RawSHA256:                rec.RawSHA256,
+			Lane:                     rec.Lane,
+			Subject:                  rec.Subject,
+			Stream:                   rec.Stream,
+			Consumer:                 rec.Consumer,
+			NormalizedVersion:        rec.NormalizedVersion,
+			JSSeq:                    rec.JSSeq,
+			BatchKey:                 rec.BatchKey,
+			AgentID:                  rec.AgentID,
+		}
+		if err := r.incidents.ProcessAlert(incidentAlert); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (r *RCE) emitDropState(ruleID string) {
@@ -1180,6 +2056,93 @@ func (r *RCE) baseAlertAttrs(rec NormalizedRecord) []slog.Attr {
 		attrs = append(attrs, slog.String("agent_id", rec.AgentID))
 	}
 	return attrs
+}
+
+func (r *RCE) baseExportMap(rec NormalizedRecord) map[string]any {
+	obj := map[string]any{
+		"lane":               rec.Lane,
+		"subject":            rec.Subject,
+		"stream":             rec.Stream,
+		"consumer":           rec.Consumer,
+		"normalized_version": rec.NormalizedVersion,
+		"batch_key":          rec.BatchKey,
+		"seq_start":          rec.SeqStart,
+		"seq_end":            rec.SeqEnd,
+		"event_index":        rec.EventIndex,
+		"event_count":        rec.EventCount,
+	}
+	if rec.JSSeq != nil {
+		obj["js_seq"] = *rec.JSSeq
+	}
+	if rec.AgentID != "" {
+		obj["agent_id"] = rec.AgentID
+	}
+	return obj
+}
+
+func (r *RCE) baseAlertExportMap(rec NormalizedRecord) map[string]any {
+	obj := map[string]any{
+		"lane":               rec.Lane,
+		"subject":            rec.Subject,
+		"stream":             rec.Stream,
+		"consumer":           rec.Consumer,
+		"normalized_version": rec.NormalizedVersion,
+		"batch_key":          rec.BatchKey,
+	}
+	if rec.JSSeq != nil {
+		obj["js_seq"] = *rec.JSSeq
+	}
+	if rec.AgentID != "" {
+		obj["agent_id"] = rec.AgentID
+	}
+	return obj
+}
+
+func (r *RCE) correlationMatchObject(rule RCERule, rec NormalizedRecord, groupKey string, matchCount int, firstSeen int64, lastSeen int64, hashes []string, threshold int, steps []RCEWhen, predicates []RCEWhen) map[string]any {
+	obj := r.baseExportMap(rec)
+	obj["msg"] = "correlation_match"
+	obj["rule_id"] = rule.ID
+	obj["rule_kind"] = rule.Kind
+	obj["severity"] = rule.Severity
+	obj["group_by"] = rule.GroupBy
+	obj["group_key"] = groupKey
+	obj["window_ms"] = rule.WindowMs
+	obj["match_count"] = matchCount
+	obj["first_seen"] = firstSeen
+	obj["last_seen"] = lastSeen
+	obj["observed_at_unix_ms"] = rec.ObservedAt
+	obj["evidence"] = map[string]any{"raw_sha256": hashes}
+	if threshold > 0 {
+		obj["threshold"] = threshold
+	}
+	if steps != nil {
+		obj["steps"] = steps
+	}
+	if predicates != nil {
+		obj["predicates"] = predicates
+	}
+	return obj
+}
+
+func (r *RCE) alertObject(rule RCERule, rec NormalizedRecord, groupKey string, ruleKind string, alertKey string, cooldown int64, correlationHashes []string) map[string]any {
+	obj := r.baseAlertExportMap(rec)
+	obj["msg"] = "alert"
+	obj["alert_key"] = alertKey
+	obj["rule_id"] = rule.ID
+	obj["rule_kind"] = ruleKind
+	obj["severity"] = rule.Severity
+	obj["cooldown_ms"] = cooldown
+	obj["emitted_at_unix_ms"] = rec.ObservedAt
+	obj["evidence"] = r.alertEvidence(rec)
+	if ruleKind != "stateless" && len(correlationHashes) > 0 {
+		obj["correlation_evidence"] = map[string]any{"raw_sha256": correlationHashes}
+		obj["correlation_evidence_count"] = len(correlationHashes)
+	}
+	if groupKey != "" {
+		obj["group_by"] = rule.GroupBy
+		obj["group_key"] = groupKey
+	}
+	return obj
 }
 
 func (r *RCE) evidence(rec NormalizedRecord) map[string]any {

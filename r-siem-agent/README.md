@@ -53,94 +53,47 @@ Then set `transport.mode: grpc_mtls` in `configs/agent.yaml` and run the agent:
 go run ./cmd/agent --config configs/agent.yaml
 ```
 
-## Master (JetStream boundary)
+## Overview
 
-Master ingest publishes `Batch` messages into NATS JetStream stream `RSIEM` on subjects `rsiem.fast` and `rsiem.standard`, with idempotency enforced via a KV store to prevent duplicate republish.
+This repo supports a local end-to-end flow: master ingest publishes batches into JetStream, `cmd/master-consume` normalizes and evaluates RCE rules/correlations, and optional exports/incident logs provide audit trails.
 
-Start NATS locally with JetStream enabled:
+## Prerequisites
 
-```
-docker run --rm -p 4222:4222 -p 8222:8222 nats:2.10 -js
-```
+- Go 1.22+ (set `GOTOOLCHAIN=go1.24.11` for local runs)
+- Docker for local NATS JetStream
 
-Run the master service (uses configs/certs for mTLS):
+## Config (master.yaml blocks)
 
-```
-go run ./cmd/master --config configs/master.yaml
-```
+Alert export (JSONL):
 
-Run the JetStream consumer (FAST and STANDARD workers):
-
-```
-go run ./cmd/master-consume --config configs/master.yaml
-```
-
-Run the smoke client to send three batches and print ACKs:
-
-```
-go run ./cmd/master-smoke \
-  --addr 127.0.0.1:7777 \
-  --ca configs/certs/ca.pem \
-  --cert configs/certs/agent.pem \
-  --key configs/certs/agent-key.pem \
-  --server-name master.local
+```yaml
+export:
+  enabled: true
+  path: "exports/alerts.jsonl"
+  include:
+    alerts: true
+    correlation_matches: false
+  required: true
+  flush: true
 ```
 
-Expected master logs include `master_starting`, `config_summary`, `jetstream_stream_ready`, `master_listening`, `master_recv_batch`, and `master_send_ack` for each batch.
+Incidents (log-only + optional incidents JSONL):
 
-Inspect stream contents (optional helper):
-
-```
-go run ./cmd/master-inspect --count 10
-```
-
-Acceptance check: run the smoke client twice; the second run should log `duplicate_batch` on the master and return the same `js_seq` values. The consumer should only log batches from the first run, and `master-inspect` should show the stream length unchanged after the duplicate run.
-
-## Aggregator v0 (cmd/master-consume)
-
-`cmd/master-consume` is the Aggregator v0 worker. It consumes from JetStream subjects `rsiem.fast` and `rsiem.standard` using durable consumers. FAST is protected via separate workers and reserved concurrency. For each consumed message it:
-
-- Decodes the `Batch`
-- Logs `master_consume_batch`
-- Emits `normalized_event` JSON log line(s)
-- ACKs the JetStream message after `normalized_event` emission
-
-Because master ingest enforces idempotency via KV, duplicates are not republished, so repeated smoke runs do not yield new consumer messages.
-
-## normalized_event schema (v0)
-
-Top-level fields:
-
-- msg: `normalized_event`
-- normalized_version: `v0`
-- stream: `RSIEM`
-- consumer: `master-consume`
-- lane: `FAST` | `STANDARD`
-- subject: `rsiem.fast` | `rsiem.standard`
-- js_seq: JetStream stream sequence (present when metadata is available; omitted if metadata unavailable)
-- batch_key: `batch.<LANE>.<SEQ_START>.<SEQ_END>`
-- seq_start: uint64
-- seq_end: uint64
-- event_index: int
-- event_count: int
-- agent_id: string (best-effort from batch metadata)
-- observed_at_unix_ms: int64
-
-Normalized object:
-
-- type: `unknown`
-- raw_sha256: hex sha256 of raw record bytes
-- size_bytes: int
-- preview: optional <= 200 chars, only when payload is valid UTF-8 and mostly printable
-- ts_unix_ms: optional (only if extractable; otherwise omitted)
-
-Example (single line):
-
-```
-{"msg":"normalized_event","normalized_version":"v0","stream":"RSIEM","consumer":"master-consume","lane":"FAST","subject":"rsiem.fast","js_seq":42,"batch_key":"batch.FAST.1.3","seq_start":1,"seq_end":3,"event_index":0,"event_count":1,"agent_id":"agent-1","observed_at_unix_ms":1700000000000,"normalized":{"type":"unknown","raw_sha256":"0a4d55a8d778e5022fab701977c5d840bbc486d0","size_bytes":12,"preview":"example"}}
+```yaml
+incidents:
+  enabled: true
+  max_open_incidents: 50000
+  inactivity_ttl_ms: 600000
+  cleanup_interval_ms: 5000
+  recent_evidence_max: 10
+  export:
+    enabled: true
+    required: true
+    path: "exports/incidents.jsonl"
+    flush: true
 ```
 
-## Runbook: Local acceptance (Terminals A/B/C/D)
+## Local runbook (Terminals A/B/C/D)
 
 Terminal A — NATS JetStream:
 
@@ -155,7 +108,7 @@ export GOTOOLCHAIN=go1.24.11
 go run -mod=vendor ./cmd/master --config configs/master.yaml
 ```
 
-Terminal C — Aggregator v0 (consumer):
+Terminal C — Consumer + Aggregator + RCE + Incidents:
 
 ```
 export GOTOOLCHAIN=go1.24.11
@@ -174,20 +127,78 @@ go run -mod=vendor ./cmd/master-smoke \
   --server-name master.local
 ```
 
-Expected (first run):
+Optional inspector:
 
-- Terminal C shows `master_consume_batch` and `normalized_event` lines for 3 messages.
+```
+export GOTOOLCHAIN=go1.24.11
+go run -mod=vendor ./cmd/master-inspect --count 10
+```
+
+Addressing note: for local same-machine tests use `127.0.0.1:7777`; for cross-machine tests use `10.238.211.178:7777`.
+
+## What to expect (first run)
+
+- Terminal B logs `master_starting`, `jetstream_stream_ready`, `master_recv_batch`, `master_send_ack`.
+- Terminal C logs `master_consume_batch`, `normalized_event`, `rule_match`, `correlation_match`, `alert`, and incident logs.
+
+## Aggregator v0 output
+
+`cmd/master-consume` emits `msg="normalized_event"` JSON lines per consumed record. When the payload is a JSON object, it fills:
+
+- `normalized.type`
+- `normalized.ts_unix_ms` (if present)
+- `normalized.fields` allowlist: `host`, `user`, `process`, `src_ip`, `dst_ip`, `severity`, `message`
+
+Non-JSON payloads remain `type="unknown"` with preview/hash/size.
+
+## RCE v0 (Rules & Correlation Engine)
+
+RCE emits:
+
+- `msg="rule_match"` for stateless rules
+- `msg="correlation_match"` for count/sequence/join rules
+- `msg="alert"` and `msg="alert_suppressed"`
+
+Correlation correctness:
+
+- Join and sequence enforce first-match semantics (one event satisfies at most one predicate/step).
+- Alerts for correlation rules include `correlation_evidence.raw_sha256` and `correlation_evidence_count`.
+
+## Incidents v0
+
+Incidents emit `incident_opened`, `incident_updated`, and `incident_closed` (on cleanup). Keying:
+
+- `incident_key = inc.<rule_id>.<group_key_or_global>`
+- `incident_id = sha256(incident_key)` truncated to 16 hex chars
+
+## Validate idempotency
 
 Idempotency repeat (run the same smoke command again):
 
-Expected:
-
 - Terminal B shows `duplicate_batch` and sends ACK with same `js_seq` (no republish).
-- Terminal C shows no new `master_consume_batch` and no new `normalized_event` lines.
+- Terminal C shows no new `master_consume_batch`, `normalized_event`, `rule_match`, `correlation_match`, `alert`, or `incident` lines.
 
-Fresh run / reset: to force fresh events again, restart Terminal A’s NATS container (JetStream state resets), then restart Terminals B and C, then run the smoke client once.
+Fresh run / reset: restart Terminal A’s NATS container (JetStream state resets), then restart Terminals B and C, then run the smoke client once.
 
-Addressing note: for local same-machine tests use `127.0.0.1:7777`; for cross-machine tests use the master host’s LAN IP instead of loopback.
+## Validate exports
+
+Alerts JSONL (when `export.enabled: true`):
+
+```
+ls -l exports/alerts.jsonl
+tail -n 10 exports/alerts.jsonl
+```
+
+Incidents JSONL (when `incidents.export.enabled: true`):
+
+```
+ls -l exports/incidents.jsonl
+tail -n 10 exports/incidents.jsonl
+```
+
+## Troubleshooting
+
+- `export_init_failed` (permission denied): if `export.required=true` and `export.path` is unwritable (e.g. `/root/rsiem/alerts.jsonl`), `cmd/master-consume` exits non-zero to prevent ACKs.
 
 ## Building
 

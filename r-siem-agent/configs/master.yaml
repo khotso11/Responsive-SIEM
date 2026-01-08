@@ -14,6 +14,25 @@ jetstream:
   subject_standard: rsiem.standard
   durable_name_fast: master-fast
   durable_name_standard: master-standard
+export:
+  enabled: true
+  path: "exports/alerts.jsonl"
+  include:
+    alerts: true
+    correlation_matches: false
+  required: true
+  flush: true
+incidents:
+  enabled: true
+  max_open_incidents: 50000
+  inactivity_ttl_ms: 600000
+  cleanup_interval_ms: 5000
+  recent_evidence_max: 10
+  export:
+    enabled: true
+    required: true
+    path: "exports/incidents.jsonl"
+    flush: true
 consumer:
   fast_workers: 1
   standard_workers: 1

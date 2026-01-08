@@ -1,0 +1,4 @@
+./agent.pb.go
+./agent_grpc.pb.go
+./master.pb.go
+./master_grpc.pb.go

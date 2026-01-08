@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package agent.v1;
+
+option go_package = "r-siem-agent/internal/proto/pb";
+
+message BatchMsg {
+  string lane = 1;
+  int32 batch_size = 2;
+  uint64 first_seq = 3;
+  uint64 last_seq = 4;
+  uint64 max_offset = 5;
+}
+
+message AckMsg {
+  string lane = 1;
+  int32 batch_size = 2;
+  uint64 max_offset = 3;
+}
+
+service AgentIngest {
+  rpc Stream(stream BatchMsg) returns (stream AckMsg);
+}

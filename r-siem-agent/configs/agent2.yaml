@@ -1,0 +1,32 @@
+log:
+  level: INFO
+heartbeat:
+  interval_seconds: 60
+mock:
+  interval_seconds: 1
+agent:
+  name: r-siem-agent
+  instance_id: dev-instance-2
+lanes:
+  fast_buffer: 1000
+  standard_buffer: 5000
+wal:
+  path: ./data/agent2.wal
+  fsync: true
+batch:
+  fast:
+    max_size: 50
+    max_latency_ms: 200
+  standard:
+    max_size: 200
+    max_latency_ms: 500
+transport:
+  mode: grpc_mtls
+  addr: 192.2.42.182:7777
+  ack_delay_ms: 150
+  ack_drop_rate: 0.0
+  tls:
+    ca: /etc/r-siem-agent/certs/ca.pem
+    cert: /etc/r-siem-agent/certs/agent.pem
+    key: /etc/r-siem-agent/certs/agent-key.pem
+    server_name: master.local

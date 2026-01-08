@@ -1,0 +1,75 @@
+log_level: INFO
+listen_addr: 0.0.0.0:7777
+transport:
+  mode: grpc_mtls
+  tls:
+    ca: configs/certs/ca.pem
+    cert: configs/certs/master.pem
+    key: configs/certs/master-key.pem
+  server_name: master.local
+jetstream:
+  url: nats://127.0.0.1:4222
+  stream: RSIEM
+  subject_fast: rsiem.fast
+  subject_standard: rsiem.standard
+  durable_name_fast: master-fast
+  durable_name_standard: master-standard
+consumer:
+  fast_workers: 1
+  standard_workers: 1
+  pull_batch: 10
+  pull_timeout_ms: 500
+ack_delay_ms: 0
+ack_drop_rate: 0.0
+rce:
+  enabled: true
+  dispatch:
+    max_queue: 1024
+    degrade_high_watermark_pct: 80
+  guardrails:
+    max_event_size_bytes: 65536
+    max_clock_skew_ms: 86400000
+  state:
+    ttl_ms: 300000
+    max_keys_per_rule: 50000
+    cleanup_interval_ms: 5000
+  suppression:
+    default_cooldown_ms: 60000
+  rules:
+    - id: R-STAT-PROCESS-MED
+      enabled: true
+      kind: stateless
+      severity: medium
+      when:
+        type: process
+        fields:
+          severity: medium
+    - id: R-COUNT-PROCESS-HOST
+      enabled: true
+      kind: count
+      severity: high
+      group_by: host
+      window_ms: 60000
+      threshold: 3
+      when:
+        type: process
+    - id: R-SEQ-PROCESS-TO-NET
+      enabled: true
+      kind: sequence
+      severity: high
+      group_by: host
+      window_ms: 120000
+      steps:
+        - type: process
+        - type: network
+    - id: R-JOIN-HIGH-NET
+      enabled: true
+      kind: join
+      severity: high
+      group_by: src_ip
+      window_ms: 300000
+      predicates:
+        - type: network
+          fields:
+            severity: high
+        - type: network

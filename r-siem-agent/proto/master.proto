@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package master.v1;
+
+option go_package = "r-siem-agent/internal/proto/pb";
+
+service Ingest {
+  rpc Stream(stream Batch) returns (stream Ack);
+}
+
+message Batch {
+  string tenant_id = 1;
+  string producer_id = 2;
+  string stream_id = 3;
+  string lane = 4;       // "FAST" or "STANDARD"
+  uint64 seq_start = 5;
+  uint64 seq_end = 6;
+  bytes payload = 7;     // opaque bytes for now
+}
+
+message Ack {
+  string lane = 1;
+  uint64 seq_end = 2;
+  uint64 js_seq = 3;     // JetStream publish ack sequence (if available)
+}

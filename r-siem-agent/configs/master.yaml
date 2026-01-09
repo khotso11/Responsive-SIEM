@@ -64,13 +64,17 @@ roe:
     subject_triggers_standard: "rsiem.response.triggers.standard"
     subject_steps_fast: "rsiem.response.steps.fast"
     subject_steps_standard: "rsiem.response.steps.standard"
+    subject_results_fast: "rsiem.response.results.fast"
+    subject_results_standard: "rsiem.response.results.standard"
+    subject_approvals: "rsiem.response.approvals"
+    subject_approval_requests: "rsiem.response.approval_requests"
 
     durable_triggers_fast: "roe-trig-fast-replay1"
     durable_triggers_standard: "roe-trig-standard-replay1"
 
   workers:
-    fast_workers: 1
-    standard_workers: 1
+    fast_workers: 2
+    standard_workers: 2
     pull_batch: 10
     pull_timeout_ms: 500
 
@@ -84,6 +88,8 @@ roe:
     bucket_runs: "RSIEM_RSP_RUNS"
     bucket_steps: "RSIEM_RSP_STEPS"
     bucket_locks: "RSIEM_RSP_LOCKS"
+    bucket_approvals: "RSIEM_RSP_APPROVALS"
+    bucket_results: "RSIEM_RSP_RESULTS"
 
   # ROE v0.3 journaling / exports (JSONL)
   # Worker writes step result journal
@@ -100,6 +106,11 @@ roe:
     required: false
     runs_path: "exports/roe_runs.jsonl"
     flush: true
+    approvals:
+      enabled: false
+      required: true
+      path: "exports/roe_approvals.jsonl"
+      flush: true
 
 playbooks:
   - id: "PB-STAT-PROCESS-MED"
@@ -127,12 +138,26 @@ playbooks:
       approval: "auto"
       max_blast_radius: 1
     steps:
+      - name: "notify_before"
+        action_type: "notify"
+        timeout_ms: 2000
+        retries: 0
+        backoff_ms: 0
+        target_from: "group_key"
+
       - name: "contain_host_stub"
         action_type: "agent_command_stub"
         timeout_ms: 5000
         retries: 2
         backoff_ms: 500
-        target_from: "group_key"   # host
+        target_from: "group_key"
+
+      - name: "notify_after"
+        action_type: "notify"
+        timeout_ms: 2000
+        retries: 0
+        backoff_ms: 0
+        target_from: "group_key"
 
   - id: "PB-SEQ-PROCESS-TO-NET"
     version: 1
@@ -251,4 +276,3 @@ rce:
           fields:
             severity: high
         - type: network
-

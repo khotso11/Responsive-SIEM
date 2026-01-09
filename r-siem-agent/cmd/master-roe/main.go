@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -110,12 +111,41 @@ type roeExportTarget struct {
 }
 
 type roeExportConfig struct {
-	Runs     roeExportTarget `yaml:"runs"`
-	Steps    roeExportTarget `yaml:"steps"`
-	Enabled  bool            `yaml:"enabled"`
-	Required *bool           `yaml:"required"`
-	RunsPath string          `yaml:"runs_path"`
-	Flush    *bool           `yaml:"flush"`
+	Runs      roeExportTarget `yaml:"runs"`
+	Steps     roeExportTarget `yaml:"steps"`
+	Approvals roeExportTarget `yaml:"approvals"`
+	Enabled   bool            `yaml:"enabled"`
+	Required  *bool           `yaml:"required"`
+	RunsPath  string          `yaml:"runs_path"`
+	Flush     *bool           `yaml:"flush"`
+}
+
+type roeLocksConfig struct {
+	GroupTTLms int64 `yaml:"group_ttl_ms"`
+}
+
+type roeWorkerLockConfig struct {
+	LockTTLms int64 `yaml:"lock_ttl_ms"`
+}
+
+type roeJetstreamConfig struct {
+	SubjectTriggersFast     string `yaml:"subject_triggers_fast"`
+	SubjectTriggersStandard string `yaml:"subject_triggers_standard"`
+	SubjectStepsFast        string `yaml:"subject_steps_fast"`
+	SubjectStepsStandard    string `yaml:"subject_steps_standard"`
+	SubjectResultsFast      string `yaml:"subject_results_fast"`
+	SubjectResultsStandard  string `yaml:"subject_results_standard"`
+	SubjectApprovals        string `yaml:"subject_approvals"`
+	SubjectApprovalRequests string `yaml:"subject_approval_requests"`
+}
+
+type roeKVConfig struct {
+	BucketIdemp     string `yaml:"bucket_idemp"`
+	BucketRuns      string `yaml:"bucket_runs"`
+	BucketSteps     string `yaml:"bucket_steps"`
+	BucketLocks     string `yaml:"bucket_locks"`
+	BucketApprovals string `yaml:"bucket_approvals"`
+	BucketResults   string `yaml:"bucket_results"`
 }
 
 type roeConfig struct {
@@ -124,11 +154,16 @@ type roeConfig struct {
 	Playbooks     []roePlaybook          `yaml:"playbooks"`
 	Policies      roePolicies            `yaml:"policies"`
 	Export        roeExportConfig        `yaml:"export"`
+	Locks         roeLocksConfig         `yaml:"locks"`
+	Worker        roeWorkerLockConfig    `yaml:"worker"`
+	Jetstream     roeJetstreamConfig     `yaml:"jetstream"`
+	KV            roeKVConfig            `yaml:"kv"`
 }
 
 type roeConfigWrapper struct {
 	ROE       *roeConfig    `yaml:"roe"`
 	Playbooks []roePlaybook `yaml:"playbooks"`
+	Policies  *roePolicies  `yaml:"policies"`
 }
 
 type responseTrigger struct {
@@ -150,26 +185,31 @@ type responseTrigger struct {
 }
 
 type runRecord struct {
-	RunID                    string            `json:"run_id"`
-	TriggerIdemKey           string            `json:"trigger_idem_key"`
-	AlertKey                 string            `json:"alert_key"`
-	RuleID                   string            `json:"rule_id"`
-	RuleKind                 string            `json:"rule_kind"`
-	Severity                 string            `json:"severity"`
-	Lane                     string            `json:"lane"`
-	GroupBy                  string            `json:"group_by,omitempty"`
-	GroupKey                 string            `json:"group_key,omitempty"`
-	PlaybookID               string            `json:"playbook_id"`
-	PlaybookVersion          string            `json:"playbook_version"`
-	Status                   string            `json:"status"`
-	CreatedAtUnixMs          int64             `json:"created_at_unix_ms"`
-	CurrentStepIndex         int               `json:"current_step_index"`
-	StepTotal                int               `json:"step_total"`
-	StepSucceededCount       int               `json:"step_succeeded_count"`
-	StepFailedSafeCount      int               `json:"step_failed_safe_count"`
-	StepFailedTransientCount int               `json:"step_failed_transient_count"`
-	LastUpdatedAtUnixMs      int64             `json:"last_updated_at_unix_ms"`
-	StepStatuses             map[string]string `json:"step_statuses,omitempty"`
+	RunID                     string            `json:"run_id"`
+	TriggerIdemKey            string            `json:"trigger_idem_key"`
+	AlertKey                  string            `json:"alert_key"`
+	RuleID                    string            `json:"rule_id"`
+	RuleKind                  string            `json:"rule_kind"`
+	Severity                  string            `json:"severity"`
+	Lane                      string            `json:"lane"`
+	GroupBy                   string            `json:"group_by,omitempty"`
+	GroupKey                  string            `json:"group_key,omitempty"`
+	PlaybookID                string            `json:"playbook_id"`
+	PlaybookVersion           string            `json:"playbook_version"`
+	Status                    string            `json:"status"`
+	CreatedAtUnixMs           int64             `json:"created_at_unix_ms"`
+	CurrentStepIndex          int               `json:"current_step_index"`
+	StepTotal                 int               `json:"step_total"`
+	StepSucceededCount        int               `json:"step_succeeded_count"`
+	StepFailedSafeCount       int               `json:"step_failed_safe_count"`
+	StepFailedTransientCount  int               `json:"step_failed_transient_count"`
+	LastUpdatedAtUnixMs       int64             `json:"last_updated_at_unix_ms"`
+	ApprovalRequired          bool              `json:"approval_required,omitempty"`
+	ApprovalRequestedAtUnixMs int64             `json:"approval_requested_at_unix_ms,omitempty"`
+	ApprovalTimeoutMs         int64             `json:"approval_timeout_ms,omitempty"`
+	ApprovalDecision          string            `json:"approval_decision,omitempty"`
+	ApprovalDecidedAtUnixMs   int64             `json:"approval_decided_at_unix_ms,omitempty"`
+	StepStatuses              map[string]string `json:"step_statuses,omitempty"`
 }
 
 type stepRecord struct {
@@ -213,33 +253,45 @@ type roeResultsExporter struct {
 }
 
 type roeRuntime struct {
-	logger          *slog.Logger
-	js              nats.JetStreamContext
-	cfg             roeConfig
-	idempKV         nats.KeyValue
-	runsKV          nats.KeyValue
-	stepsKV         nats.KeyValue
-	degraded        atomic.Bool
-	dispatchSize    int
-	dispatchHighPct int
-	dispatchLowPct  int
-	resultsExport   *roeResultsExporter
+	logger             *slog.Logger
+	js                 nats.JetStreamContext
+	cfg                roeConfig
+	idempKV            nats.KeyValue
+	runsKV             nats.KeyValue
+	stepsKV            nats.KeyValue
+	resultsKV          nats.KeyValue
+	locksKV            nats.KeyValue
+	approvalsKV        nats.KeyValue
+	degraded           atomic.Bool
+	dispatchSize       int
+	dispatchHighPct    int
+	dispatchLowPct     int
+	resultsExport      *roeResultsExporter
+	approvalsExport    *roeJournal
+	resultLockHolderID string
 }
 
+var errResultNoAck = errors.New("result_nak")
+
 const (
-	responseStream       = "RSIEM_RESPONSE"
-	responseTriggerFast  = "rsiem.response.triggers.fast"
-	responseTriggerStd   = "rsiem.response.triggers.standard"
-	responseStepsFast    = "rsiem.response.steps.fast"
-	responseStepsStd     = "rsiem.response.steps.standard"
-	responseResultsFast  = "rsiem.response.results.fast"
-	responseResultsStd   = "rsiem.response.results.standard"
-	defaultWorkers       = 1
-	defaultPullBatch     = 10
-	defaultPullTimeoutMs = 500
-	defaultQueueSize     = 1024
-	defaultHighPct       = 80
-	defaultLowPct        = 50
+	responseStream           = "RSIEM_RESPONSE"
+	responseTriggerFast      = "rsiem.response.triggers.fast"
+	responseTriggerStd       = "rsiem.response.triggers.standard"
+	responseStepsFast        = "rsiem.response.steps.fast"
+	responseStepsStd         = "rsiem.response.steps.standard"
+	responseResultsFast      = "rsiem.response.results.fast"
+	responseResultsStd       = "rsiem.response.results.standard"
+	responseApprovals        = "rsiem.response.approvals"
+	responseApprovalRequests = "rsiem.response.approval_requests"
+	defaultWorkers           = 1
+	defaultPullBatch         = 10
+	defaultPullTimeoutMs     = 500
+	defaultQueueSize         = 1024
+	defaultHighPct           = 80
+	defaultLowPct            = 50
+	defaultGroupLockTTL      = int64(600000)
+	defaultApprovalTimeoutMs = int64(60000)
+	defaultResultLockTTL     = int64(30000)
 )
 
 func main() {
@@ -264,6 +316,7 @@ func main() {
 		os.Exit(1)
 	}
 	logROEConfigLoaded(logger, *configPath, roeCfg)
+	logROEApprovalsTimeoutLoaded(logger, *configPath, roeCfg)
 
 	nc, err := nats.Connect(baseCfg.JetStream.URL, nats.Name("r-siem-master-roe"))
 	if err != nil {
@@ -278,30 +331,40 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := ensureResponseStream(js); err != nil {
+	if err := ensureResponseStream(js, roeCfg); err != nil {
 		logger.Error("ensure_response_stream_failed", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
 	logStreamInfo(logger, js)
 
-	idempKV, err := ensureKV(js, "RSIEM_RSP_IDEMP")
+	idempKV, err := ensureKV(js, firstNonEmpty(roeCfg.KV.BucketIdemp, "RSIEM_RSP_IDEMP"))
 	if err != nil {
 		logger.Error("kv_init_failed", slog.String("bucket", "RSIEM_RSP_IDEMP"), slog.String("error", err.Error()))
 		os.Exit(1)
 	}
-	runsKV, err := ensureKV(js, "RSIEM_RSP_RUNS")
+	runsKV, err := ensureKV(js, firstNonEmpty(roeCfg.KV.BucketRuns, "RSIEM_RSP_RUNS"))
 	if err != nil {
 		logger.Error("kv_init_failed", slog.String("bucket", "RSIEM_RSP_RUNS"), slog.String("error", err.Error()))
 		os.Exit(1)
 	}
-	stepsKV, err := ensureKV(js, "RSIEM_RSP_STEPS")
+	stepsKV, err := ensureKV(js, firstNonEmpty(roeCfg.KV.BucketSteps, "RSIEM_RSP_STEPS"))
 	if err != nil {
 		logger.Error("kv_init_failed", slog.String("bucket", "RSIEM_RSP_STEPS"), slog.String("error", err.Error()))
 		os.Exit(1)
 	}
-	_, err = ensureKV(js, "RSIEM_RSP_LOCKS")
+	resultsKV, err := ensureKV(js, firstNonEmpty(roeCfg.KV.BucketResults, "RSIEM_RSP_RESULTS"))
+	if err != nil {
+		logger.Error("kv_init_failed", slog.String("bucket", "RSIEM_RSP_RESULTS"), slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	locksKV, err := ensureKV(js, firstNonEmpty(roeCfg.KV.BucketLocks, "RSIEM_RSP_LOCKS"))
 	if err != nil {
 		logger.Error("kv_init_failed", slog.String("bucket", "RSIEM_RSP_LOCKS"), slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	approvalsKV, err := ensureKV(js, firstNonEmpty(roeCfg.KV.BucketApprovals, "RSIEM_RSP_APPROVALS"))
+	if err != nil {
+		logger.Error("kv_init_failed", slog.String("bucket", "RSIEM_RSP_APPROVALS"), slog.String("error", err.Error()))
 		os.Exit(1)
 	}
 
@@ -329,18 +392,31 @@ func main() {
 	if resultsExporter != nil {
 		defer resultsExporter.Close()
 	}
+	approvalsJournal, err := newRoeJournal(logger, roeCfg.Export.Approvals)
+	if err != nil {
+		logger.Error("roe_export_init_failed", slog.String("target", "approvals"), slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	if approvalsJournal != nil {
+		defer approvalsJournal.Close()
+	}
 
 	runtime := &roeRuntime{
-		logger:          logger,
-		js:              js,
-		cfg:             roeCfg,
-		idempKV:         idempKV,
-		runsKV:          runsKV,
-		stepsKV:         stepsKV,
-		dispatchSize:    roeCfg.DispatchQueue.Size,
-		dispatchHighPct: roeCfg.DispatchQueue.DegradeHighWatermark,
-		dispatchLowPct:  roeCfg.DispatchQueue.DegradeLowWatermark,
-		resultsExport:   resultsExporter,
+		logger:             logger,
+		js:                 js,
+		cfg:                roeCfg,
+		idempKV:            idempKV,
+		runsKV:             runsKV,
+		stepsKV:            stepsKV,
+		resultsKV:          resultsKV,
+		locksKV:            locksKV,
+		approvalsKV:        approvalsKV,
+		dispatchSize:       roeCfg.DispatchQueue.Size,
+		dispatchHighPct:    roeCfg.DispatchQueue.DegradeHighWatermark,
+		dispatchLowPct:     roeCfg.DispatchQueue.DegradeLowWatermark,
+		resultsExport:      resultsExporter,
+		approvalsExport:    approvalsJournal,
+		resultLockHolderID: newRuntimeID("master-roe-results"),
 	}
 
 	ctx, cancel := signalContext()
@@ -350,42 +426,52 @@ func main() {
 	standardQueue := make(chan *nats.Msg, roeCfg.DispatchQueue.Size)
 	resultsFastQueue := make(chan *nats.Msg, roeCfg.DispatchQueue.Size)
 	resultsStandardQueue := make(chan *nats.Msg, roeCfg.DispatchQueue.Size)
+	approvalsQueue := make(chan *nats.Msg, roeCfg.DispatchQueue.Size)
 
-	if err := ensureConsumer(js, responseStream, responseTriggerFast, "roe-trig-fast"); err != nil {
+	if err := ensureConsumer(js, responseStream, runtime.subjectTriggersFast(), "roe-trig-fast"); err != nil {
 		logger.Error("ensure_consumer_failed", slog.String("lane", "FAST"), slog.String("error", err.Error()))
 		os.Exit(1)
 	}
-	if err := ensureConsumer(js, responseStream, responseTriggerStd, "roe-trig-standard"); err != nil {
+	if err := ensureConsumer(js, responseStream, runtime.subjectTriggersStandard(), "roe-trig-standard"); err != nil {
 		logger.Error("ensure_consumer_failed", slog.String("lane", "STANDARD"), slog.String("error", err.Error()))
 		os.Exit(1)
 	}
-	if err := ensureConsumer(js, responseStream, responseResultsFast, "roe-results-fast"); err != nil {
+	if err := ensureConsumer(js, responseStream, runtime.subjectResultsFast(), "roe-results-fast"); err != nil {
 		logger.Error("ensure_consumer_failed", slog.String("lane", "FAST"), slog.String("error", err.Error()))
 		os.Exit(1)
 	}
-	if err := ensureConsumer(js, responseStream, responseResultsStd, "roe-results-standard"); err != nil {
+	if err := ensureConsumer(js, responseStream, runtime.subjectResultsStandard(), "roe-results-standard"); err != nil {
 		logger.Error("ensure_consumer_failed", slog.String("lane", "STANDARD"), slog.String("error", err.Error()))
 		os.Exit(1)
 	}
+	if err := ensureConsumer(js, responseStream, runtime.subjectApprovals(), "roe-approvals"); err != nil {
+		logger.Error("ensure_consumer_failed", slog.String("lane", "APPROVALS"), slog.String("error", err.Error()))
+		os.Exit(1)
+	}
 
-	fastSub, err := js.PullSubscribe(responseTriggerFast, "roe-trig-fast", nats.BindStream(responseStream))
+	fastSub, err := js.PullSubscribe(runtime.subjectTriggersFast(), "roe-trig-fast", nats.BindStream(responseStream))
 	if err != nil {
 		logger.Error("subscribe_failed", slog.String("lane", "FAST"), slog.String("error", err.Error()))
 		os.Exit(1)
 	}
-	standardSub, err := js.PullSubscribe(responseTriggerStd, "roe-trig-standard", nats.BindStream(responseStream))
+	standardSub, err := js.PullSubscribe(runtime.subjectTriggersStandard(), "roe-trig-standard", nats.BindStream(responseStream))
 	if err != nil {
 		logger.Error("subscribe_failed", slog.String("lane", "STANDARD"), slog.String("error", err.Error()))
 		os.Exit(1)
 	}
-	resultsFastSub, err := js.PullSubscribe(responseResultsFast, "roe-results-fast", nats.BindStream(responseStream))
+	resultsFastSub, err := js.PullSubscribe(runtime.subjectResultsFast(), "roe-results-fast", nats.BindStream(responseStream))
 	if err != nil {
 		logger.Error("subscribe_failed", slog.String("lane", "FAST"), slog.String("error", err.Error()))
 		os.Exit(1)
 	}
-	resultsStandardSub, err := js.PullSubscribe(responseResultsStd, "roe-results-standard", nats.BindStream(responseStream))
+	resultsStandardSub, err := js.PullSubscribe(runtime.subjectResultsStandard(), "roe-results-standard", nats.BindStream(responseStream))
 	if err != nil {
 		logger.Error("subscribe_failed", slog.String("lane", "STANDARD"), slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	approvalsSub, err := js.PullSubscribe(runtime.subjectApprovals(), "roe-approvals", nats.BindStream(responseStream))
+	if err != nil {
+		logger.Error("subscribe_failed", slog.String("lane", "APPROVALS"), slog.String("error", err.Error()))
 		os.Exit(1)
 	}
 
@@ -409,6 +495,11 @@ func main() {
 	go func() {
 		defer wg.Done()
 		runFetchLoop(ctx, runtime, resultsStandardSub, "STANDARD", resultsStandardQueue, runtime)
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runFetchLoop(ctx, runtime, approvalsSub, "APPROVALS", approvalsQueue, nil)
 	}()
 
 	for i := 0; i < roeCfg.Workers.FastWorkers; i++ {
@@ -439,6 +530,19 @@ func main() {
 			runResultWorker(ctx, runtime, resultsStandardQueue, "STANDARD")
 		}()
 	}
+	for i := 0; i < roeCfg.Workers.StandardWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runApprovalWorker(ctx, runtime, approvalsQueue)
+		}()
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runApprovalTimeoutScanner(ctx, runtime)
+	}()
 
 	wg.Wait()
 	logger.Info("master_roe_stopped")
@@ -449,6 +553,10 @@ func loadROEConfig(path string) (roeConfig, error) {
 	if err != nil {
 		return roeConfig{}, fmt.Errorf("read config: %w", err)
 	}
+	return parseROEConfig(data)
+}
+
+func parseROEConfig(data []byte) (roeConfig, error) {
 	var wrapper roeConfigWrapper
 	if err := yaml.Unmarshal(data, &wrapper); err != nil {
 		return roeConfig{}, fmt.Errorf("parse roe config: %w", err)
@@ -459,6 +567,9 @@ func loadROEConfig(path string) (roeConfig, error) {
 	}
 	if len(wrapper.Playbooks) > 0 {
 		cfg.Playbooks = wrapper.Playbooks
+	}
+	if wrapper.Policies != nil {
+		cfg.Policies = *wrapper.Policies
 	}
 	applyROEDefaults(&cfg)
 	return cfg, nil
@@ -487,8 +598,16 @@ func applyROEDefaults(cfg *roeConfig) {
 		cfg.DispatchQueue.DegradeLowWatermark = defaultLowPct
 	}
 	if cfg.Policies.Approvals.TimeoutMs <= 0 {
-		cfg.Policies.Approvals.TimeoutMs = 60000
+		cfg.Policies.Approvals.TimeoutMs = defaultApprovalTimeoutMs
 	}
+	if cfg.Locks.GroupTTLms <= 0 {
+		cfg.Locks.GroupTTLms = defaultGroupLockTTL
+	}
+	if cfg.Worker.LockTTLms <= 0 {
+		cfg.Worker.LockTTLms = defaultResultLockTTL
+	}
+	applyROEJetstreamDefaults(&cfg.Jetstream)
+	applyROEKVDefaults(&cfg.KV)
 }
 
 func logROEConfigLoaded(logger *slog.Logger, configPath string, cfg roeConfig) {
@@ -504,6 +623,14 @@ func logROEConfigLoaded(logger *slog.Logger, configPath string, cfg roeConfig) {
 	)
 }
 
+func logROEApprovalsTimeoutLoaded(logger *slog.Logger, configPath string, cfg roeConfig) {
+	logger.LogAttrs(context.Background(), slog.LevelInfo, "roe_approvals_timeout_loaded",
+		slog.Int64("timeout_ms", cfg.Policies.Approvals.TimeoutMs),
+		slog.String("source", "policies.approvals.timeout_ms"),
+		slog.String("config_path", configPath),
+	)
+}
+
 func playbookRuleMap(playbooks []roePlaybook) map[string][]string {
 	result := make(map[string][]string, len(playbooks))
 	for _, pb := range playbooks {
@@ -516,14 +643,16 @@ func playbookRuleMap(playbooks []roePlaybook) map[string][]string {
 	return result
 }
 
-func ensureResponseStream(js nats.JetStreamContext) error {
+func ensureResponseStream(js nats.JetStreamContext, cfg roeConfig) error {
 	required := []string{
-		responseTriggerFast,
-		responseTriggerStd,
-		responseStepsFast,
-		responseStepsStd,
-		responseResultsFast,
-		responseResultsStd,
+		firstNonEmpty(cfg.Jetstream.SubjectTriggersFast, responseTriggerFast),
+		firstNonEmpty(cfg.Jetstream.SubjectTriggersStandard, responseTriggerStd),
+		firstNonEmpty(cfg.Jetstream.SubjectStepsFast, responseStepsFast),
+		firstNonEmpty(cfg.Jetstream.SubjectStepsStandard, responseStepsStd),
+		firstNonEmpty(cfg.Jetstream.SubjectResultsFast, responseResultsFast),
+		firstNonEmpty(cfg.Jetstream.SubjectResultsStandard, responseResultsStd),
+		firstNonEmpty(cfg.Jetstream.SubjectApprovals, responseApprovals),
+		firstNonEmpty(cfg.Jetstream.SubjectApprovalRequests, responseApprovalRequests),
 	}
 	info, err := js.StreamInfo(responseStream)
 	if err != nil {
@@ -540,9 +669,9 @@ func ensureResponseStream(js nats.JetStreamContext) error {
 	if equalSubjects(info.Config.Subjects, merged) {
 		return nil
 	}
-	cfg := info.Config
-	cfg.Subjects = merged
-	_, err = js.UpdateStream(&cfg)
+	streamCfg := info.Config
+	streamCfg.Subjects = merged
+	_, err = js.UpdateStream(&streamCfg)
 	return err
 }
 
@@ -705,11 +834,49 @@ func runResultWorker(ctx context.Context, runtime *roeRuntime, queue chan *nats.
 				continue
 			}
 			if err := processResult(runtime, msg, lane); err != nil {
+				if errors.Is(err, errResultNoAck) {
+					continue
+				}
 				runtime.logger.Error("roe_result_process_failed", slog.String("lane", lane), slog.String("error", err.Error()))
 				continue
 			}
 			if err := msg.Ack(); err != nil {
 				runtime.logger.Error("roe_result_ack_failed", slog.String("lane", lane), slog.String("error", err.Error()))
+			}
+		}
+	}
+}
+
+func runApprovalWorker(ctx context.Context, runtime *roeRuntime, queue chan *nats.Msg) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg := <-queue:
+			if msg == nil {
+				continue
+			}
+			if err := processApproval(runtime, msg); err != nil {
+				runtime.logger.Error("roe_approval_process_failed", slog.String("error", err.Error()))
+				continue
+			}
+			if err := msg.Ack(); err != nil {
+				runtime.logger.Error("roe_approval_ack_failed", slog.String("error", err.Error()))
+			}
+		}
+	}
+}
+
+func runApprovalTimeoutScanner(ctx context.Context, runtime *roeRuntime) {
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := scanForApprovalTimeouts(runtime, 100); err != nil {
+				runtime.logger.Error("roe_approval_timeout_scan_failed", slog.String("error", err.Error()))
 			}
 		}
 	}
@@ -772,6 +939,12 @@ func processTrigger(runtime *roeRuntime, msg *nats.Msg, lane string, runJournal 
 		CreatedAtUnixMs: trigger.ObservedAtUnixMs,
 	}
 
+	if ok, err := runtime.tryAcquireGroupLock(trigger, runID); err != nil {
+		return err
+	} else if !ok {
+		return nil
+	}
+
 	if err := runtime.persistRun(runKey, run); err != nil {
 		return err
 	}
@@ -798,22 +971,6 @@ func processTrigger(runtime *roeRuntime, msg *nats.Msg, lane string, runJournal 
 		runtime.logger.LogAttrs(context.Background(), slog.LevelWarn, "response_run_rejected",
 			slog.String("run_id", runID),
 			slog.String("reason", err.Error()),
-		)
-		return nil
-	}
-
-	requiresApproval := runtime.requiresApproval(playbook, trigger.Severity)
-	if requiresApproval {
-		run.Status = "WAITING_APPROVAL"
-		if err := runtime.persistRun(runKey, run); err != nil {
-			return err
-		}
-		runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "approval_requested",
-			slog.String("run_id", runID),
-			slog.String("rule_id", trigger.RuleID),
-			slog.String("playbook_id", playbook.ID),
-			slog.String("playbook_version", playbook.Version.Value),
-			slog.Int64("timeout_ms", runtime.cfg.Policies.Approvals.TimeoutMs),
 		)
 		return nil
 	}
@@ -848,6 +1005,42 @@ func processTrigger(runtime *roeRuntime, msg *nats.Msg, lane string, runJournal 
 		}); err != nil {
 			return err
 		}
+	}
+
+	requiresApproval := runtime.requiresApproval(playbook, trigger.Severity)
+	if requiresApproval {
+		run.Status = "WAITING_APPROVAL"
+		run.ApprovalRequired = true
+		run.ApprovalRequestedAtUnixMs = time.Now().UnixMilli()
+		run.ApprovalTimeoutMs = runtime.cfg.Policies.Approvals.TimeoutMs
+		run.StepTotal = len(steps)
+		run.CurrentStepIndex = 0
+		if err := runtime.persistRun(runKey, run); err != nil {
+			return err
+		}
+		if err := runtime.publishApprovalRequest(run); err != nil {
+			return err
+		}
+		runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "approval_request_published",
+			slog.String("run_id", runID),
+			slog.String("rule_id", trigger.RuleID),
+			slog.String("playbook_id", playbook.ID),
+			slog.String("subject", runtime.subjectApprovalRequests()),
+		)
+		runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "approval_requested",
+			slog.String("run_id", runID),
+			slog.String("rule_id", trigger.RuleID),
+			slog.String("playbook_id", playbook.ID),
+			slog.String("playbook_version", playbook.Version.Value),
+			slog.Int64("timeout_ms", runtime.cfg.Policies.Approvals.TimeoutMs),
+		)
+		runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "response_run_waiting_approval",
+			slog.String("run_id", runID),
+			slog.String("rule_id", trigger.RuleID),
+			slog.String("playbook_id", playbook.ID),
+			slog.Int64("timeout_ms", runtime.cfg.Policies.Approvals.TimeoutMs),
+		)
+		return nil
 	}
 
 	for _, step := range steps {
@@ -893,16 +1086,71 @@ func processResult(runtime *roeRuntime, msg *nats.Msg, lane string) error {
 		slog.Uint64("js_seq", jsSeq),
 	)
 
+	lockKey := fmt.Sprintf("lock.run.%s", result.RunID)
+	locked, err := runtime.acquireResultLock(lockKey, result)
+	if err != nil {
+		return err
+	}
+	if !locked {
+		runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "roe_lock_contended_result",
+			slog.String("run_id", result.RunID),
+			slog.String("step_id", result.StepID),
+			slog.String("lock_key", lockKey),
+		)
+		if err := msg.NakWithDelay(250 * time.Millisecond); err != nil {
+			runtime.logger.Error("roe_result_nak_failed", slog.String("error", err.Error()))
+		}
+		return errResultNoAck
+	}
+	runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "roe_lock_acquired_result",
+		slog.String("run_id", result.RunID),
+		slog.String("step_id", result.StepID),
+		slog.String("lock_key", lockKey),
+	)
+	defer runtime.releaseResultLock(lockKey, result)
+
+	resultKey := fmt.Sprintf("result.%s.%s", result.RunID, result.StepID)
+	if entry, err := runtime.resultsKV.Get(resultKey); err == nil {
+		_ = entry
+		runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "response_result_duplicate",
+			slog.String("run_id", result.RunID),
+			slog.String("step_id", result.StepID),
+			slog.String("result_key", resultKey),
+		)
+		return nil
+	} else if !errors.Is(err, nats.ErrKeyNotFound) {
+		return err
+	}
+	if err := runtime.persistResultDedupe(resultKey, result, jsSeq); err != nil {
+		return err
+	}
+	applied := false
+	defer func() {
+		if applied {
+			return
+		}
+		_ = runtime.resultsKV.Delete(resultKey)
+	}()
+
 	runKey := fmt.Sprintf("run.%s", result.RunID)
 	run, err := runtime.getRun(runKey, result)
 	if err != nil {
 		return err
 	}
-	prevStatus := run.Status
 	updateRunWithResult(&run, result)
 	if err := runtime.persistRun(runKey, run); err != nil {
 		return err
 	}
+	runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "response_result_applied",
+		slog.String("run_id", result.RunID),
+		slog.String("step_id", result.StepID),
+		slog.String("status", result.Status),
+		slog.String("result_key", resultKey),
+		slog.Int("step_total", run.StepTotal),
+		slog.Int("step_succeeded_count", run.StepSucceededCount),
+		slog.Int("step_failed_safe_count", run.StepFailedSafeCount),
+		slog.Int("step_failed_transient_count", run.StepFailedTransientCount),
+	)
 	runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "response_run_updated",
 		slog.String("run_id", run.RunID),
 		slog.String("status", run.Status),
@@ -910,34 +1158,165 @@ func processResult(runtime *roeRuntime, msg *nats.Msg, lane string) error {
 		slog.Int("step_failed_safe_count", run.StepFailedSafeCount),
 		slog.Int("step_failed_transient_count", run.StepFailedTransientCount),
 	)
-	if run.Status == "SUCCEEDED" && prevStatus != "SUCCEEDED" {
-		runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "response_run_succeeded",
-			slog.String("run_id", run.RunID),
-		)
+	if err := runtime.exportRunUpdate(run); err != nil {
+		return err
 	}
-	if run.Status == "FAILED_SAFE" && prevStatus != "FAILED_SAFE" {
-		runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "response_run_failed_safe",
-			slog.String("run_id", run.RunID),
-		)
-	}
-	if runtime.resultsExport != nil {
-		obj := map[string]any{
-			"msg":                         "response_run_updated",
-			"run_id":                      run.RunID,
-			"status":                      run.Status,
-			"step_total":                  run.StepTotal,
-			"step_succeeded_count":        run.StepSucceededCount,
-			"step_failed_safe_count":      run.StepFailedSafeCount,
-			"step_failed_transient_count": run.StepFailedTransientCount,
-			"last_updated_at_unix_ms":     run.LastUpdatedAtUnixMs,
-		}
-		if err := runtime.resultsExport.WriteJSON(obj); err != nil {
-			return err
-		}
-	}
+	applied = true
 	return nil
 }
 
+func processApproval(runtime *roeRuntime, msg *nats.Msg) error {
+	approval, err := decodeApproval(msg.Data)
+	if err != nil {
+		runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "approval_invalid",
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+	approvalKey := fmt.Sprintf("approval.%s", approval.RunID)
+	if entry, err := runtime.approvalsKV.Get(approvalKey); err == nil {
+		_ = entry
+		runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "approval_duplicate",
+			slog.String("run_id", approval.RunID),
+			slog.String("approval_key", approvalKey),
+		)
+		return nil
+	} else if !errors.Is(err, nats.ErrKeyNotFound) {
+		return err
+	}
+	if _, err := runtime.approvalsKV.Put(approvalKey, msg.Data); err != nil {
+		return err
+	}
+	applied := false
+	defer func() {
+		if applied {
+			return
+		}
+		_ = runtime.approvalsKV.Delete(approvalKey)
+	}()
+	runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "approval_received",
+		slog.String("run_id", approval.RunID),
+		slog.String("decision", approval.Decision),
+		slog.String("actor", approval.Actor),
+	)
+	if runtime.approvalsExport != nil {
+		if err := runtime.approvalsExport.Write("approval_received", map[string]any{
+			"run_id":   approval.RunID,
+			"decision": approval.Decision,
+			"actor":    approval.Actor,
+			"reason":   approval.Reason,
+		}); err != nil {
+			return err
+		}
+	}
+
+	runKey := fmt.Sprintf("run.%s", approval.RunID)
+	run, found, err := runtime.loadRun(runKey)
+	if err != nil {
+		return err
+	}
+	if !found {
+		runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "approval_orphaned",
+			slog.String("run_id", approval.RunID),
+		)
+		applied = true
+		return nil
+	}
+	eligible := run.Status == "WAITING_APPROVAL" || run.Status == "APPROVED"
+	if !eligible {
+		if approval.Decision == "approve" && run.Status == "RUNNING" && run.ApprovalDecision == "approve" {
+			eligible = true
+		}
+		if approval.Decision == "deny" && run.Status == "FAILED_SAFE" && run.ApprovalDecision == "deny" {
+			eligible = true
+		}
+	}
+	if !eligible {
+		runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "approval_not_needed",
+			slog.String("run_id", approval.RunID),
+			slog.String("status", run.Status),
+		)
+		applied = true
+		return nil
+	}
+
+	now := time.Now().UnixMilli()
+	run.ApprovalDecision = approval.Decision
+	run.ApprovalDecidedAtUnixMs = now
+	run.LastUpdatedAtUnixMs = now
+	if approval.Decision == "deny" {
+		run.Status = "FAILED_SAFE"
+		if err := runtime.persistRun(runKey, run); err != nil {
+			return err
+		}
+		runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "approval_denied",
+			slog.String("run_id", approval.RunID),
+			slog.String("reason", approval.Reason),
+		)
+		if runtime.approvalsExport != nil {
+			if err := runtime.approvalsExport.Write("approval_denied", map[string]any{
+				"run_id": approval.RunID,
+				"reason": approval.Reason,
+			}); err != nil {
+				return err
+			}
+		}
+		if err := runtime.exportRunUpdate(run); err != nil {
+			return err
+		}
+		applied = true
+		return nil
+	}
+
+	wasRunning := run.Status == "RUNNING"
+	if !wasRunning {
+		run.Status = "APPROVED"
+		if err := runtime.persistRun(runKey, run); err != nil {
+			return err
+		}
+	}
+	runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "approval_approved",
+		slog.String("run_id", approval.RunID),
+	)
+	if runtime.approvalsExport != nil {
+		if err := runtime.approvalsExport.Write("approval_approved", map[string]any{
+			"run_id": approval.RunID,
+		}); err != nil {
+			return err
+		}
+	}
+	steps, err := runtime.loadPlannedSteps(run.RunID)
+	if err != nil {
+		return err
+	}
+	for _, step := range steps {
+		subject, err := runtime.publishStep(step.Lane, step)
+		if err != nil {
+			return err
+		}
+		runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "response_step_published",
+			slog.String("run_id", run.RunID),
+			slog.String("step_id", step.StepID),
+			slog.Int("step_index", step.StepIndex),
+			slog.String("action_type", step.ActionType),
+			slog.String("step_subject", subject),
+		)
+	}
+	runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "response_steps_released_after_approval",
+		slog.String("run_id", run.RunID),
+		slog.Int("step_count", len(steps)),
+	)
+	run.Status = "RUNNING"
+	run.LastUpdatedAtUnixMs = time.Now().UnixMilli()
+	if err := runtime.persistRun(runKey, run); err != nil {
+		return err
+	}
+	if err := runtime.exportRunUpdate(run); err != nil {
+		return err
+	}
+	applied = true
+	return nil
+}
 func decodeTrigger(data []byte) (responseTrigger, error) {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()
@@ -991,6 +1370,41 @@ func decodeStepResult(data []byte) (stepResult, error) {
 	return result, nil
 }
 
+type approvalDecision struct {
+	RunID    string `json:"run_id"`
+	Decision string `json:"decision"`
+	Actor    string `json:"actor"`
+	Reason   string `json:"reason"`
+	TsUnixMs int64  `json:"ts_unix_ms"`
+}
+
+func decodeApproval(data []byte) (approvalDecision, error) {
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return approvalDecision{}, err
+	}
+	runID, _ := raw["run_id"].(string)
+	decision, _ := raw["decision"].(string)
+	actor, _ := raw["actor"].(string)
+	reason, _ := raw["reason"].(string)
+	runID = strings.TrimSpace(runID)
+	decision = strings.TrimSpace(decision)
+	if runID == "" {
+		return approvalDecision{}, fmt.Errorf("missing run_id")
+	}
+	if decision != "approve" && decision != "deny" {
+		return approvalDecision{}, fmt.Errorf("invalid decision")
+	}
+	ts, _ := int64Field(raw, "ts_unix_ms")
+	return approvalDecision{
+		RunID:    runID,
+		Decision: decision,
+		Actor:    strings.TrimSpace(actor),
+		Reason:   strings.TrimSpace(reason),
+		TsUnixMs: ts,
+	}, nil
+}
+
 func (r *roeRuntime) getRun(key string, result stepResult) (runRecord, error) {
 	entry, err := r.runsKV.Get(key)
 	if err != nil {
@@ -1015,56 +1429,64 @@ func (r *roeRuntime) getRun(key string, result stepResult) (runRecord, error) {
 	return run, nil
 }
 
+func (r *roeRuntime) loadRun(key string) (runRecord, bool, error) {
+	entry, err := r.runsKV.Get(key)
+	if err != nil {
+		if errors.Is(err, nats.ErrKeyNotFound) {
+			return runRecord{}, false, nil
+		}
+		return runRecord{}, false, err
+	}
+	var run runRecord
+	if err := json.Unmarshal(entry.Value(), &run); err != nil {
+		return runRecord{}, false, err
+	}
+	if run.StepStatuses == nil {
+		run.StepStatuses = make(map[string]string)
+	}
+	return run, true, nil
+}
+
 func updateRunWithResult(run *runRecord, result stepResult) {
 	now := time.Now().UnixMilli()
-	prev, hasPrev := run.StepStatuses[result.StepID]
-	if hasPrev {
-		decrementCount(run, prev)
+	if run.StepStatuses == nil {
+		run.StepStatuses = make(map[string]string)
 	}
 	run.StepStatuses[result.StepID] = result.Status
-	incrementCount(run, result.Status)
 	run.LastUpdatedAtUnixMs = now
-	if run.StepFailedSafeCount > 0 {
+	recomputeRunCounts(run)
+}
+
+func recomputeRunCounts(run *runRecord) {
+	succeeded := 0
+	failedSafe := 0
+	failedTransient := 0
+	for _, status := range run.StepStatuses {
+		switch status {
+		case "SUCCEEDED":
+			succeeded++
+		case "FAILED_SAFE":
+			failedSafe++
+		case "FAILED_TRANSIENT":
+			failedTransient++
+		}
+	}
+	run.StepSucceededCount = succeeded
+	run.StepFailedSafeCount = failedSafe
+	run.StepFailedTransientCount = failedTransient
+	if failedSafe > 0 {
 		run.Status = "FAILED_SAFE"
 		return
 	}
-	if run.StepTotal > 0 && run.StepSucceededCount >= run.StepTotal {
+	if run.StepTotal > 0 && succeeded >= run.StepTotal {
 		run.Status = "SUCCEEDED"
 		return
 	}
-	if run.StepFailedTransientCount > 0 {
+	if failedTransient > 0 {
 		run.Status = "FAILED_TRANSIENT"
 		return
 	}
 	run.Status = "RUNNING"
-}
-
-func incrementCount(run *runRecord, status string) {
-	switch status {
-	case "SUCCEEDED":
-		run.StepSucceededCount++
-	case "FAILED_SAFE":
-		run.StepFailedSafeCount++
-	case "FAILED_TRANSIENT":
-		run.StepFailedTransientCount++
-	}
-}
-
-func decrementCount(run *runRecord, status string) {
-	switch status {
-	case "SUCCEEDED":
-		if run.StepSucceededCount > 0 {
-			run.StepSucceededCount--
-		}
-	case "FAILED_SAFE":
-		if run.StepFailedSafeCount > 0 {
-			run.StepFailedSafeCount--
-		}
-	case "FAILED_TRANSIENT":
-		if run.StepFailedTransientCount > 0 {
-			run.StepFailedTransientCount--
-		}
-	}
 }
 
 func stringFieldRaw(raw map[string]any, key string) string {
@@ -1168,6 +1590,128 @@ func (r *roeRuntime) persistIdempotency(trigger responseTrigger, runID string, p
 	return err
 }
 
+func (r *roeRuntime) persistResultDedupe(key string, result stepResult, jsSeq uint64) error {
+	record := map[string]any{
+		"run_id":              result.RunID,
+		"step_id":             result.StepID,
+		"status":              result.Status,
+		"finished_at_unix_ms": result.FinishedAtUnixMs,
+		"lane":                result.Lane,
+	}
+	if jsSeq > 0 {
+		record["js_seq"] = jsSeq
+	}
+	payload, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	_, err = r.resultsKV.Put(key, payload)
+	return err
+}
+
+func (r *roeRuntime) acquireResultLock(lockKey string, result stepResult) (bool, error) {
+	now := time.Now().UnixMilli()
+	ttl := r.cfg.Worker.LockTTLms
+	if ttl <= 0 {
+		ttl = defaultResultLockTTL
+	}
+	entry, err := r.locksKV.Get(lockKey)
+	if err == nil {
+		var existing map[string]any
+		if err := json.Unmarshal(entry.Value(), &existing); err == nil {
+			holder := stringFieldRaw(existing, "holder_id")
+			acquiredAt, _ := int64Field(existing, "acquired_at_unix_ms")
+			lockTTL, ok := int64Field(existing, "ttl_ms")
+			if ok && lockTTL > 0 {
+				ttl = lockTTL
+			}
+			if holder != "" && holder != r.resultLockHolderID && acquiredAt > 0 && now-acquiredAt < ttl {
+				return false, nil
+			}
+		}
+	} else if !errors.Is(err, nats.ErrKeyNotFound) {
+		return false, err
+	}
+	record := map[string]any{
+		"holder_id":           r.resultLockHolderID,
+		"step_id":             result.StepID,
+		"acquired_at_unix_ms": now,
+		"ttl_ms":              ttl,
+	}
+	payload, err := json.Marshal(record)
+	if err != nil {
+		return false, err
+	}
+	if _, err := r.locksKV.Put(lockKey, payload); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (r *roeRuntime) releaseResultLock(lockKey string, result stepResult) {
+	if err := r.locksKV.Delete(lockKey); err != nil && !errors.Is(err, nats.ErrKeyNotFound) {
+		r.logger.LogAttrs(context.Background(), slog.LevelError, "roe_lock_release_failed_result",
+			slog.String("error", err.Error()),
+			slog.String("run_id", result.RunID),
+			slog.String("step_id", result.StepID),
+			slog.String("lock_key", lockKey),
+		)
+		return
+	}
+	r.logger.LogAttrs(context.Background(), slog.LevelInfo, "roe_lock_released_result",
+		slog.String("run_id", result.RunID),
+		slog.String("step_id", result.StepID),
+		slog.String("lock_key", lockKey),
+	)
+}
+
+func (r *roeRuntime) tryAcquireGroupLock(trigger responseTrigger, runID string) (bool, error) {
+	if trigger.GroupBy == "" || trigger.GroupKey == "" {
+		return true, nil
+	}
+	lockKey := fmt.Sprintf("lock.group.%s.%s", trigger.RuleID, trigger.GroupKey)
+	now := time.Now().UnixMilli()
+	ttl := r.cfg.Locks.GroupTTLms
+	if ttl <= 0 {
+		ttl = defaultGroupLockTTL
+	}
+	entry, err := r.locksKV.Get(lockKey)
+	if err == nil {
+		var existing map[string]any
+		if err := json.Unmarshal(entry.Value(), &existing); err == nil {
+			acquiredAt, _ := int64Field(existing, "acquired_at_unix_ms")
+			if acquiredAt > 0 && now-acquiredAt < ttl {
+				runtimeLogSuppressed(r.logger, trigger, runID, lockKey)
+				return false, nil
+			}
+		}
+	} else if !errors.Is(err, nats.ErrKeyNotFound) {
+		return false, err
+	}
+	record := map[string]any{
+		"run_id":              runID,
+		"acquired_at_unix_ms": now,
+		"ttl_ms":              ttl,
+	}
+	payload, err := json.Marshal(record)
+	if err != nil {
+		return false, err
+	}
+	if _, err := r.locksKV.Put(lockKey, payload); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func runtimeLogSuppressed(logger *slog.Logger, trigger responseTrigger, runID, lockKey string) {
+	logger.LogAttrs(context.Background(), slog.LevelInfo, "response_run_suppressed_by_lock",
+		slog.String("run_id", runID),
+		slog.String("rule_id", trigger.RuleID),
+		slog.String("group_by", trigger.GroupBy),
+		slog.String("group_key", trigger.GroupKey),
+		slog.String("lock_key", lockKey),
+	)
+}
 func (r *roeRuntime) applyAllowlist(playbook roePlaybook) error {
 	allowed := r.cfg.Policies.ActionAllowlist.AllowedActionTypes
 	if len(allowed) == 0 {
@@ -1186,8 +1730,14 @@ func (r *roeRuntime) applyAllowlist(playbook roePlaybook) error {
 }
 
 func (r *roeRuntime) requiresApproval(playbook roePlaybook, severity string) bool {
-	if strings.EqualFold(playbook.PolicyRequirements.Approval, "required_for_high") && strings.EqualFold(severity, "high") {
+	switch strings.ToLower(strings.TrimSpace(playbook.PolicyRequirements.Approval)) {
+	case "required":
 		return true
+	case "required_for_high":
+		if strings.EqualFold(severity, "high") {
+			return true
+		}
+	case "auto":
 	}
 	if r.cfg.Policies.SafeMode.RequireApprovalWhenDegraded && r.degraded.Load() {
 		return true
@@ -1252,9 +1802,9 @@ func (r *roeRuntime) persistStep(step stepRecord) error {
 }
 
 func (r *roeRuntime) publishStep(lane string, step stepRecord) (string, error) {
-	subject := responseStepsStd
-	if lane == "FAST" {
-		subject = responseStepsFast
+	subject := r.subjectStepsStandard()
+	if strings.EqualFold(lane, "FAST") {
+		subject = r.subjectStepsFast()
 	}
 	payload, err := json.Marshal(step)
 	if err != nil {
@@ -1264,9 +1814,208 @@ func (r *roeRuntime) publishStep(lane string, step stepRecord) (string, error) {
 	return subject, err
 }
 
+func (r *roeRuntime) publishApprovalRequest(run runRecord) error {
+	subject := r.subjectApprovalRequests()
+	payload := map[string]any{
+		"run_id":               run.RunID,
+		"rule_id":              run.RuleID,
+		"playbook_id":          run.PlaybookID,
+		"playbook_version":     run.PlaybookVersion,
+		"severity":             run.Severity,
+		"lane":                 run.Lane,
+		"group_by":             run.GroupBy,
+		"group_key":            run.GroupKey,
+		"timeout_ms":           run.ApprovalTimeoutMs,
+		"requested_at_unix_ms": run.ApprovalRequestedAtUnixMs,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	_, err = r.js.Publish(subject, data)
+	return err
+}
+
 func shortHash(input string) string {
 	sum := sha256.Sum256([]byte(input))
 	return hex.EncodeToString(sum[:])[:16]
+}
+
+func newRuntimeID(prefix string) string {
+	host, _ := os.Hostname()
+	pid := os.Getpid()
+	return fmt.Sprintf("%s-%s-%d-%d", prefix, host, pid, time.Now().UnixNano())
+}
+
+func applyROEJetstreamDefaults(cfg *roeJetstreamConfig) {
+	cfg.SubjectTriggersFast = firstNonEmpty(cfg.SubjectTriggersFast, responseTriggerFast)
+	cfg.SubjectTriggersStandard = firstNonEmpty(cfg.SubjectTriggersStandard, responseTriggerStd)
+	cfg.SubjectStepsFast = firstNonEmpty(cfg.SubjectStepsFast, responseStepsFast)
+	cfg.SubjectStepsStandard = firstNonEmpty(cfg.SubjectStepsStandard, responseStepsStd)
+	cfg.SubjectResultsFast = firstNonEmpty(cfg.SubjectResultsFast, responseResultsFast)
+	cfg.SubjectResultsStandard = firstNonEmpty(cfg.SubjectResultsStandard, responseResultsStd)
+	cfg.SubjectApprovals = firstNonEmpty(cfg.SubjectApprovals, responseApprovals)
+	cfg.SubjectApprovalRequests = firstNonEmpty(cfg.SubjectApprovalRequests, responseApprovalRequests)
+}
+
+func applyROEKVDefaults(cfg *roeKVConfig) {
+	cfg.BucketIdemp = firstNonEmpty(cfg.BucketIdemp, "RSIEM_RSP_IDEMP")
+	cfg.BucketRuns = firstNonEmpty(cfg.BucketRuns, "RSIEM_RSP_RUNS")
+	cfg.BucketSteps = firstNonEmpty(cfg.BucketSteps, "RSIEM_RSP_STEPS")
+	cfg.BucketLocks = firstNonEmpty(cfg.BucketLocks, "RSIEM_RSP_LOCKS")
+	cfg.BucketApprovals = firstNonEmpty(cfg.BucketApprovals, "RSIEM_RSP_APPROVALS")
+	cfg.BucketResults = firstNonEmpty(cfg.BucketResults, "RSIEM_RSP_RESULTS")
+}
+
+func firstNonEmpty(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return strings.TrimSpace(value)
+}
+
+func (r *roeRuntime) subjectTriggersFast() string {
+	return r.cfg.Jetstream.SubjectTriggersFast
+}
+
+func (r *roeRuntime) subjectTriggersStandard() string {
+	return r.cfg.Jetstream.SubjectTriggersStandard
+}
+
+func (r *roeRuntime) subjectStepsFast() string {
+	return r.cfg.Jetstream.SubjectStepsFast
+}
+
+func (r *roeRuntime) subjectStepsStandard() string {
+	return r.cfg.Jetstream.SubjectStepsStandard
+}
+
+func (r *roeRuntime) subjectResultsFast() string {
+	return r.cfg.Jetstream.SubjectResultsFast
+}
+
+func (r *roeRuntime) subjectResultsStandard() string {
+	return r.cfg.Jetstream.SubjectResultsStandard
+}
+
+func (r *roeRuntime) subjectApprovals() string {
+	return r.cfg.Jetstream.SubjectApprovals
+}
+
+func (r *roeRuntime) subjectApprovalRequests() string {
+	return r.cfg.Jetstream.SubjectApprovalRequests
+}
+
+func (r *roeRuntime) loadPlannedSteps(runID string) ([]stepRecord, error) {
+	keys, err := r.stepsKV.Keys()
+	if err != nil {
+		if errors.Is(err, nats.ErrNoKeysFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	steps := make([]stepRecord, 0)
+	for _, key := range keys {
+		if strings.Count(key, ".") != 1 || !strings.HasPrefix(key, "step.") {
+			continue
+		}
+		entry, err := r.stepsKV.Get(key)
+		if err != nil {
+			return nil, err
+		}
+		var step stepRecord
+		if err := json.Unmarshal(entry.Value(), &step); err != nil {
+			return nil, err
+		}
+		if step.RunID != runID {
+			continue
+		}
+		steps = append(steps, step)
+	}
+	sort.Slice(steps, func(i, j int) bool {
+		return steps[i].StepIndex < steps[j].StepIndex
+	})
+	return steps, nil
+}
+
+func (r *roeRuntime) exportRunUpdate(run runRecord) error {
+	if r.resultsExport == nil {
+		return nil
+	}
+	obj := map[string]any{
+		"msg":                         "response_run_updated",
+		"run_id":                      run.RunID,
+		"status":                      run.Status,
+		"step_total":                  run.StepTotal,
+		"step_succeeded_count":        run.StepSucceededCount,
+		"step_failed_safe_count":      run.StepFailedSafeCount,
+		"step_failed_transient_count": run.StepFailedTransientCount,
+		"last_updated_at_unix_ms":     run.LastUpdatedAtUnixMs,
+	}
+	return r.resultsExport.WriteJSON(obj)
+}
+
+func scanForApprovalTimeouts(runtime *roeRuntime, limit int) error {
+	keys, err := runtime.runsKV.Keys()
+	if err != nil {
+		if errors.Is(err, nats.ErrNoKeysFound) {
+			return nil
+		}
+		return err
+	}
+	now := time.Now().UnixMilli()
+	checked := 0
+	for _, key := range keys {
+		if !strings.HasPrefix(key, "run.") {
+			continue
+		}
+		if limit > 0 && checked >= limit {
+			continue
+		}
+		checked++
+		entry, err := runtime.runsKV.Get(key)
+		if err != nil {
+			return err
+		}
+		var run runRecord
+		if err := json.Unmarshal(entry.Value(), &run); err != nil {
+			return err
+		}
+		if run.Status != "WAITING_APPROVAL" {
+			continue
+		}
+		timeoutMs := run.ApprovalTimeoutMs
+		if timeoutMs <= 0 {
+			timeoutMs = runtime.cfg.Policies.Approvals.TimeoutMs
+		}
+		if timeoutMs <= 0 {
+			timeoutMs = defaultApprovalTimeoutMs
+		}
+		if run.ApprovalRequestedAtUnixMs <= 0 || now <= run.ApprovalRequestedAtUnixMs+timeoutMs {
+			continue
+		}
+		run.Status = "FAILED_SAFE"
+		run.ApprovalDecision = "timeout"
+		run.ApprovalDecidedAtUnixMs = now
+		run.LastUpdatedAtUnixMs = now
+		if err := runtime.persistRun(key, run); err != nil {
+			return err
+		}
+		runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "approval_timed_out",
+			slog.String("run_id", run.RunID),
+		)
+		if runtime.approvalsExport != nil {
+			if err := runtime.approvalsExport.Write("approval_timed_out", map[string]any{
+				"run_id": run.RunID,
+			}); err != nil {
+				return err
+			}
+		}
+		if err := runtime.exportRunUpdate(run); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func newRoeJournal(logger *slog.Logger, cfg roeExportTarget) (*roeJournal, error) {

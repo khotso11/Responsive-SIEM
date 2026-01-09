@@ -85,13 +85,6 @@ func main() {
 		defer incidentMgr.Close()
 	}
 
-	rceCfg, err := loadRCEConfig(*configPath)
-	if err != nil {
-		logger.Error("rce_config_load_failed", slog.String("error", err.Error()))
-		os.Exit(1)
-	}
-	rce := newRCE(logger, rceCfg, exporter, incidentMgr)
-
 	logger.Info("master_consumer_starting", slog.Any("config", cfg.Summary()))
 
 	nc, err := nats.Connect(cfg.JetStream.URL, nats.Name("r-siem-master-consume"))
@@ -106,6 +99,24 @@ func main() {
 		logger.Error("jetstream_context_failed", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
+
+	respCfg, err := loadResponseTriggerConfig(*configPath)
+	if err != nil {
+		logger.Error("response_trigger_config_load_failed", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	triggerPublisher, err := newResponseTriggerPublisher(logger, js, respCfg)
+	if err != nil {
+		logger.Error("response_trigger_init_failed", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+
+	rceCfg, err := loadRCEConfig(*configPath)
+	if err != nil {
+		logger.Error("rce_config_load_failed", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	rce := newRCE(logger, rceCfg, exporter, incidentMgr, triggerPublisher)
 
 	params := []consumerParams{
 		{
@@ -656,6 +667,211 @@ func (e *Exporter) logError(err error, meta ExportMeta) {
 		attrs = append(attrs, slog.String("alert_key", meta.AlertKey))
 	}
 	e.logger.LogAttrs(context.Background(), slog.LevelError, "export_error", attrs...)
+}
+
+type ResponseTriggerConfig struct {
+	Enabled         bool
+	Required        bool
+	Stream          string
+	SubjectFast     string
+	SubjectStandard string
+	LanePolicy      string
+}
+
+type responseTriggerConfigRaw struct {
+	Enabled         bool   `yaml:"enabled"`
+	Required        *bool  `yaml:"required"`
+	Stream          string `yaml:"stream"`
+	SubjectFast     string `yaml:"subject_fast"`
+	SubjectStandard string `yaml:"subject_standard"`
+	LanePolicy      string `yaml:"lane_policy"`
+}
+
+type ResponseTriggerPublisher struct {
+	logger *slog.Logger
+	js     nats.JetStreamContext
+	cfg    ResponseTriggerConfig
+}
+
+const (
+	defaultResponseStream      = "RSIEM_RESPONSE"
+	defaultResponseSubjectFast = "rsiem.response.triggers.fast"
+	defaultResponseSubjectStd  = "rsiem.response.triggers.standard"
+	defaultResponseLanePolicy  = "from_alert"
+)
+
+func loadResponseTriggerConfig(path string) (*ResponseTriggerConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read config: %w", err)
+	}
+	var wrapper struct {
+		ResponseTriggers *responseTriggerConfigRaw `yaml:"response_triggers"`
+	}
+	if err := yaml.Unmarshal(data, &wrapper); err != nil {
+		return nil, fmt.Errorf("parse response_triggers config: %w", err)
+	}
+	if wrapper.ResponseTriggers == nil {
+		return nil, nil
+	}
+	cfg := resolveResponseTriggerConfig(*wrapper.ResponseTriggers)
+	if !cfg.Enabled {
+		return nil, nil
+	}
+	return &cfg, nil
+}
+
+func resolveResponseTriggerConfig(raw responseTriggerConfigRaw) ResponseTriggerConfig {
+	cfg := ResponseTriggerConfig{
+		Enabled:         raw.Enabled,
+		Required:        true,
+		Stream:          strings.TrimSpace(raw.Stream),
+		SubjectFast:     strings.TrimSpace(raw.SubjectFast),
+		SubjectStandard: strings.TrimSpace(raw.SubjectStandard),
+		LanePolicy:      strings.TrimSpace(raw.LanePolicy),
+	}
+	if raw.Required != nil {
+		cfg.Required = *raw.Required
+	}
+	if cfg.Stream == "" {
+		cfg.Stream = defaultResponseStream
+	}
+	if cfg.SubjectFast == "" {
+		cfg.SubjectFast = defaultResponseSubjectFast
+	}
+	if cfg.SubjectStandard == "" {
+		cfg.SubjectStandard = defaultResponseSubjectStd
+	}
+	if cfg.LanePolicy == "" {
+		cfg.LanePolicy = defaultResponseLanePolicy
+	}
+	return cfg
+}
+
+func newResponseTriggerPublisher(logger *slog.Logger, js nats.JetStreamContext, cfg *ResponseTriggerConfig) (*ResponseTriggerPublisher, error) {
+	if cfg == nil || !cfg.Enabled {
+		return nil, nil
+	}
+	if err := ensureResponseStream(js, cfg); err != nil {
+		return nil, err
+	}
+	return &ResponseTriggerPublisher{
+		logger: logger,
+		js:     js,
+		cfg:    *cfg,
+	}, nil
+}
+
+func ensureResponseStream(js nats.JetStreamContext, cfg *ResponseTriggerConfig) error {
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name: cfg.Stream,
+		Subjects: []string{
+			cfg.SubjectFast,
+			cfg.SubjectStandard,
+			"rsiem.response.steps.fast",
+			"rsiem.response.steps.standard",
+		},
+	})
+	if err != nil && !errors.Is(err, nats.ErrStreamNameAlreadyInUse) {
+		return err
+	}
+	return nil
+}
+
+func (p *ResponseTriggerPublisher) PublishAlert(alert ResponseTriggerAlert) error {
+	if p == nil || !p.cfg.Enabled {
+		return nil
+	}
+	lane := p.resolveLane(alert.Lane, alert.Severity)
+	subject := p.cfg.SubjectStandard
+	if lane == "FAST" {
+		subject = p.cfg.SubjectFast
+	}
+	alertKey := strings.TrimSpace(alert.AlertKey)
+	triggerID := fmt.Sprintf("trig.alert.%s", alertKey)
+	payload := map[string]any{
+		"msg":                 "response_trigger",
+		"lane":                lane,
+		"trigger_kind":        "alert",
+		"trigger_idem_key":    triggerID,
+		"alert_key":           alertKey,
+		"rule_id":             alert.RuleID,
+		"rule_kind":           alert.RuleKind,
+		"severity":            alert.Severity,
+		"observed_at_unix_ms": alert.ObservedAtUnixMs,
+		"stream":              alert.Stream,
+		"consumer":            alert.Consumer,
+		"subject":             alert.Subject,
+		"batch_key":           alert.BatchKey,
+	}
+	if alert.GroupBy != "" {
+		payload["group_by"] = alert.GroupBy
+	}
+	if alert.GroupKey != "" {
+		payload["group_key"] = alert.GroupKey
+	}
+	if alert.AgentID != "" {
+		payload["agent_id"] = alert.AgentID
+	}
+	if alert.JSSeq != nil {
+		payload["js_seq"] = *alert.JSSeq
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return p.handleError(err, triggerID, subject, alert)
+	}
+	if _, err := p.js.Publish(subject, data); err != nil {
+		return p.handleError(err, triggerID, subject, alert)
+	}
+	return nil
+}
+
+func (p *ResponseTriggerPublisher) resolveLane(alertLane, severity string) string {
+	switch strings.ToLower(p.cfg.LanePolicy) {
+	case "by_severity":
+		if strings.ToLower(severity) == "high" {
+			return "FAST"
+		}
+		return "STANDARD"
+	default:
+		if strings.TrimSpace(alertLane) == "" {
+			return "STANDARD"
+		}
+		return alertLane
+	}
+}
+
+func (p *ResponseTriggerPublisher) handleError(err error, triggerID, subject string, alert ResponseTriggerAlert) error {
+	if p.cfg.Required {
+		return err
+	}
+	attrs := []slog.Attr{
+		slog.String("error", err.Error()),
+		slog.String("trigger_idem_key", triggerID),
+		slog.String("subject", subject),
+		slog.String("rule_id", alert.RuleID),
+		slog.String("alert_key", alert.AlertKey),
+	}
+	p.logger.LogAttrs(context.Background(), slog.LevelError, "response_trigger_publish_error", attrs...)
+	return nil
+}
+
+type ResponseTriggerAlert struct {
+	AlertKey         string
+	RuleID           string
+	RuleKind         string
+	Severity         string
+	GroupBy          string
+	GroupKey         string
+	AgentID          string
+	ObservedAtUnixMs int64
+	Lane             string
+	Stream           string
+	Consumer         string
+	Subject          string
+	JSSeq            *uint64
+	BatchKey         string
 }
 
 type IncidentConfig struct {
@@ -1316,6 +1532,7 @@ type RCE struct {
 	suppression map[string]int64
 	exporter    *Exporter
 	incidents   *IncidentManager
+	triggers    *ResponseTriggerPublisher
 }
 
 type ruleState struct {
@@ -1411,7 +1628,7 @@ func applyRCEDefaults(cfg *RCEConfig) {
 	}
 }
 
-func newRCE(logger *slog.Logger, cfg *RCEConfig, exporter *Exporter, incidents *IncidentManager) *RCE {
+func newRCE(logger *slog.Logger, cfg *RCEConfig, exporter *Exporter, incidents *IncidentManager, triggers *ResponseTriggerPublisher) *RCE {
 	if cfg == nil {
 		return nil
 	}
@@ -1423,6 +1640,7 @@ func newRCE(logger *slog.Logger, cfg *RCEConfig, exporter *Exporter, incidents *
 		suppression: make(map[string]int64),
 		exporter:    exporter,
 		incidents:   incidents,
+		triggers:    triggers,
 	}
 	go r.worker()
 	go r.cleanupLoop()
@@ -2004,6 +2222,27 @@ func (r *RCE) emitAlert(rule RCERule, rec NormalizedRecord, groupKey string, rul
 			AgentID:                  rec.AgentID,
 		}
 		if err := r.incidents.ProcessAlert(incidentAlert); err != nil {
+			return err
+		}
+	}
+	if r.triggers != nil {
+		triggerAlert := ResponseTriggerAlert{
+			AlertKey:         alertKey,
+			RuleID:           rule.ID,
+			RuleKind:         ruleKind,
+			Severity:         rule.Severity,
+			GroupBy:          rule.GroupBy,
+			GroupKey:         groupKey,
+			AgentID:          rec.AgentID,
+			ObservedAtUnixMs: now,
+			Lane:             rec.Lane,
+			Stream:           rec.Stream,
+			Consumer:         rec.Consumer,
+			Subject:          rec.Subject,
+			JSSeq:            rec.JSSeq,
+			BatchKey:         rec.BatchKey,
+		}
+		if err := r.triggers.PublishAlert(triggerAlert); err != nil {
 			return err
 		}
 	}

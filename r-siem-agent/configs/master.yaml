@@ -1,5 +1,6 @@
 log_level: INFO
 listen_addr: 0.0.0.0:7777
+
 transport:
   mode: grpc_mtls
   tls:
@@ -7,6 +8,7 @@ transport:
     cert: configs/certs/master.pem
     key: configs/certs/master-key.pem
   server_name: master.local
+
 jetstream:
   url: nats://127.0.0.1:4222
   stream: RSIEM
@@ -14,6 +16,7 @@ jetstream:
   subject_standard: rsiem.standard
   durable_name_fast: master-fast
   durable_name_standard: master-standard
+
 export:
   enabled: true
   path: "exports/alerts.jsonl"
@@ -22,6 +25,7 @@ export:
     correlation_matches: false
   required: true
   flush: true
+
 incidents:
   enabled: true
   max_open_incidents: 50000
@@ -33,13 +37,165 @@ incidents:
     required: true
     path: "exports/incidents.jsonl"
     flush: true
+
+response_triggers:
+  enabled: true
+  # ROE consumes these
+  stream: "RSIEM_RESPONSE"
+  subject_fast: "rsiem.response.triggers.fast"
+  subject_standard: "rsiem.response.triggers.standard"
+
+  # If true: master-consume MUST successfully publish the trigger before ACKing the input JS msg
+  required: true
+
+  # Lane decision policy (v0)
+  # If "from_alert": use the alert's lane field.
+  # If "by_severity": map severity high->FAST else STANDARD.
+  lane_policy: "from_alert"
+
+roe:
+  enabled: true
+
+  jetstream:
+    # Reuse existing jetstream.url unless you intentionally want a different one
+    url: "nats://127.0.0.1:4222"
+    stream: "RSIEM_RESPONSE"
+    subject_triggers_fast: "rsiem.response.triggers.fast"
+    subject_triggers_standard: "rsiem.response.triggers.standard"
+    subject_steps_fast: "rsiem.response.steps.fast"
+    subject_steps_standard: "rsiem.response.steps.standard"
+
+    durable_triggers_fast: "roe-trig-fast-replay1"
+    durable_triggers_standard: "roe-trig-standard-replay1"
+
+  workers:
+    fast_workers: 1
+    standard_workers: 1
+    pull_batch: 10
+    pull_timeout_ms: 500
+
+  dispatch_queue:
+    size: 1000
+    degrade_high_watermark_pct: 80
+    degrade_low_watermark_pct: 50
+
+  kv:
+    bucket_idemp: "RSIEM_RSP_IDEMP"
+    bucket_runs: "RSIEM_RSP_RUNS"
+    bucket_steps: "RSIEM_RSP_STEPS"
+    bucket_locks: "RSIEM_RSP_LOCKS"
+
+  # ROE v0.3 journaling / exports (JSONL)
+  # Worker writes step result journal
+  worker:
+    export:
+      enabled: true
+      required: false
+      steps_path: "exports/roe_steps.jsonl"
+      flush: true
+
+  # ROE writes run outcome journal
+  export:
+    enabled: true
+    required: false
+    runs_path: "exports/roe_runs.jsonl"
+    flush: true
+
+playbooks:
+  - id: "PB-STAT-PROCESS-MED"
+    version: 1
+    enabled: true
+    selectors:
+      rule_ids: ["R-STAT-PROCESS-MED"]
+    policy_requirements:
+      approval: "auto"
+      max_blast_radius: 1
+    steps:
+      - name: "notify_soc"
+        action_type: "notify"
+        timeout_ms: 2000
+        retries: 0
+        backoff_ms: 0
+        target_from: "global"
+
+  - id: "PB-COUNT-PROCESS-HOST"
+    version: 1
+    enabled: true
+    selectors:
+      rule_ids: ["R-COUNT-PROCESS-HOST"]
+    policy_requirements:
+      approval: "auto"
+      max_blast_radius: 1
+    steps:
+      - name: "contain_host_stub"
+        action_type: "agent_command_stub"
+        timeout_ms: 5000
+        retries: 2
+        backoff_ms: 500
+        target_from: "group_key"   # host
+
+  - id: "PB-SEQ-PROCESS-TO-NET"
+    version: 1
+    enabled: true
+    selectors:
+      rule_ids: ["R-SEQ-PROCESS-TO-NET"]
+    policy_requirements:
+      approval: "required_for_high"
+      max_blast_radius: 1
+    steps:
+      - name: "block_egress_stub"
+        action_type: "network_block_stub"
+        timeout_ms: 5000
+        retries: 2
+        backoff_ms: 500
+        target_from: "group_key"   # host
+
+  - id: "PB-JOIN-HIGH-NET"
+    version: 1
+    enabled: true
+    selectors:
+      rule_ids: ["R-JOIN-HIGH-NET"]
+    policy_requirements:
+      approval: "required_for_high"
+      max_blast_radius: 3
+    steps:
+      - name: "rate_limit_src_ip_stub"
+        action_type: "network_rate_limit_stub"
+        timeout_ms: 5000
+        retries: 2
+        backoff_ms: 500
+        target_from: "group_key"   # src_ip
+
+policies:
+  safe_mode:
+    enabled: true
+    # When ROE is degraded, require approvals more aggressively
+    require_approval_when_degraded: true
+
+  approvals:
+    # If approval is required, how long we wait before failing safe
+    timeout_ms: 60000
+
+  blast_radius:
+    default_max: 1
+
+  action_allowlist:
+    # v0.1: planning only (no real connectors yet)
+    allowed_action_types:
+      - "notify"
+      - "agent_command_stub"
+      - "network_block_stub"
+      - "network_rate_limit_stub"
+
 consumer:
   fast_workers: 1
   standard_workers: 1
   pull_batch: 10
   pull_timeout_ms: 500
+
 ack_delay_ms: 0
 ack_drop_rate: 0.0
+
 rce:
   enabled: true
   dispatch:
@@ -63,6 +219,7 @@ rce:
         type: process
         fields:
           severity: medium
+
     - id: R-COUNT-PROCESS-HOST
       enabled: true
       kind: count
@@ -72,6 +229,7 @@ rce:
       threshold: 3
       when:
         type: process
+
     - id: R-SEQ-PROCESS-TO-NET
       enabled: true
       kind: sequence
@@ -81,6 +239,7 @@ rce:
       steps:
         - type: process
         - type: network
+
     - id: R-JOIN-HIGH-NET
       enabled: true
       kind: join
@@ -92,3 +251,4 @@ rce:
           fields:
             severity: high
         - type: network
+

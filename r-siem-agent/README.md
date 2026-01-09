@@ -136,6 +136,88 @@ go run -mod=vendor ./cmd/master-inspect --count 10
 
 Addressing note: for local same-machine tests use `127.0.0.1:7777`; for cross-machine tests use `10.238.211.178:7777`.
 
+## Local Runbook: End-to-End (Consume → Alert/Incident → ROE → Worker → Results → Approvals)
+
+This is a copy-paste flow for local validation. Use your existing NATS JetStream setup (Docker example below).
+
+Terminal A — NATS JetStream:
+
+```
+docker run --rm --name rsiem-nats -p 4222:4222 -p 8222:8222 nats:2.10 -js
+```
+
+Terminal B — Consume + RCE + Incidents:
+
+```
+export GOTOOLCHAIN=go1.24.11
+go run -mod=vendor ./cmd/master-consume --config configs/master.yaml
+```
+
+Terminal C — ROE (triggers → runs → plans → results consumer):
+
+```
+export GOTOOLCHAIN=go1.24.11
+go run -mod=vendor ./cmd/master-roe --config configs/master.yaml
+```
+
+Terminal D — ROE worker (executes steps → publishes results):
+
+```
+export GOTOOLCHAIN=go1.24.11
+go run -mod=vendor ./cmd/master-roe-worker --config configs/master.yaml
+```
+
+Terminal E — Smoke client (no `--config`, use flags):
+
+```
+export GOTOOLCHAIN=go1.24.11
+go run -mod=vendor ./cmd/master-smoke -addr 127.0.0.1:7777 -ca configs/certs/ca.pem -cert configs/certs/agent.pem -key configs/certs/agent-key.pem -server-name master.local
+```
+
+Approvals (approve/deny via CLI):
+
+```
+export GOTOOLCHAIN=go1.24.11
+go run -mod=vendor ./cmd/master-roe-approve --config configs/master.yaml --run_id <RUN_ID_FROM_ROE_LOGS> --decision approve --actor "soc@test" --reason "approved for test"
+```
+
+```
+export GOTOOLCHAIN=go1.24.11
+go run -mod=vendor ./cmd/master-roe-approve --config configs/master.yaml --run_id <RUN_ID_FROM_ROE_LOGS> --decision deny --actor "soc@test" --reason "deny test"
+```
+
+Expected logs (spot-check):
+- `normalized_event`, `correlation_match`, `alert`
+- `incident_opened`, `incident_closed`
+- `response_trigger_received`, `response_run_created`, `response_plan_compiled`, `response_step_published`
+- `step_received`, `step_state`, `step_succeeded`
+- `response_step_result_received`, `response_result_applied`, `response_result_duplicate`, `response_run_updated`
+- `roe_lock_acquired`, `roe_lock_released`, `roe_lock_contended`
+- `approval_requested`, `response_run_waiting_approval`, `approval_published`, `approval_received`, `approval_approved`, `approval_denied`, `approval_duplicate`, `approval_timed_out`, `response_steps_released_after_approval`
+
+Default subjects:
+- `rsiem.response.triggers.fast` | `rsiem.response.triggers.standard`
+- `rsiem.response.steps.fast` | `rsiem.response.steps.standard`
+- `rsiem.response.results.fast` | `rsiem.response.results.standard`
+- `rsiem.response.approvals`
+- `rsiem.response.approval_requests`
+
+Verification (JSONL exports):
+
+```
+tail -n 10 exports/alerts.jsonl
+tail -n 10 exports/incidents.jsonl
+tail -n 10 exports/roe_runs.jsonl
+tail -n 10 exports/roe_steps.jsonl
+tail -n 10 exports/roe_approvals.jsonl
+```
+
+Notes on correctness:
+- Lane-aware separation (FAST vs STANDARD) for triggers, steps, results.
+- ACK-after-commit semantics for triggers/results/approvals.
+- Idempotency for triggers, results, and approvals (KV-backed).
+- Per-run locks ensure multi-worker safety and avoid lost updates.
+
 ## What to expect (first run)
 
 - Terminal B logs `master_starting`, `jetstream_stream_ready`, `master_recv_batch`, `master_send_ack`.

@@ -45,8 +45,9 @@ type roeSelectors struct {
 }
 
 type roeStep struct {
-	ActionType string `yaml:"action_type"`
-	TargetFrom string `yaml:"target_from"`
+	ActionType string         `yaml:"action_type"`
+	TargetFrom string         `yaml:"target_from"`
+	Params     map[string]any `yaml:"params"`
 }
 
 type roePolicyRequirements struct {
@@ -213,15 +214,16 @@ type runRecord struct {
 }
 
 type stepRecord struct {
-	StepID      string `json:"step_id"`
-	StepIdemKey string `json:"step_idem_key"`
-	RunID       string `json:"run_id"`
-	StepIndex   int    `json:"step_index"`
-	ActionType  string `json:"action_type"`
-	Target      string `json:"target,omitempty"`
-	Status      string `json:"status"`
-	Attempt     int    `json:"attempt"`
-	Lane        string `json:"lane"`
+	StepID      string         `json:"step_id"`
+	StepIdemKey string         `json:"step_idem_key"`
+	RunID       string         `json:"run_id"`
+	StepIndex   int            `json:"step_index"`
+	ActionType  string         `json:"action_type"`
+	Target      string         `json:"target,omitempty"`
+	Params      map[string]any `json:"params"`
+	Status      string         `json:"status"`
+	Attempt     int            `json:"attempt"`
+	Lane        string         `json:"lane"`
 }
 
 type stepResult struct {
@@ -1759,6 +1761,10 @@ func compileSteps(runID string, trigger responseTrigger, playbook roePlaybook) (
 		default:
 			return nil, fmt.Errorf("invalid_target_from")
 		}
+		params := step.Params
+		if params == nil {
+			params = map[string]any{}
+		}
 		stepID := shortHash(fmt.Sprintf("%s|%d|%s|%s", runID, idx, step.ActionType, target))
 		record := stepRecord{
 			StepID:      stepID,
@@ -1767,6 +1773,7 @@ func compileSteps(runID string, trigger responseTrigger, playbook roePlaybook) (
 			StepIndex:   idx,
 			ActionType:  step.ActionType,
 			Target:      target,
+			Params:      params,
 			Status:      "PLANNED",
 			Attempt:     0,
 			Lane:        trigger.Lane,
@@ -1805,6 +1812,9 @@ func (r *roeRuntime) publishStep(lane string, step stepRecord) (string, error) {
 	subject := r.subjectStepsStandard()
 	if strings.EqualFold(lane, "FAST") {
 		subject = r.subjectStepsFast()
+	}
+	if step.Params == nil {
+		step.Params = map[string]any{}
 	}
 	payload, err := json.Marshal(step)
 	if err != nil {

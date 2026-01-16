@@ -84,20 +84,21 @@ type roeWorkerConfigWrapper struct {
 }
 
 type stepMessage struct {
-	RunID           string `json:"run_id"`
-	StepID          string `json:"step_id"`
-	StepIndex       int    `json:"step_index"`
-	ActionType      string `json:"action_type"`
-	Lane            string `json:"lane"`
-	StepIdemKey     string `json:"step_idem_key"`
-	Attempt         int    `json:"attempt"`
-	Target          string `json:"target"`
-	PlannedAtUnixMs int64  `json:"planned_at_unix_ms"`
-	EmittedAtUnixMs int64  `json:"emitted_at_unix_ms"`
-	Retries         *int   `json:"retries,omitempty"`
-	BackoffMs       *int64 `json:"backoff_ms,omitempty"`
-	BackoffMaxMs    *int64 `json:"backoff_max_ms,omitempty"`
-	TimeoutMs       *int64 `json:"timeout_ms,omitempty"`
+	RunID           string         `json:"run_id"`
+	StepID          string         `json:"step_id"`
+	StepIndex       int            `json:"step_index"`
+	ActionType      string         `json:"action_type"`
+	Lane            string         `json:"lane"`
+	StepIdemKey     string         `json:"step_idem_key"`
+	Attempt         int            `json:"attempt"`
+	Target          string         `json:"target"`
+	Params          map[string]any `json:"params,omitempty"`
+	PlannedAtUnixMs int64          `json:"planned_at_unix_ms"`
+	EmittedAtUnixMs int64          `json:"emitted_at_unix_ms"`
+	Retries         *int           `json:"retries,omitempty"`
+	BackoffMs       *int64         `json:"backoff_ms,omitempty"`
+	BackoffMaxMs    *int64         `json:"backoff_max_ms,omitempty"`
+	TimeoutMs       *int64         `json:"timeout_ms,omitempty"`
 }
 
 type stepState struct {
@@ -227,8 +228,11 @@ func main() {
 		testFailKV: isTestFailAfterKVEnabled(),
 		exporter:   exporter,
 		workerID:   newWorkerID(),
-		connectors: connectors.NewManager(connectors.Builtins()...),
-		allowlist:  buildAllowlist(cfg.AllowedActionTypes),
+		connectors: connectors.NewManager(connectors.Builtins(connectors.BuiltinOptions{
+			Logger: logger,
+			NATS:   nc,
+		})...),
+		allowlist: buildAllowlist(cfg.AllowedActionTypes),
 	}
 	logger.LogAttrs(context.Background(), slog.LevelInfo, "roe_connector_manager_ready",
 		slog.Int("connectors", runtime.connectors.Count()),
@@ -724,6 +728,39 @@ func processStep(runtime *workerRuntime, msg *nats.Msg) error {
 		return msg.Ack()
 	}
 
+	if reason := validateStepParams(connector.RequiredParams(), connector.OptionalParams(), step.Params); reason != "" {
+		final := running
+		final.Status = "FAILED_SAFE"
+		final.LastError = reason
+		final.FinishedAtUnixMs = time.Now().UnixMilli()
+		if err := putState(runtime.kv, stepKey, final); err != nil {
+			runtime.logger.Error("roe_step_kv_error", slog.String("error", err.Error()))
+			return nil
+		}
+		if err := runtime.persistTerminalResult(step, final); err != nil {
+			runtime.logger.Error("roe_result_kv_error", slog.String("error", err.Error()))
+			return nil
+		}
+		if err := runtime.maybeFailAfterKV(step, jsSeq); err != nil {
+			return err
+		}
+		if err := runtime.publishResult(step, final); err != nil {
+			runtime.logger.Error("roe_step_result_publish_failed", slog.String("error", err.Error()))
+			return nil
+		}
+		runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "step_failed_safe",
+			slog.String("run_id", step.RunID),
+			slog.String("step_id", step.StepID),
+			slog.String("last_error", reason),
+			slog.Int("attempt", attempt),
+		)
+		runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "roe_connector_terminal",
+			slog.String("status", final.Status),
+			slog.String("err", reason),
+		)
+		return msg.Ack()
+	}
+
 	runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "roe_connector_selected",
 		slog.String("connector", connector.Name()),
 		slog.String("run_id", step.RunID),
@@ -963,6 +1000,11 @@ func (r *workerRuntime) executeConnector(ctx context.Context, connector connecto
 	return connector.Execute(ctx, connectors.Step{
 		ActionType: step.ActionType,
 		Target:     step.Target,
+		RunID:      step.RunID,
+		StepID:     step.StepID,
+		Lane:       step.Lane,
+		Params:     step.Params,
+		TimeoutMs:  step.TimeoutMs,
 	})
 }
 
@@ -1117,6 +1159,36 @@ func resolveTimeout(step stepMessage) time.Duration {
 		return 0
 	}
 	return time.Duration(*step.TimeoutMs) * time.Millisecond
+}
+
+func validateStepParams(required []string, optional []string, params map[string]any) string {
+	allowed := make(map[string]struct{}, len(required)+len(optional))
+	for _, name := range required {
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "" {
+			continue
+		}
+		allowed[trimmed] = struct{}{}
+		if params == nil {
+			return fmt.Sprintf("missing_param:%s", trimmed)
+		}
+		if _, ok := params[trimmed]; !ok {
+			return fmt.Sprintf("missing_param:%s", trimmed)
+		}
+	}
+	for _, name := range optional {
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "" {
+			continue
+		}
+		allowed[trimmed] = struct{}{}
+	}
+	for name := range params {
+		if _, ok := allowed[name]; !ok {
+			return fmt.Sprintf("unknown_param:%s", name)
+		}
+	}
+	return ""
 }
 
 func newWorkerExporter(logger *slog.Logger, cfg workerExportConfig) (*workerExporter, error) {

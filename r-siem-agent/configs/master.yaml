@@ -146,7 +146,7 @@ playbooks:
         target_from: "group_key"
 
       - name: "contain_host_stub"
-        action_type: "agent_command_stub"
+        action_type: "agent_command"
         timeout_ms: 5000
         retries: 2
         backoff_ms: 500
@@ -169,7 +169,7 @@ playbooks:
       max_blast_radius: 1
     steps:
       - name: "block_egress_stub"
-        action_type: "network_block_stub"
+        action_type: "network_block"
         timeout_ms: 5000
         retries: 2
         backoff_ms: 500
@@ -185,7 +185,7 @@ playbooks:
       max_blast_radius: 3
     steps:
       - name: "rate_limit_src_ip_stub"
-        action_type: "network_rate_limit_stub"
+        action_type: "network_rate_limit"
         timeout_ms: 5000
         retries: 2
         backoff_ms: 500
@@ -208,9 +208,9 @@ policies:
     # v0.1: planning only (no real connectors yet)
     allowed_action_types:
       - "notify"
-      - "agent_command_stub"
-      - "network_block_stub"
-      - "network_rate_limit_stub"
+      - "agent_command"
+      - "network_block"
+      - "network_rate_limit"
 
 consumer:
   fast_workers: 1

@@ -8,11 +8,18 @@ import (
 type Step struct {
 	ActionType string
 	Target     string
+	RunID      string
+	StepID     string
+	Lane       string
+	Params     map[string]any
+	TimeoutMs  *int64
 }
 
 type Connector interface {
 	Name() string
 	ActionType() string
+	RequiredParams() []string
+	OptionalParams() []string
 	Execute(ctx context.Context, step Step) (map[string]any, error)
 }
 

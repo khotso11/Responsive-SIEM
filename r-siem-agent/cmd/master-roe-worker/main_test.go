@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"testing"
+
+	"r-siem-agent/internal/roe/connectors"
+)
 
 func TestResolveAttempt(t *testing.T) {
 	step := stepMessage{Attempt: 0}
@@ -48,4 +52,40 @@ func TestRetryDelayMs(t *testing.T) {
 	if got := retryDelayMs(1000, &stepState{}); got != 0 {
 		t.Fatalf("retryDelayMs empty state got %d, want 0", got)
 	}
+}
+
+func TestValidateStepParamsAllowlist(t *testing.T) {
+	block := findBuiltin(t, "network_block")
+	rateLimit := findBuiltin(t, "network_rate_limit")
+
+	if reason := validateStepParams(block.RequiredParams(), block.OptionalParams(), map[string]any{
+		"direction": "ingress",
+	}); reason != "" {
+		t.Fatalf("network_block allowlist rejected direction: %s", reason)
+	}
+
+	if reason := validateStepParams(rateLimit.RequiredParams(), rateLimit.OptionalParams(), map[string]any{
+		"rate_kbps":   512,
+		"burst_kb":    128,
+		"duration_ms": 60000,
+	}); reason != "" {
+		t.Fatalf("network_rate_limit allowlist rejected params: %s", reason)
+	}
+
+	if reason := validateStepParams(rateLimit.RequiredParams(), rateLimit.OptionalParams(), map[string]any{
+		"unknown_param": "nope",
+	}); reason == "" {
+		t.Fatalf("expected unknown_param to be rejected")
+	}
+}
+
+func findBuiltin(t *testing.T, action string) connectors.Connector {
+	t.Helper()
+	for _, connector := range connectors.Builtins(connectors.BuiltinOptions{}) {
+		if connector.ActionType() == action {
+			return connector
+		}
+	}
+	t.Fatalf("missing builtin connector %q", action)
+	return nil
 }

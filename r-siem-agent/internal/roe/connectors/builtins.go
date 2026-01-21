@@ -279,7 +279,7 @@ func (networkBlockStubConnector) RequiredParams() []string {
 }
 
 func (networkBlockStubConnector) OptionalParams() []string {
-	return nil
+	return []string{"direction"}
 }
 
 func (c networkBlockStubConnector) Execute(ctx context.Context, step Step) (map[string]any, error) {
@@ -315,7 +315,7 @@ func (networkRateLimitStubConnector) RequiredParams() []string {
 }
 
 func (networkRateLimitStubConnector) OptionalParams() []string {
-	return nil
+	return []string{"rate_kbps", "burst_kb", "duration_ms"}
 }
 
 func (c networkRateLimitStubConnector) Execute(ctx context.Context, step Step) (map[string]any, error) {

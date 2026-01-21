@@ -532,6 +532,7 @@ func processStep(runtime *workerRuntime, msg *nats.Msg) error {
 		slog.Uint64("js_seq", jsSeq),
 	)
 
+	var priorState *stepState
 	if payload, found, err := runtime.getTerminalResult(resultKey); err != nil {
 		runtime.logger.Error("roe_result_kv_error", slog.String("error", err.Error()))
 		return nil
@@ -592,12 +593,13 @@ func processStep(runtime *workerRuntime, msg *nats.Msg) error {
 			)
 			return msg.Ack()
 		case "FAILED_TRANSIENT":
+			priorState = &state
 			if err := runtime.publishResult(step, state); err != nil {
 				runtime.logger.Error("roe_step_result_publish_failed", slog.String("error", err.Error()))
 				return nil
 			}
-			if state.NextRetryAtUnixMs > 0 && time.Now().UnixMilli() < state.NextRetryAtUnixMs {
-				if err := msg.NakWithDelay(time.Duration(runtime.cfg.BaseBackoffMs) * time.Millisecond); err != nil {
+			if delayMs := retryDelayMs(time.Now().UnixMilli(), &state); delayMs > 0 {
+				if err := msg.NakWithDelay(time.Duration(delayMs) * time.Millisecond); err != nil {
 					runtime.logger.Error("roe_step_nak_failed", slog.String("error", err.Error()))
 				}
 				return nil
@@ -631,7 +633,7 @@ func processStep(runtime *workerRuntime, msg *nats.Msg) error {
 	)
 	defer runtime.releaseRunLock(lockKey, step)
 
-	attempt := step.Attempt + 1
+	attempt := resolveAttempt(step, priorState)
 	maxAttempts := resolveMaxAttempts(step, runtime.cfg.MaxAttempts)
 	baseBackoff := resolveBackoff(step, runtime.cfg.BaseBackoffMs, defaultBaseBackoffMs)
 	maxBackoff := resolveBackoffMax(step, runtime.cfg.MaxBackoffMs, defaultMaxBackoffMs)
@@ -1129,6 +1131,28 @@ func resolveMaxAttempts(step stepMessage, fallback int) int {
 		return defaultMaxAttempts
 	}
 	return fallback
+}
+
+func resolveAttempt(step stepMessage, state *stepState) int {
+	base := step.Attempt
+	if state != nil && state.Attempt > base {
+		base = state.Attempt
+	}
+	return base + 1
+}
+
+func retryDelayMs(nowUnixMs int64, state *stepState) int64 {
+	if state == nil || state.NextRetryAtUnixMs <= 0 {
+		return 0
+	}
+	if nowUnixMs >= state.NextRetryAtUnixMs {
+		return 0
+	}
+	delay := state.NextRetryAtUnixMs - nowUnixMs
+	if delay < 1 {
+		return 1
+	}
+	return delay
 }
 
 func resolveBackoff(step stepMessage, fallback int64, defaultValue int64) int64 {

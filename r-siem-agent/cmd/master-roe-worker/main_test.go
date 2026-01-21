@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"testing"
 
 	"r-siem-agent/internal/roe/connectors"
@@ -54,9 +55,33 @@ func TestRetryDelayMs(t *testing.T) {
 	}
 }
 
+func TestRetryableErrorBackoff(t *testing.T) {
+	err := connectors.Retryable(fmt.Errorf("agent_command_no_responders"))
+	if !connectors.IsRetryable(err) {
+		t.Fatalf("expected retryable error")
+	}
+	backoff := computeBackoff(1, 500, 2000)
+	if backoff != 500 {
+		t.Fatalf("expected backoff 500, got %d", backoff)
+	}
+}
+
 func TestValidateStepParamsAllowlist(t *testing.T) {
+	agentCmd := findBuiltin(t, "agent_command")
 	block := findBuiltin(t, "network_block")
 	rateLimit := findBuiltin(t, "network_rate_limit")
+
+	if reason := validateStepParams(agentCmd.RequiredParams(), agentCmd.OptionalParams(), map[string]any{
+		"command": "ping",
+	}); reason != "" {
+		t.Fatalf("agent_command allowlist rejected command: %s", reason)
+	}
+
+	if reason := validateStepParams(agentCmd.RequiredParams(), agentCmd.OptionalParams(), map[string]any{
+		"name": "ping",
+	}); reason != "" {
+		t.Fatalf("agent_command allowlist rejected name: %s", reason)
+	}
 
 	if reason := validateStepParams(block.RequiredParams(), block.OptionalParams(), map[string]any{
 		"direction": "ingress",
@@ -77,6 +102,42 @@ func TestValidateStepParamsAllowlist(t *testing.T) {
 	}); reason == "" {
 		t.Fatalf("expected unknown_param to be rejected")
 	}
+}
+
+func TestValidationFailureState(t *testing.T) {
+	step := stepMessage{
+		RunID:      "run-1",
+		StepID:     "step-1",
+		StepIndex:  1,
+		ActionType: "agent_command",
+		Lane:       "FAST",
+		Attempt:    2,
+		Retries:    intPtr(2),
+	}
+	reason := "unknown_param:frobnicate"
+	if !isValidationError(reason) {
+		t.Fatalf("expected validation error for %q", reason)
+	}
+	final := validationFailureState(step, reason)
+	if final.Status != "FAILED_SAFE" {
+		t.Fatalf("expected FAILED_SAFE, got %s", final.Status)
+	}
+	if final.Attempt != step.Attempt {
+		t.Fatalf("expected attempt %d, got %d", step.Attempt, final.Attempt)
+	}
+	if final.NextRetryAtUnixMs != 0 {
+		t.Fatalf("expected no retry scheduled, got %d", final.NextRetryAtUnixMs)
+	}
+	if final.LastError != reason {
+		t.Fatalf("expected last_error %q, got %q", reason, final.LastError)
+	}
+	if final.FinishedAtUnixMs <= 0 {
+		t.Fatalf("expected finished_at_unix_ms to be set")
+	}
+}
+
+func intPtr(value int) *int {
+	return &value
 }
 
 func findBuiltin(t *testing.T, action string) connectors.Connector {

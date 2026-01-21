@@ -732,9 +732,13 @@ func processStep(runtime *workerRuntime, msg *nats.Msg) error {
 
 	if reason := validateStepParams(connector.RequiredParams(), connector.OptionalParams(), step.Params); reason != "" {
 		final := running
-		final.Status = "FAILED_SAFE"
-		final.LastError = reason
-		final.FinishedAtUnixMs = time.Now().UnixMilli()
+		if isValidationError(reason) {
+			final = validationFailureState(step, reason)
+		} else {
+			final.Status = "FAILED_SAFE"
+			final.LastError = reason
+			final.FinishedAtUnixMs = time.Now().UnixMilli()
+		}
 		if err := putState(runtime.kv, stepKey, final); err != nil {
 			runtime.logger.Error("roe_step_kv_error", slog.String("error", err.Error()))
 			return nil
@@ -754,7 +758,7 @@ func processStep(runtime *workerRuntime, msg *nats.Msg) error {
 			slog.String("run_id", step.RunID),
 			slog.String("step_id", step.StepID),
 			slog.String("last_error", reason),
-			slog.Int("attempt", attempt),
+			slog.Int("attempt", final.Attempt),
 		)
 		runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "roe_connector_terminal",
 			slog.String("status", final.Status),
@@ -1153,6 +1157,34 @@ func retryDelayMs(nowUnixMs int64, state *stepState) int64 {
 		return 1
 	}
 	return delay
+}
+
+func isValidationError(reason string) bool {
+	return strings.HasPrefix(reason, "unknown_param:") ||
+		strings.HasPrefix(reason, "missing_param:") ||
+		strings.HasPrefix(reason, "missing_required_param:")
+}
+
+func validationAttempt(step stepMessage) int {
+	attempt := step.Attempt
+	if attempt < 1 {
+		return 1
+	}
+	return attempt
+}
+
+func validationFailureState(step stepMessage, reason string) stepState {
+	return stepState{
+		Status:           "FAILED_SAFE",
+		Attempt:          validationAttempt(step),
+		LastError:        reason,
+		FinishedAtUnixMs: time.Now().UnixMilli(),
+		RunID:            step.RunID,
+		StepID:           step.StepID,
+		StepIndex:        step.StepIndex,
+		ActionType:       step.ActionType,
+		Lane:             step.Lane,
+	}
 }
 
 func resolveBackoff(step stepMessage, fallback int64, defaultValue int64) int64 {

@@ -162,7 +162,7 @@ func (c *agentCommandStubConnector) RequiredParams() []string {
 }
 
 func (c *agentCommandStubConnector) OptionalParams() []string {
-	return []string{"force"}
+	return []string{"command", "name", "force"}
 }
 
 func (c *agentCommandStubConnector) Execute(ctx context.Context, step Step) (map[string]any, error) {

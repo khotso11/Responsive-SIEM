@@ -55,8 +55,21 @@ func main() {
 		"transport_tls_server_name", cfg.TransportTLSServerName(),
 	)
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	baseCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	ctx, cancel := context.WithCancel(baseCtx)
+	defer cancel()
+
+	listenerErrs := make(chan error, 1)
+	go func() {
+		listenerErrs <- runCommandListener(ctx, logger, commandNatsURL())
+	}()
+	go func() {
+		if err := <-listenerErrs; err != nil {
+			logger.Error("agent_command_listener_failed", "error", err)
+			cancel()
+		}
+	}()
 
 	sup := supervisor.New(cfg, logger)
 	if err := sup.Run(ctx); err != nil {

@@ -230,6 +230,10 @@ pipeline:
     enabled: true
     window_ms: 60000
     max_keys: 50000
+    persist:
+      enabled: true
+      path: "tmp/cooldown.checkpoint.json"
+      flush_interval_ms: 5000
 
 ack_delay_ms: 0
 ack_drop_rate: 0.0

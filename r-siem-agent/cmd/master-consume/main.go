@@ -126,6 +126,22 @@ func main() {
 		os.Exit(1)
 	}
 	cooldownTracker := pipeline.NewCooldownTracker(cooldownCfg)
+	if cooldownCfg.Persist.Enabled {
+		now := time.Now().UnixMilli()
+		loaded, kept, err := cooldownTracker.LoadFrom(cooldownCfg.Persist.Path, now)
+		if err != nil {
+			logger.Warn("cooldown_checkpoint_load_failed",
+				slog.String("error", err.Error()),
+				slog.String("path", cooldownCfg.Persist.Path),
+			)
+		} else {
+			logger.LogAttrs(context.Background(), slog.LevelInfo, "cooldown_checkpoint_loaded",
+				slog.Int("entries_loaded", loaded),
+				slog.Int("entries_kept", kept),
+				slog.String("path", cooldownCfg.Persist.Path),
+			)
+		}
+	}
 
 	rceCfg, err := loadRCEConfig(*configPath)
 	if err != nil {
@@ -133,6 +149,31 @@ func main() {
 		os.Exit(1)
 	}
 	rce := newRCE(logger, rceCfg, exporter, incidentMgr, triggerPublisher, rawTriggerPublisher, cooldownTracker)
+
+	if cooldownCfg.Persist.Enabled && cooldownCfg.Persist.FlushIntervalMs > 0 {
+		flushInterval := time.Duration(cooldownCfg.Persist.FlushIntervalMs) * time.Millisecond
+		go func() {
+			ticker := time.NewTicker(flushInterval)
+			defer ticker.Stop()
+			for range ticker.C {
+				bytesWritten, entries, err := cooldownTracker.FlushIfDirty(cooldownCfg.Persist.Path, time.Now().UnixMilli())
+				if err != nil {
+					logger.Error("cooldown_checkpoint_flush_failed",
+						slog.String("error", err.Error()),
+						slog.String("path", cooldownCfg.Persist.Path),
+					)
+					continue
+				}
+				if entries > 0 && bytesWritten > 0 {
+					logger.LogAttrs(context.Background(), slog.LevelInfo, "cooldown_checkpoint_flushed",
+						slog.Int("entries", entries),
+						slog.String("path", cooldownCfg.Persist.Path),
+						slog.Int("bytes", bytesWritten),
+					)
+				}
+			}
+		}()
+	}
 
 	params := []consumerParams{
 		{

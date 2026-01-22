@@ -1,6 +1,10 @@
 package pipeline
 
 import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 )
@@ -12,9 +16,16 @@ const (
 
 // CooldownConfig controls trigger suppression.
 type CooldownConfig struct {
-	Enabled  bool  `yaml:"enabled"`
-	WindowMs int64 `yaml:"window_ms"`
-	MaxKeys  int   `yaml:"max_keys"`
+	Enabled  bool               `yaml:"enabled"`
+	WindowMs int64              `yaml:"window_ms"`
+	MaxKeys  int                `yaml:"max_keys"`
+	Persist  CooldownPersistCfg `yaml:"persist"`
+}
+
+type CooldownPersistCfg struct {
+	Enabled         bool   `yaml:"enabled"`
+	Path            string `yaml:"path"`
+	FlushIntervalMs int64  `yaml:"flush_interval_ms"`
 }
 
 // ResolveCooldownConfig applies defaults to the provided config.
@@ -23,6 +34,11 @@ func ResolveCooldownConfig(raw *CooldownConfig) CooldownConfig {
 		Enabled:  true,
 		WindowMs: defaultCooldownWindowMs,
 		MaxKeys:  defaultCooldownMaxKeys,
+		Persist: CooldownPersistCfg{
+			Enabled:         true,
+			Path:            "tmp/cooldown.checkpoint.json",
+			FlushIntervalMs: 5000,
+		},
 	}
 	if raw == nil {
 		return cfg
@@ -34,6 +50,13 @@ func ResolveCooldownConfig(raw *CooldownConfig) CooldownConfig {
 	if raw.MaxKeys > 0 {
 		cfg.MaxKeys = raw.MaxKeys
 	}
+	cfg.Persist.Enabled = raw.Persist.Enabled
+	if raw.Persist.Path != "" {
+		cfg.Persist.Path = raw.Persist.Path
+	}
+	if raw.Persist.FlushIntervalMs > 0 {
+		cfg.Persist.FlushIntervalMs = raw.Persist.FlushIntervalMs
+	}
 	return cfg
 }
 
@@ -42,6 +65,9 @@ type CooldownTracker struct {
 	cfg  CooldownConfig
 	mu   sync.Mutex
 	last map[string]int64
+
+	dirty         bool
+	lastFlushUnix int64
 }
 
 // NewCooldownTracker creates a tracker with defaults applied.
@@ -72,6 +98,7 @@ func (t *CooldownTracker) Allow(key string, now int64) (bool, int64) {
 	}
 
 	t.last[key] = now
+	t.dirty = true
 	if t.cfg.MaxKeys > 0 && len(t.last) > t.cfg.MaxKeys {
 		t.cleanup(now)
 	}
@@ -109,4 +136,116 @@ func (t *CooldownTracker) cleanup(now int64) {
 		}
 		delete(t.last, key)
 	}
+}
+
+type cooldownCheckpoint struct {
+	Version       int             `json:"version"`
+	WindowMs      int64           `json:"window_ms"`
+	SavedAtUnixMs int64           `json:"saved_at_unix_ms"`
+	Entries       []cooldownEntry `json:"entries"`
+}
+
+type cooldownEntry struct {
+	Key               string `json:"k"`
+	LastPublishedUnix int64  `json:"last_published_unix_ms"`
+}
+
+func (t *CooldownTracker) LoadFrom(path string, now int64) (int, int, error) {
+	if t == nil || path == "" {
+		return 0, 0, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, 0, err
+		}
+		return 0, 0, fmt.Errorf("read cooldown checkpoint: %w", err)
+	}
+	var checkpoint cooldownCheckpoint
+	if err := json.Unmarshal(data, &checkpoint); err != nil {
+		return 0, 0, fmt.Errorf("parse cooldown checkpoint: %w", err)
+	}
+	loaded := len(checkpoint.Entries)
+	kept := 0
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	for _, entry := range checkpoint.Entries {
+		if entry.Key == "" {
+			continue
+		}
+		if entry.LastPublishedUnix == 0 {
+			continue
+		}
+		if now > 0 && now-entry.LastPublishedUnix > t.cfg.WindowMs {
+			continue
+		}
+		t.last[entry.Key] = entry.LastPublishedUnix
+		kept++
+	}
+	t.cleanup(now)
+	t.dirty = false
+	return loaded, kept, nil
+}
+
+func (t *CooldownTracker) FlushIfDirty(path string, now int64) (int, int, error) {
+	if t == nil || path == "" || !t.cfg.Persist.Enabled {
+		return 0, 0, nil
+	}
+	t.mu.Lock()
+	if !t.dirty {
+		t.mu.Unlock()
+		return 0, 0, nil
+	}
+	if t.lastFlushUnix > 0 && t.cfg.Persist.FlushIntervalMs > 0 && now-t.lastFlushUnix < t.cfg.Persist.FlushIntervalMs {
+		t.mu.Unlock()
+		return 0, 0, nil
+	}
+	t.cleanup(now)
+	keys := make([]string, 0, len(t.last))
+	for key := range t.last {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	entries := make([]cooldownEntry, 0, len(keys))
+	for _, key := range keys {
+		if t.cfg.MaxKeys > 0 && len(entries) >= t.cfg.MaxKeys {
+			break
+		}
+		entries = append(entries, cooldownEntry{
+			Key:               key,
+			LastPublishedUnix: t.last[key],
+		})
+	}
+	checkpoint := cooldownCheckpoint{
+		Version:       1,
+		WindowMs:      t.cfg.WindowMs,
+		SavedAtUnixMs: now,
+		Entries:       entries,
+	}
+	payload, err := json.Marshal(checkpoint)
+	if err != nil {
+		t.mu.Unlock()
+		return 0, 0, fmt.Errorf("marshal cooldown checkpoint: %w", err)
+	}
+	t.mu.Unlock()
+
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return 0, 0, fmt.Errorf("mkdir cooldown checkpoint dir: %w", err)
+	}
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, payload, 0644); err != nil {
+		return 0, 0, fmt.Errorf("write cooldown checkpoint tmp: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return 0, 0, fmt.Errorf("rename cooldown checkpoint: %w", err)
+	}
+
+	t.mu.Lock()
+	t.dirty = false
+	t.lastFlushUnix = now
+	t.mu.Unlock()
+
+	return len(payload), len(entries), nil
 }

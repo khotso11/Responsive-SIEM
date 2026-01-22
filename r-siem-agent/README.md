@@ -1,10 +1,134 @@
 # R-SIEM Endpoint Agent
 
-Milestone 1 implements the supervisor shell for the endpoint agent: configuration loading, structured logging, a heartbeat loop, and graceful shutdown.
+## What is R-SIEM / Responsive SIEM
+R-SIEM combines detection with automated response orchestration. It is not only log collection; it executes response playbooks through ROE and an allowlisted agent executor. Collection is the next milestone, and the ROE execution path is already working.
+
+## Working convention
+Always run commands from the module root:
+
+```
+cd ~/projects/r-siem-agent
+```
 
 ## Requirements
+- Go 1.22+ (set `GOTOOLCHAIN=go1.24.11` for local runs)
+- Docker for local NATS JetStream
 
-- Go 1.22+
+## Components / Commands
+- `cmd/master-roe`: Orchestrator. Consumes triggers, compiles response plans from playbooks, and enforces policy gates (approvals, allowlists).
+- `cmd/master-roe-worker`: Executes step messages via connectors (FAST/STD worker pools).
+- `cmd/master-consume`: Consumer/processing side for stream subscriptions (operational service).
+- `cmd/agent`: Real allowlisted command executor.
+- `cmd/agent-sim`: Agent simulator.
+- `cmd/master-roe-pubtrigger`: Publishes response triggers (manual testing entry point).
+- `cmd/master-roe-approve`: Approves or denies response runs when approvals are required.
+- `cmd/master-smoke`: Smoke driver.
+
+## Quick Start (Local Lab)
+Assume separate terminals.
+
+Terminal A - NATS JetStream:
+
+```
+docker run --rm --name rsiem-nats -p 4222:4222 -p 8222:8222 nats:2.10 -js
+```
+
+Terminal B - Consume + RCE + Incidents:
+
+```
+export GOTOOLCHAIN=go1.24.11
+go run -mod=vendor ./cmd/master-consume --config configs/master.yaml | tee logs/master-consume.log
+```
+
+Terminal C - ROE (triggers -> runs -> plans -> results consumer):
+
+```
+export GOTOOLCHAIN=go1.24.11
+go run -mod=vendor ./cmd/master-roe --config configs/master.yaml | tee logs/master-roe.log
+```
+
+Terminal D - ROE worker (executes steps -> publishes results):
+
+```
+export GOTOOLCHAIN=go1.24.11
+go run -mod=vendor ./cmd/master-roe-worker --config configs/master.yaml | tee logs/worker-f.log
+```
+
+Terminal E - Agent (allowlisted executor):
+
+```
+export GOTOOLCHAIN=go1.24.11
+go run -mod=vendor ./cmd/agent --config configs/agent.yaml | tee logs/agent.log
+```
+
+## Approval timeout
+`policies.approvals.timeout_ms` is now `300000` (5 minutes).
+
+## E2E Proof: network_block dry-run
+
+A) Pubtrigger:
+
+```
+go run -mod=vendor ./cmd/master-roe-pubtrigger -config configs/master.yaml -alert-key A-SEQ-DRYRUN-X -rule-id R-SEQ-PROCESS-TO-NET -severity high -group-key 10.0.0.10 -lane FAST
+```
+
+B) Find run_id:
+
+```
+tail -n 200 logs/master-roe.log | rg "A-SEQ-DRYRUN-X|approval_request_published|response_run_waiting_approval" | tail -n 20
+```
+
+C) Approve:
+
+```
+RUN=<paste>
+go run -mod=vendor ./cmd/master-roe-approve -config configs/master.yaml -run_id "$RUN" -decision approve -actor khotso -reason "lab approval"
+```
+
+D) Grep proof:
+
+```
+rg "\"run_id\":\"$RUN\"" logs/master-roe.log | rg "approval_(received|approved)|response_step_published|response_run_updated" | tail -n 200
+rg "\"run_id\":\"$RUN\"" logs/worker-f.log | rg "network_block_(request|reply|terminal)|step_failed_|step_succeeded" | tail -n 200
+rg "$RUN" exports/roe_steps.jsonl | rg "receipt|message|dry_run" | tail -n 50
+```
+
+E) Expected output:
+- `response_run_updated` status `SUCCEEDED`
+- `exports` receipt.message contains: `dry_run: network_block target=10.0.0.10`
+
+## E2E Proof: network_rate_limit dry-run
+
+A) Pubtrigger:
+
+```
+go run -mod=vendor ./cmd/master-roe-pubtrigger -config configs/master.yaml -alert-key A-JOIN-DRYRUN-X -rule-id R-JOIN-HIGH-NET -severity high -group-key 10.0.0.55 -lane FAST
+```
+
+B) Find run_id:
+
+```
+tail -n 200 logs/master-roe.log | rg "A-JOIN-DRYRUN-X|approval_request_published|response_run_waiting_approval" | tail -n 20
+```
+
+C) Approve:
+
+```
+RUN=<paste>
+go run -mod=vendor ./cmd/master-roe-approve -config configs/master.yaml -run_id "$RUN" -decision approve -actor khotso -reason "lab approval"
+```
+
+D) Grep proof:
+
+```
+rg "\"run_id\":\"$RUN\"" logs/master-roe.log | rg "approval_(received|approved)|response_step_published|response_run_updated" | tail -n 200
+rg "\"run_id\":\"$RUN\"" logs/worker-f.log | rg "network_rate_limit_(request|reply|terminal)|step_failed_|step_succeeded" | tail -n 200
+rg "$RUN" exports/roe_steps.jsonl | rg "receipt|message|dry_run" | tail -n 50
+```
+
+E) Expected output:
+- `response_run_updated` status `SUCCEEDED`
+- `exports` receipt.message contains: `dry_run: network_rate_limit target=10.0.0.55`
 
 ## Configuration
 
@@ -53,262 +177,9 @@ Then set `transport.mode: grpc_mtls` in `configs/agent.yaml` and run the agent:
 go run ./cmd/agent --config configs/agent.yaml
 ```
 
-## Overview
-
-This repo supports a local end-to-end flow: master ingest publishes batches into JetStream, `cmd/master-consume` normalizes and evaluates RCE rules/correlations, and optional exports/incident logs provide audit trails.
-
-## Prerequisites
-
-- Go 1.22+ (set `GOTOOLCHAIN=go1.24.11` for local runs)
-- Docker for local NATS JetStream
-
-## Config (master.yaml blocks)
-
-Alert export (JSONL):
-
-```yaml
-export:
-  enabled: true
-  path: "exports/alerts.jsonl"
-  include:
-    alerts: true
-    correlation_matches: false
-  required: true
-  flush: true
-```
-
-Incidents (log-only + optional incidents JSONL):
-
-```yaml
-incidents:
-  enabled: true
-  max_open_incidents: 50000
-  inactivity_ttl_ms: 600000
-  cleanup_interval_ms: 5000
-  recent_evidence_max: 10
-  export:
-    enabled: true
-    required: true
-    path: "exports/incidents.jsonl"
-    flush: true
-```
-
-## Local runbook (Terminals A/B/C/D)
-
-Terminal A — NATS JetStream:
-
-```
-docker run --rm --name rsiem-nats -p 4222:4222 -p 8222:8222 nats:2.10 -js
-```
-
-Terminal B — Master ingest:
-
-```
-export GOTOOLCHAIN=go1.24.11
-go run -mod=vendor ./cmd/master --config configs/master.yaml
-```
-
-Terminal C — Consumer + Aggregator + RCE + Incidents:
-
-```
-export GOTOOLCHAIN=go1.24.11
-go run -mod=vendor ./cmd/master-consume --config configs/master.yaml
-```
-
-Terminal D — Smoke client (run once):
-
-```
-export GOTOOLCHAIN=go1.24.11
-go run -mod=vendor ./cmd/master-smoke \
-  --addr 127.0.0.1:7777 \
-  --ca configs/certs/ca.pem \
-  --cert configs/certs/agent.pem \
-  --key configs/certs/agent-key.pem \
-  --server-name master.local
-```
-
-Optional inspector:
-
-```
-export GOTOOLCHAIN=go1.24.11
-go run -mod=vendor ./cmd/master-inspect --count 10
-```
-
-Addressing note: for local same-machine tests use `127.0.0.1:7777`; for cross-machine tests use `10.238.211.178:7777`.
-
-## Local Runbook: End-to-End (Consume → Alert/Incident → ROE → Worker → Results → Approvals)
-
-This is a copy-paste flow for local validation. Use your existing NATS JetStream setup (Docker example below).
-
-Terminal A — NATS JetStream:
-
-```
-docker run --rm --name rsiem-nats -p 4222:4222 -p 8222:8222 nats:2.10 -js
-```
-
-Terminal B — Consume + RCE + Incidents:
-
-```
-export GOTOOLCHAIN=go1.24.11
-go run -mod=vendor ./cmd/master-consume --config configs/master.yaml
-```
-
-Terminal C — ROE (triggers → runs → plans → results consumer):
-
-```
-export GOTOOLCHAIN=go1.24.11
-go run -mod=vendor ./cmd/master-roe --config configs/master.yaml
-```
-
-Terminal D — ROE worker (executes steps → publishes results):
-
-```
-export GOTOOLCHAIN=go1.24.11
-go run -mod=vendor ./cmd/master-roe-worker --config configs/master.yaml
-```
-
-Terminal E — Smoke client (no `--config`, use flags):
-
-```
-export GOTOOLCHAIN=go1.24.11
-go run -mod=vendor ./cmd/master-smoke -addr 127.0.0.1:7777 -ca configs/certs/ca.pem -cert configs/certs/agent.pem -key configs/certs/agent-key.pem -server-name master.local
-```
-
-Approvals (approve/deny via CLI):
-
-```
-export GOTOOLCHAIN=go1.24.11
-go run -mod=vendor ./cmd/master-roe-approve --config configs/master.yaml --run_id <RUN_ID_FROM_ROE_LOGS> --decision approve --actor "soc@test" --reason "approved for test"
-```
-
-```
-export GOTOOLCHAIN=go1.24.11
-go run -mod=vendor ./cmd/master-roe-approve --config configs/master.yaml --run_id <RUN_ID_FROM_ROE_LOGS> --decision deny --actor "soc@test" --reason "deny test"
-```
-
-Expected logs (spot-check):
-- `normalized_event`, `correlation_match`, `alert`
-- `incident_opened`, `incident_closed`
-- `response_trigger_received`, `response_run_created`, `response_plan_compiled`, `response_step_published`
-- `step_received`, `step_state`, `step_succeeded`
-- `response_step_result_received`, `response_result_applied`, `response_result_duplicate`, `response_run_updated`
-- `roe_lock_acquired`, `roe_lock_released`, `roe_lock_contended`
-- `approval_requested`, `response_run_waiting_approval`, `approval_published`, `approval_received`, `approval_approved`, `approval_denied`, `approval_duplicate`, `approval_timed_out`, `response_steps_released_after_approval`
-
-Default subjects:
-- `rsiem.response.triggers.fast` | `rsiem.response.triggers.standard`
-- `rsiem.response.steps.fast` | `rsiem.response.steps.standard`
-- `rsiem.response.results.fast` | `rsiem.response.results.standard`
-- `rsiem.response.approvals`
-- `rsiem.response.approval_requests`
-
-Verification (JSONL exports):
-
-```
-tail -n 10 exports/alerts.jsonl
-tail -n 10 exports/incidents.jsonl
-tail -n 10 exports/roe_runs.jsonl
-tail -n 10 exports/roe_steps.jsonl
-tail -n 10 exports/roe_approvals.jsonl
-```
-
-Notes on correctness:
-- Lane-aware separation (FAST vs STANDARD) for triggers, steps, results.
-- ACK-after-commit semantics for triggers/results/approvals.
-- Idempotency for triggers, results, and approvals (KV-backed).
-- Per-run locks ensure multi-worker safety and avoid lost updates.
-
-## What to expect (first run)
-
-- Terminal B logs `master_starting`, `jetstream_stream_ready`, `master_recv_batch`, `master_send_ack`.
-- Terminal C logs `master_consume_batch`, `normalized_event`, `rule_match`, `correlation_match`, `alert`, and incident logs.
-
-## Aggregator v0 output
-
-`cmd/master-consume` emits `msg="normalized_event"` JSON lines per consumed record. When the payload is a JSON object, it fills:
-
-- `normalized.type`
-- `normalized.ts_unix_ms` (if present)
-- `normalized.fields` allowlist: `host`, `user`, `process`, `src_ip`, `dst_ip`, `severity`, `message`
-
-Non-JSON payloads remain `type="unknown"` with preview/hash/size.
-
-## RCE v0 (Rules & Correlation Engine)
-
-RCE emits:
-
-- `msg="rule_match"` for stateless rules
-- `msg="correlation_match"` for count/sequence/join rules
-- `msg="alert"` and `msg="alert_suppressed"`
-
-Correlation correctness:
-
-- Join and sequence enforce first-match semantics (one event satisfies at most one predicate/step).
-- Alerts for correlation rules include `correlation_evidence.raw_sha256` and `correlation_evidence_count`.
-
-## Incidents v0
-
-Incidents emit `incident_opened`, `incident_updated`, and `incident_closed` (on cleanup). Keying:
-
-- `incident_key = inc.<rule_id>.<group_key_or_global>`
-- `incident_id = sha256(incident_key)` truncated to 16 hex chars
-
-## Validate idempotency
-
-Idempotency repeat (run the same smoke command again):
-
-- Terminal B shows `duplicate_batch` and sends ACK with same `js_seq` (no republish).
-- Terminal C shows no new `master_consume_batch`, `normalized_event`, `rule_match`, `correlation_match`, `alert`, or `incident` lines.
-
-Fresh run / reset: restart Terminal A’s NATS container (JetStream state resets), then restart Terminals B and C, then run the smoke client once.
-
-## Validate exports
-
-Alerts JSONL (when `export.enabled: true`):
-
-```
-ls -l exports/alerts.jsonl
-tail -n 10 exports/alerts.jsonl
-```
-
-Incidents JSONL (when `incidents.export.enabled: true`):
-
-```
-ls -l exports/incidents.jsonl
-tail -n 10 exports/incidents.jsonl
-```
-
-## Troubleshooting
-
-- `export_init_failed` (permission denied): if `export.required=true` and `export.path` is unwritable (e.g. `/root/rsiem/alerts.jsonl`), `cmd/master-consume` exits non-zero to prevent ACKs.
-
-## Building
-
-```
-go build -o bin/r-siem-agent ./cmd/agent
-```
-
-For a static build (handy for scratch containers or minimal hosts):
-
-```
-CGO_ENABLED=0 go build -o bin/r-siem-agent-static ./cmd/agent
-```
-
 ## Testing
 
-Format and compile tests (compilation) must pass before shipping:
-
 ```
-gofmt ./...
-go test ./...
-```
-
-## Protobuf generation
-
-The transport gRPC stubs live under `internal/proto/pb`. Regenerate them after editing `proto/agent.proto`:
-
-```
-protoc --go_out=internal/proto/pb --go_opt=paths=source_relative \
-  --go-grpc_out=internal/proto/pb --go-grpc_opt=paths=source_relative \
-  proto/agent.proto
+cd ~/projects/r-siem-agent
+go test ./internal/... ./cmd/...
 ```

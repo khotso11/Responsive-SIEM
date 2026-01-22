@@ -31,6 +31,7 @@ import (
 
 	"r-siem-agent/internal/config"
 	"r-siem-agent/internal/logging"
+	"r-siem-agent/internal/pipeline"
 	"r-siem-agent/internal/proto/pb"
 	"r-siem-agent/internal/roe/trigger"
 )
@@ -119,13 +120,19 @@ func main() {
 			os.Exit(1)
 		}
 	}
+	cooldownCfg, err := loadPipelineCooldownConfig(*configPath)
+	if err != nil {
+		logger.Error("pipeline_cooldown_config_load_failed", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	cooldownTracker := pipeline.NewCooldownTracker(cooldownCfg)
 
 	rceCfg, err := loadRCEConfig(*configPath)
 	if err != nil {
 		logger.Error("rce_config_load_failed", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
-	rce := newRCE(logger, rceCfg, exporter, incidentMgr, triggerPublisher, rawTriggerPublisher)
+	rce := newRCE(logger, rceCfg, exporter, incidentMgr, triggerPublisher, rawTriggerPublisher, cooldownTracker)
 
 	params := []consumerParams{
 		{
@@ -694,6 +701,27 @@ type responseTriggerConfigRaw struct {
 	SubjectFast     string `yaml:"subject_fast"`
 	SubjectStandard string `yaml:"subject_standard"`
 	LanePolicy      string `yaml:"lane_policy"`
+}
+
+type pipelineConfigRaw struct {
+	Cooldown *pipeline.CooldownConfig `yaml:"cooldown"`
+}
+
+func loadPipelineCooldownConfig(path string) (pipeline.CooldownConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return pipeline.CooldownConfig{}, fmt.Errorf("read config: %w", err)
+	}
+	var wrapper struct {
+		Pipeline *pipelineConfigRaw `yaml:"pipeline"`
+	}
+	if err := yaml.Unmarshal(data, &wrapper); err != nil {
+		return pipeline.CooldownConfig{}, fmt.Errorf("parse pipeline config: %w", err)
+	}
+	if wrapper.Pipeline == nil {
+		return pipeline.ResolveCooldownConfig(nil), nil
+	}
+	return pipeline.ResolveCooldownConfig(wrapper.Pipeline.Cooldown), nil
 }
 
 type ResponseTriggerPublisher struct {
@@ -1543,6 +1571,7 @@ type RCE struct {
 	incidents   *IncidentManager
 	triggers    *ResponseTriggerPublisher
 	rawTriggers *trigger.Publisher
+	cooldown    *pipeline.CooldownTracker
 }
 
 type ruleState struct {
@@ -1638,7 +1667,7 @@ func applyRCEDefaults(cfg *RCEConfig) {
 	}
 }
 
-func newRCE(logger *slog.Logger, cfg *RCEConfig, exporter *Exporter, incidents *IncidentManager, triggers *ResponseTriggerPublisher, rawTriggers *trigger.Publisher) *RCE {
+func newRCE(logger *slog.Logger, cfg *RCEConfig, exporter *Exporter, incidents *IncidentManager, triggers *ResponseTriggerPublisher, rawTriggers *trigger.Publisher, cooldown *pipeline.CooldownTracker) *RCE {
 	if cfg == nil {
 		return nil
 	}
@@ -1652,6 +1681,7 @@ func newRCE(logger *slog.Logger, cfg *RCEConfig, exporter *Exporter, incidents *
 		incidents:   incidents,
 		triggers:    triggers,
 		rawTriggers: rawTriggers,
+		cooldown:    cooldown,
 	}
 	go r.worker()
 	go r.cleanupLoop()
@@ -2282,6 +2312,20 @@ func (r *RCE) emitTrigger(rule RCERule, rec NormalizedRecord, groupKey string) e
 	key := strings.TrimSpace(groupKey)
 	if key == "" {
 		key = "unknown"
+	}
+	cooldownKey := fmt.Sprintf("%s|%s", rule.ID, key)
+	if r.cooldown != nil {
+		allowed, elapsed := r.cooldown.Allow(cooldownKey, rec.ObservedAt)
+		if !allowed {
+			r.logger.LogAttrs(context.Background(), slog.LevelInfo, "rule_suppressed_cooldown",
+				slog.String("lane", rec.Lane),
+				slog.String("rule_id", rule.ID),
+				slog.String("correlation_key", key),
+				slog.Int64("window_ms", r.cooldown.WindowMs()),
+				slog.Int64("elapsed_ms", elapsed),
+			)
+			return nil
+		}
 	}
 	alertKey := deterministicAlertKey(rule.ID, key)
 	lane := strings.TrimSpace(rec.Lane)

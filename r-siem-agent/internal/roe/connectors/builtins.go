@@ -255,15 +255,28 @@ func (c *agentCommandStubConnector) Execute(ctx context.Context, step Step) (map
 }
 
 type networkBlockStubConnector struct {
-	logger *slog.Logger
+	logger  *slog.Logger
+	nats    *nats.Conn
+	subject string
+	timeout time.Duration
 }
 
 func newNetworkBlockConnector(opts BuiltinOptions) *networkBlockStubConnector {
+	timeoutMs := envInt("RSIEM_AGENT_CMD_TIMEOUT_MS", 2000)
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &networkBlockStubConnector{logger: logger}
+	subject := strings.TrimSpace(os.Getenv("RSIEM_AGENT_CMD_SUBJECT"))
+	if subject == "" {
+		subject = "rsiem.agent.command"
+	}
+	return &networkBlockStubConnector{
+		logger:  logger,
+		nats:    opts.NATS,
+		subject: subject,
+		timeout: time.Duration(timeoutMs) * time.Millisecond,
+	}
 }
 
 func (networkBlockStubConnector) Name() string {
@@ -283,23 +296,127 @@ func (networkBlockStubConnector) OptionalParams() []string {
 }
 
 func (c networkBlockStubConnector) Execute(ctx context.Context, step Step) (map[string]any, error) {
-	c.logger.LogAttrs(context.Background(), slog.LevelInfo, "network_block_applied_stub",
+	if c.nats == nil {
+		return nil, fmt.Errorf("network_block_nats_missing")
+	}
+	payload := map[string]any{
+		"run_id":      step.RunID,
+		"step_id":     step.StepID,
+		"lane":        step.Lane,
+		"action_type": "network_block",
+		"target":      step.Target,
+		"params":      step.Params,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	timeout := c.timeout
+	if step.TimeoutMs != nil && *step.TimeoutMs > 0 {
+		timeout = time.Duration(*step.TimeoutMs) * time.Millisecond
+	}
+	reqCtx, cancel := withOptionalTimeout(ctx, timeout)
+	if cancel != nil {
+		defer cancel()
+	}
+	c.logger.LogAttrs(context.Background(), slog.LevelInfo, "network_block_request",
 		slog.String("run_id", step.RunID),
 		slog.String("step_id", step.StepID),
+		slog.String("subject", c.subject),
 	)
-	return map[string]any{"message": "blocked_stub"}, nil
+	msg := nats.NewMsg(c.subject)
+	msg.Data = data
+	reply, err := c.nats.RequestMsgWithContext(reqCtx, msg)
+	if err != nil {
+		c.logger.LogAttrs(context.Background(), slog.LevelInfo, "network_block_terminal",
+			slog.String("run_id", step.RunID),
+			slog.String("step_id", step.StepID),
+			slog.String("status", "retryable"),
+		)
+		return nil, Retryable(err)
+	}
+	resp := struct {
+		Status  string `json:"status"`
+		Message string `json:"message,omitempty"`
+	}{}
+	if err := json.Unmarshal(reply.Data, &resp); err != nil {
+		c.logger.LogAttrs(context.Background(), slog.LevelInfo, "network_block_terminal",
+			slog.String("run_id", step.RunID),
+			slog.String("step_id", step.StepID),
+			slog.String("status", "failed_safe"),
+		)
+		return nil, fmt.Errorf("network_block_bad_reply")
+	}
+	status := strings.ToLower(strings.TrimSpace(resp.Status))
+	c.logger.LogAttrs(context.Background(), slog.LevelInfo, "network_block_reply",
+		slog.String("run_id", step.RunID),
+		slog.String("step_id", step.StepID),
+		slog.String("status", status),
+	)
+	switch status {
+	case "ok":
+		c.logger.LogAttrs(context.Background(), slog.LevelInfo, "network_block_terminal",
+			slog.String("run_id", step.RunID),
+			slog.String("step_id", step.StepID),
+			slog.String("status", "succeeded"),
+		)
+		if resp.Message == "" {
+			return map[string]any{"message": "dry_run"}, nil
+		}
+		return map[string]any{"message": resp.Message}, nil
+	case "fail_safe":
+		c.logger.LogAttrs(context.Background(), slog.LevelInfo, "network_block_terminal",
+			slog.String("run_id", step.RunID),
+			slog.String("step_id", step.StepID),
+			slog.String("status", "failed_safe"),
+		)
+		if resp.Message != "" {
+			return nil, fmt.Errorf("%s", resp.Message)
+		}
+		return nil, fmt.Errorf("network_block_fail_safe")
+	case "fail_transient":
+		c.logger.LogAttrs(context.Background(), slog.LevelInfo, "network_block_terminal",
+			slog.String("run_id", step.RunID),
+			slog.String("step_id", step.StepID),
+			slog.String("status", "retryable"),
+		)
+		if resp.Message != "" {
+			return nil, Retryable(fmt.Errorf("%s", resp.Message))
+		}
+		return nil, Retryable(fmt.Errorf("network_block_fail_transient"))
+	default:
+		c.logger.LogAttrs(context.Background(), slog.LevelInfo, "network_block_terminal",
+			slog.String("run_id", step.RunID),
+			slog.String("step_id", step.StepID),
+			slog.String("status", "failed_safe"),
+		)
+		return nil, fmt.Errorf("network_block_unknown_status")
+	}
 }
 
 type networkRateLimitStubConnector struct {
-	logger *slog.Logger
+	logger  *slog.Logger
+	nats    *nats.Conn
+	subject string
+	timeout time.Duration
 }
 
 func newNetworkRateLimitConnector(opts BuiltinOptions) *networkRateLimitStubConnector {
+	timeoutMs := envInt("RSIEM_AGENT_CMD_TIMEOUT_MS", 2000)
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &networkRateLimitStubConnector{logger: logger}
+	subject := strings.TrimSpace(os.Getenv("RSIEM_AGENT_CMD_SUBJECT"))
+	if subject == "" {
+		subject = "rsiem.agent.command"
+	}
+	return &networkRateLimitStubConnector{
+		logger:  logger,
+		nats:    opts.NATS,
+		subject: subject,
+		timeout: time.Duration(timeoutMs) * time.Millisecond,
+	}
 }
 
 func (networkRateLimitStubConnector) Name() string {
@@ -319,11 +436,102 @@ func (networkRateLimitStubConnector) OptionalParams() []string {
 }
 
 func (c networkRateLimitStubConnector) Execute(ctx context.Context, step Step) (map[string]any, error) {
-	c.logger.LogAttrs(context.Background(), slog.LevelInfo, "network_rate_limit_applied_stub",
+	if c.nats == nil {
+		return nil, fmt.Errorf("network_rate_limit_nats_missing")
+	}
+	payload := map[string]any{
+		"run_id":      step.RunID,
+		"step_id":     step.StepID,
+		"lane":        step.Lane,
+		"action_type": "network_rate_limit",
+		"target":      step.Target,
+		"params":      step.Params,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	timeout := c.timeout
+	if step.TimeoutMs != nil && *step.TimeoutMs > 0 {
+		timeout = time.Duration(*step.TimeoutMs) * time.Millisecond
+	}
+	reqCtx, cancel := withOptionalTimeout(ctx, timeout)
+	if cancel != nil {
+		defer cancel()
+	}
+	c.logger.LogAttrs(context.Background(), slog.LevelInfo, "network_rate_limit_request",
 		slog.String("run_id", step.RunID),
 		slog.String("step_id", step.StepID),
+		slog.String("subject", c.subject),
 	)
-	return map[string]any{"message": "rate_limited_stub"}, nil
+	msg := nats.NewMsg(c.subject)
+	msg.Data = data
+	reply, err := c.nats.RequestMsgWithContext(reqCtx, msg)
+	if err != nil {
+		c.logger.LogAttrs(context.Background(), slog.LevelInfo, "network_rate_limit_terminal",
+			slog.String("run_id", step.RunID),
+			slog.String("step_id", step.StepID),
+			slog.String("status", "retryable"),
+		)
+		return nil, Retryable(err)
+	}
+	resp := struct {
+		Status  string `json:"status"`
+		Message string `json:"message,omitempty"`
+	}{}
+	if err := json.Unmarshal(reply.Data, &resp); err != nil {
+		c.logger.LogAttrs(context.Background(), slog.LevelInfo, "network_rate_limit_terminal",
+			slog.String("run_id", step.RunID),
+			slog.String("step_id", step.StepID),
+			slog.String("status", "failed_safe"),
+		)
+		return nil, fmt.Errorf("network_rate_limit_bad_reply")
+	}
+	status := strings.ToLower(strings.TrimSpace(resp.Status))
+	c.logger.LogAttrs(context.Background(), slog.LevelInfo, "network_rate_limit_reply",
+		slog.String("run_id", step.RunID),
+		slog.String("step_id", step.StepID),
+		slog.String("status", status),
+	)
+	switch status {
+	case "ok":
+		c.logger.LogAttrs(context.Background(), slog.LevelInfo, "network_rate_limit_terminal",
+			slog.String("run_id", step.RunID),
+			slog.String("step_id", step.StepID),
+			slog.String("status", "succeeded"),
+		)
+		if resp.Message == "" {
+			return map[string]any{"message": "dry_run"}, nil
+		}
+		return map[string]any{"message": resp.Message}, nil
+	case "fail_safe":
+		c.logger.LogAttrs(context.Background(), slog.LevelInfo, "network_rate_limit_terminal",
+			slog.String("run_id", step.RunID),
+			slog.String("step_id", step.StepID),
+			slog.String("status", "failed_safe"),
+		)
+		if resp.Message != "" {
+			return nil, fmt.Errorf("%s", resp.Message)
+		}
+		return nil, fmt.Errorf("network_rate_limit_fail_safe")
+	case "fail_transient":
+		c.logger.LogAttrs(context.Background(), slog.LevelInfo, "network_rate_limit_terminal",
+			slog.String("run_id", step.RunID),
+			slog.String("step_id", step.StepID),
+			slog.String("status", "retryable"),
+		)
+		if resp.Message != "" {
+			return nil, Retryable(fmt.Errorf("%s", resp.Message))
+		}
+		return nil, Retryable(fmt.Errorf("network_rate_limit_fail_transient"))
+	default:
+		c.logger.LogAttrs(context.Background(), slog.LevelInfo, "network_rate_limit_terminal",
+			slog.String("run_id", step.RunID),
+			slog.String("step_id", step.StepID),
+			slog.String("status", "failed_safe"),
+		)
+		return nil, fmt.Errorf("network_rate_limit_unknown_status")
+	}
 }
 
 func Builtins(opts BuiltinOptions) []Connector {

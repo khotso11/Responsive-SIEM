@@ -51,6 +51,80 @@ func TestPolicyDenied(t *testing.T) {
 	}
 }
 
+func TestDryRunNetworkBlockPlan(t *testing.T) {
+	runner := &fakeRunner{}
+	exec := &commandExecutor{
+		logger:  slog.Default(),
+		timeout: time.Second,
+		runner:  runner,
+		allowlist: map[string]execSpec{
+			"network_block": {},
+		},
+	}
+	reply := exec.handle(context.Background(), commandRequest{
+		RunID:      "run-1",
+		StepID:     "step-1",
+		ActionType: "network_block",
+		Target:     "10.0.0.1",
+		Params: map[string]any{
+			"direction": "ingress",
+		},
+	})
+	if runner.called {
+		t.Fatalf("expected runner not called for dry-run")
+	}
+	want := "dry_run: network_block target=10.0.0.1 direction=ingress"
+	if reply.Status != "ok" || reply.Message != want {
+		t.Fatalf("unexpected reply: %#v", reply)
+	}
+}
+
+func TestDryRunNetworkRateLimitPlan(t *testing.T) {
+	exec := &commandExecutor{
+		logger:  slog.Default(),
+		timeout: time.Second,
+		runner:  &fakeRunner{},
+		allowlist: map[string]execSpec{
+			"network_rate_limit": {},
+		},
+	}
+	reply := exec.handle(context.Background(), commandRequest{
+		RunID:      "run-1",
+		StepID:     "step-1",
+		ActionType: "network_rate_limit",
+		Target:     "10.0.0.1",
+		Params: map[string]any{
+			"rate_kbps":   100,
+			"burst_kb":    0,
+			"duration_ms": 60000,
+		},
+	})
+	want := "dry_run: network_rate_limit target=10.0.0.1 rate_kbps=100 burst_kb=0 duration_ms=60000"
+	if reply.Status != "ok" || reply.Message != want {
+		t.Fatalf("unexpected reply: %#v", reply)
+	}
+}
+
+func TestValidationFailureIsSafe(t *testing.T) {
+	exec := &commandExecutor{
+		logger:  slog.Default(),
+		timeout: time.Second,
+		runner:  &fakeRunner{},
+		allowlist: map[string]execSpec{
+			"network_block": {},
+		},
+	}
+	reply := exec.handle(context.Background(), commandRequest{
+		RunID:      "run-1",
+		StepID:     "step-1",
+		ActionType: "network_block",
+		Target:     "not-an-ip",
+	})
+	if reply.Status != "fail_safe" || !strings.HasPrefix(reply.Message, "validation_error:") {
+		t.Fatalf("unexpected validation reply: %#v", reply)
+	}
+}
+
 func TestTimeoutMapping(t *testing.T) {
 	runner := &fakeRunner{
 		result: execResult{Err: context.DeadlineExceeded},

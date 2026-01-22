@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -23,10 +25,12 @@ const (
 )
 
 type commandRequest struct {
-	RunID  string         `json:"run_id"`
-	StepID string         `json:"step_id"`
-	Lane   string         `json:"lane"`
-	Params map[string]any `json:"params"`
+	RunID      string         `json:"run_id"`
+	StepID     string         `json:"step_id"`
+	Lane       string         `json:"lane"`
+	ActionType string         `json:"action_type"`
+	Target     string         `json:"target"`
+	Params     map[string]any `json:"params"`
 }
 
 type commandReply struct {
@@ -88,11 +92,11 @@ func (r osExecRunner) Run(ctx context.Context, spec execSpec) execResult {
 }
 
 type commandExecutor struct {
-	logger       *slog.Logger
-	timeout      time.Duration
-	runner       execRunner
-	allowlist    map[string]execSpec
-	outputLimit  int
+	logger      *slog.Logger
+	timeout     time.Duration
+	runner      execRunner
+	allowlist   map[string]execSpec
+	outputLimit int
 }
 
 func newCommandExecutor(logger *slog.Logger) *commandExecutor {
@@ -104,22 +108,36 @@ func newCommandExecutor(logger *slog.Logger) *commandExecutor {
 	if outputLimit <= 0 {
 		outputLimit = defaultOutputLimitByte
 	}
+	pingArgs := []string{"-c", "1", "127.0.0.1"}
+	if runtime.GOOS == "windows" {
+		pingArgs = []string{"-n", "1", "127.0.0.1"}
+	}
 	return &commandExecutor{
 		logger:  logger,
 		timeout: time.Duration(timeoutMs) * time.Millisecond,
 		runner:  osExecRunner{outputLimit: outputLimit},
 		allowlist: map[string]execSpec{
-			"ping": {Command: "ping", Args: []string{"-c", "1", "127.0.0.1"}},
+			"ping":               {Command: "ping", Args: pingArgs},
+			"network_block":      {},
+			"network_rate_limit": {},
 		},
 		outputLimit: outputLimit,
 	}
 }
 
 func (e *commandExecutor) handle(ctx context.Context, req commandRequest) commandReply {
+	actionType := strings.TrimSpace(req.ActionType)
+	if actionType == "" {
+		actionType = "agent_command"
+	}
 	commandID := commandIdentifier(req.Params)
 	runID := strings.TrimSpace(req.RunID)
 	stepID := strings.TrimSpace(req.StepID)
-	if commandID == "" {
+	actionKey := commandID
+	if actionType != "agent_command" {
+		actionKey = actionType
+	}
+	if actionKey == "" {
 		e.logger.LogAttrs(context.Background(), slog.LevelInfo, "agent_command_exec_denied",
 			slog.String("run_id", runID),
 			slog.String("step_id", stepID),
@@ -128,12 +146,12 @@ func (e *commandExecutor) handle(ctx context.Context, req commandRequest) comman
 		return commandReply{Status: "fail_safe", Message: "policy_denied"}
 	}
 
-	spec, ok := e.allowlist[commandID]
+	spec, ok := e.allowlist[actionKey]
 	if !ok {
 		e.logger.LogAttrs(context.Background(), slog.LevelInfo, "agent_command_exec_denied",
 			slog.String("run_id", runID),
 			slog.String("step_id", stepID),
-			slog.String("command_id", commandID),
+			slog.String("command_id", actionKey),
 			slog.String("reason", "not_allowlisted"),
 		)
 		return commandReply{Status: "fail_safe", Message: "policy_denied"}
@@ -142,8 +160,42 @@ func (e *commandExecutor) handle(ctx context.Context, req commandRequest) comman
 	e.logger.LogAttrs(context.Background(), slog.LevelInfo, "agent_command_exec_start",
 		slog.String("run_id", runID),
 		slog.String("step_id", stepID),
-		slog.String("command_id", commandID),
+		slog.String("command_id", actionKey),
 	)
+
+	if actionType == "network_block" {
+		plan, err := buildNetworkBlockPlan(req.Target, req.Params)
+		if err != nil {
+			return commandReply{Status: "fail_safe", Message: "validation_error:" + err.Error()}
+		}
+		e.logger.LogAttrs(context.Background(), slog.LevelInfo, "agent_command_exec_done",
+			slog.String("run_id", runID),
+			slog.String("step_id", stepID),
+			slog.String("command_id", actionKey),
+			slog.Int("exit_code", 0),
+			slog.Int64("duration_ms", 0),
+			slog.Bool("stdout_truncated", false),
+			slog.Bool("stderr_truncated", false),
+		)
+		return commandReply{Status: "ok", Message: plan}
+	}
+
+	if actionType == "network_rate_limit" {
+		plan, err := buildNetworkRateLimitPlan(req.Target, req.Params)
+		if err != nil {
+			return commandReply{Status: "fail_safe", Message: "validation_error:" + err.Error()}
+		}
+		e.logger.LogAttrs(context.Background(), slog.LevelInfo, "agent_command_exec_done",
+			slog.String("run_id", runID),
+			slog.String("step_id", stepID),
+			slog.String("command_id", actionKey),
+			slog.Int("exit_code", 0),
+			slog.Int64("duration_ms", 0),
+			slog.Bool("stdout_truncated", false),
+			slog.Bool("stderr_truncated", false),
+		)
+		return commandReply{Status: "ok", Message: plan}
+	}
 
 	execCtx, cancel := context.WithTimeout(ctx, e.timeout)
 	defer cancel()
@@ -152,7 +204,7 @@ func (e *commandExecutor) handle(ctx context.Context, req commandRequest) comman
 	e.logger.LogAttrs(context.Background(), slog.LevelInfo, "agent_command_exec_done",
 		slog.String("run_id", runID),
 		slog.String("step_id", stepID),
-		slog.String("command_id", commandID),
+		slog.String("command_id", actionKey),
 		slog.Int("exit_code", result.ExitCode),
 		slog.Int64("duration_ms", result.DurationMillis),
 		slog.Bool("stdout_truncated", result.StdoutTrunc),
@@ -313,4 +365,121 @@ func commandNatsURL() string {
 		return defaultAgentNatsURL
 	}
 	return val
+}
+
+func buildNetworkBlockPlan(target string, params map[string]any) (string, error) {
+	target = strings.TrimSpace(target)
+	if target == "" || !validIPOrCIDR(target) {
+		return "", fmt.Errorf("invalid_target")
+	}
+	direction := strings.TrimSpace(stringParam(params, "direction"))
+	if direction != "" && direction != "ingress" && direction != "egress" && direction != "both" {
+		return "", fmt.Errorf("invalid_direction")
+	}
+	parts := []string{"dry_run: network_block", "target=" + target}
+	if direction != "" {
+		parts = append(parts, "direction="+direction)
+	}
+	return strings.Join(parts, " "), nil
+}
+
+func buildNetworkRateLimitPlan(target string, params map[string]any) (string, error) {
+	target = strings.TrimSpace(target)
+	if target == "" || !validIPOrCIDR(target) {
+		return "", fmt.Errorf("invalid_target")
+	}
+	rateVal, rateSet, err := intParam(params, "rate_kbps")
+	if err != nil {
+		return "", err
+	}
+	if rateSet && rateVal <= 0 {
+		return "", fmt.Errorf("invalid_rate_kbps")
+	}
+	burstVal, burstSet, err := intParam(params, "burst_kb")
+	if err != nil {
+		return "", err
+	}
+	if burstSet && burstVal < 0 {
+		return "", fmt.Errorf("invalid_burst_kb")
+	}
+	durationVal, durationSet, err := intParam(params, "duration_ms")
+	if err != nil {
+		return "", err
+	}
+	if durationSet && durationVal <= 0 {
+		return "", fmt.Errorf("invalid_duration_ms")
+	}
+
+	parts := []string{"dry_run: network_rate_limit", "target=" + target}
+	if rateSet {
+		parts = append(parts, fmt.Sprintf("rate_kbps=%d", rateVal))
+	}
+	if burstSet {
+		parts = append(parts, fmt.Sprintf("burst_kb=%d", burstVal))
+	}
+	if durationSet {
+		parts = append(parts, fmt.Sprintf("duration_ms=%d", durationVal))
+	}
+	return strings.Join(parts, " "), nil
+}
+
+func stringParam(params map[string]any, key string) string {
+	if params == nil {
+		return ""
+	}
+	val, ok := params[key]
+	if !ok {
+		return ""
+	}
+	str, ok := val.(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(str)
+}
+
+func intParam(params map[string]any, key string) (int64, bool, error) {
+	if params == nil {
+		return 0, false, nil
+	}
+	val, ok := params[key]
+	if !ok {
+		return 0, false, nil
+	}
+	switch typed := val.(type) {
+	case int:
+		return int64(typed), true, nil
+	case int64:
+		return typed, true, nil
+	case int32:
+		return int64(typed), true, nil
+	case uint:
+		return int64(typed), true, nil
+	case uint64:
+		return int64(typed), true, nil
+	case float64:
+		return int64(typed), true, nil
+	case float32:
+		return int64(typed), true, nil
+	case string:
+		trimmed := strings.TrimSpace(typed)
+		if trimmed == "" {
+			return 0, true, fmt.Errorf("invalid_%s", key)
+		}
+		parsed, err := strconv.ParseInt(trimmed, 10, 64)
+		if err != nil {
+			return 0, true, fmt.Errorf("invalid_%s", key)
+		}
+		return parsed, true, nil
+	default:
+		return 0, true, fmt.Errorf("invalid_%s", key)
+	}
+}
+
+func validIPOrCIDR(value string) bool {
+	if net.ParseIP(value) != nil {
+		return true
+	}
+	_, _, err := net.ParseCIDR(value)
+	return err == nil
 }

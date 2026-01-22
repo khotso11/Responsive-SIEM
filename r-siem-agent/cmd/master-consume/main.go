@@ -32,6 +32,7 @@ import (
 	"r-siem-agent/internal/config"
 	"r-siem-agent/internal/logging"
 	"r-siem-agent/internal/proto/pb"
+	"r-siem-agent/internal/roe/trigger"
 )
 
 type consumerParams struct {
@@ -110,13 +111,21 @@ func main() {
 		logger.Error("response_trigger_init_failed", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
+	var rawTriggerPublisher *trigger.Publisher
+	if respCfg != nil && respCfg.Enabled {
+		rawTriggerPublisher, err = trigger.NewPublisher(logger, js)
+		if err != nil {
+			logger.Error("response_trigger_init_failed", slog.String("error", err.Error()))
+			os.Exit(1)
+		}
+	}
 
 	rceCfg, err := loadRCEConfig(*configPath)
 	if err != nil {
 		logger.Error("rce_config_load_failed", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
-	rce := newRCE(logger, rceCfg, exporter, incidentMgr, triggerPublisher)
+	rce := newRCE(logger, rceCfg, exporter, incidentMgr, triggerPublisher, rawTriggerPublisher)
 
 	params := []consumerParams{
 		{
@@ -1533,6 +1542,7 @@ type RCE struct {
 	exporter    *Exporter
 	incidents   *IncidentManager
 	triggers    *ResponseTriggerPublisher
+	rawTriggers *trigger.Publisher
 }
 
 type ruleState struct {
@@ -1628,7 +1638,7 @@ func applyRCEDefaults(cfg *RCEConfig) {
 	}
 }
 
-func newRCE(logger *slog.Logger, cfg *RCEConfig, exporter *Exporter, incidents *IncidentManager, triggers *ResponseTriggerPublisher) *RCE {
+func newRCE(logger *slog.Logger, cfg *RCEConfig, exporter *Exporter, incidents *IncidentManager, triggers *ResponseTriggerPublisher, rawTriggers *trigger.Publisher) *RCE {
 	if cfg == nil {
 		return nil
 	}
@@ -1641,6 +1651,7 @@ func newRCE(logger *slog.Logger, cfg *RCEConfig, exporter *Exporter, incidents *
 		exporter:    exporter,
 		incidents:   incidents,
 		triggers:    triggers,
+		rawTriggers: rawTriggers,
 	}
 	go r.worker()
 	go r.cleanupLoop()
@@ -1729,6 +1740,14 @@ func (r *RCE) processRecord(rec NormalizedRecord) error {
 					return err
 				}
 			}
+		case "trigger":
+			if r.matchWhen(rule.When, rec) {
+				groupKey := r.groupKey(rule.GroupBy, rec)
+				r.emitRuleMatch(rule, rec, groupKey)
+				if err := r.emitTrigger(rule, rec, groupKey); err != nil {
+					return err
+				}
+			}
 		case "count":
 			if err := r.evalCount(rule, rec); err != nil {
 				return err
@@ -1765,6 +1784,13 @@ func (r *RCE) matchWhen(when RCEWhen, rec NormalizedRecord) bool {
 		return false
 	}
 	for key, expected := range when.Fields {
+		if key == "message_contains" {
+			message, ok := rec.Fields["message"].(string)
+			if !ok || !strings.Contains(message, expected) {
+				return false
+			}
+			continue
+		}
 		if key == "severity" {
 			if !severityAtLeast(rec.Fields, expected) {
 				return false
@@ -2247,6 +2273,40 @@ func (r *RCE) emitAlert(rule RCERule, rec NormalizedRecord, groupKey string, rul
 		}
 	}
 	return nil
+}
+
+func (r *RCE) emitTrigger(rule RCERule, rec NormalizedRecord, groupKey string) error {
+	if r.rawTriggers == nil {
+		return nil
+	}
+	key := strings.TrimSpace(groupKey)
+	if key == "" {
+		key = "unknown"
+	}
+	alertKey := deterministicAlertKey(rule.ID, key)
+	lane := strings.TrimSpace(rec.Lane)
+	if lane == "" {
+		lane = "STANDARD"
+	}
+	alert := trigger.Alert{
+		AlertKey:         alertKey,
+		RuleID:           rule.ID,
+		Severity:         rule.Severity,
+		Lane:             lane,
+		GroupBy:          rule.GroupBy,
+		GroupKey:         key,
+		ObservedAtUnixMs: rec.ObservedAt,
+	}
+	_, _, err := r.rawTriggers.PublishAlert(alert)
+	return err
+}
+
+func deterministicAlertKey(ruleID, groupKey string) string {
+	base := strings.TrimSpace(ruleID)
+	if strings.HasPrefix(base, "R-") && len(base) > 2 {
+		base = base[2:]
+	}
+	return fmt.Sprintf("A-%s-%s", base, strings.TrimSpace(groupKey))
 }
 
 func (r *RCE) emitDropState(ruleID string) {

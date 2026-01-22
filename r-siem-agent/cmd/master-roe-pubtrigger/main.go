@@ -1,9 +1,6 @@
 package main
 
 import (
-	"context"
-	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -15,14 +12,7 @@ import (
 
 	"r-siem-agent/internal/config"
 	"r-siem-agent/internal/logging"
-)
-
-const (
-	responseStream      = "RSIEM_RESPONSE"
-	responseTriggerFast = "rsiem.response.triggers.fast"
-	responseTriggerStd  = "rsiem.response.triggers.standard"
-	responseStepsFast   = "rsiem.response.steps.fast"
-	responseStepsStd    = "rsiem.response.steps.standard"
+	"r-siem-agent/internal/roe/trigger"
 )
 
 func main() {
@@ -64,7 +54,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := ensureResponseStream(js); err != nil {
+	publisher, err := trigger.NewPublisher(logger, js)
+	if err != nil {
 		logger.Error("ensure_response_stream_failed", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
@@ -74,56 +65,17 @@ func main() {
 		fmt.Fprintf(os.Stderr, "lane must be FAST or STANDARD\n")
 		os.Exit(1)
 	}
-	subject := responseTriggerStd
-	if laneValue == "FAST" {
-		subject = responseTriggerFast
+	alert := trigger.Alert{
+		AlertKey:         strings.TrimSpace(*alertKey),
+		RuleID:           strings.TrimSpace(*ruleID),
+		Severity:         strings.TrimSpace(*severity),
+		Lane:             laneValue,
+		GroupBy:          strings.TrimSpace(*groupBy),
+		GroupKey:         strings.TrimSpace(*groupKey),
+		ObservedAtUnixMs: time.Now().UnixMilli(),
 	}
-
-	triggerID := fmt.Sprintf("trig.alert.%s", strings.TrimSpace(*alertKey))
-	payload := map[string]any{
-		"msg":                 "response_trigger",
-		"trigger_kind":        "alert",
-		"trigger_idem_key":    triggerID,
-		"alert_key":           strings.TrimSpace(*alertKey),
-		"rule_id":             strings.TrimSpace(*ruleID),
-		"severity":            strings.TrimSpace(*severity),
-		"lane":                laneValue,
-		"observed_at_unix_ms": time.Now().UnixMilli(),
-	}
-	if strings.TrimSpace(*groupBy) != "" {
-		payload["group_by"] = strings.TrimSpace(*groupBy)
-	}
-	if strings.TrimSpace(*groupKey) != "" {
-		payload["group_key"] = strings.TrimSpace(*groupKey)
-	}
-
-	data, err := json.Marshal(payload)
-	if err != nil {
-		logger.Error("pubtrigger_encode_failed", slog.String("error", err.Error()))
-		os.Exit(1)
-	}
-	if _, err := js.Publish(subject, data); err != nil {
+	if _, _, err := publisher.PublishAlert(alert); err != nil {
 		logger.Error("pubtrigger_publish_failed", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
-	logger.LogAttrs(context.Background(), slog.LevelInfo, "pubtrigger_published",
-		slog.String("subject", subject),
-		slog.String("trigger_idem_key", triggerID),
-	)
-}
-
-func ensureResponseStream(js nats.JetStreamContext) error {
-	_, err := js.AddStream(&nats.StreamConfig{
-		Name: responseStream,
-		Subjects: []string{
-			responseTriggerFast,
-			responseTriggerStd,
-			responseStepsFast,
-			responseStepsStd,
-		},
-	})
-	if err != nil && !errors.Is(err, nats.ErrStreamNameAlreadyInUse) {
-		return err
-	}
-	return nil
 }

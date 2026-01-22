@@ -17,6 +17,13 @@ jetstream:
   durable_name_fast: master-fast
   durable_name_standard: master-standard
 
+collectors:
+  tail:
+    enabled: true
+    path: "tmp/demo.log"
+    checkpoint_path: "tmp/tail.checkpoint.json"
+    poll_ms: 200
+
 export:
   enabled: true
   path: "exports/alerts.jsonl"
@@ -163,7 +170,7 @@ playbooks:
     version: 1
     enabled: true
     selectors:
-      rule_ids: ["R-SEQ-PROCESS-TO-NET"]
+      rule_ids: ["R-SEQ-PROCESS-TO-NET", "R-COLLECT-FAILED-PW"]
     policy_requirements:
       approval: "required_for_high"
       max_blast_radius: 1
@@ -254,6 +261,16 @@ rce:
       threshold: 3
       when:
         type: process
+
+    - id: R-COLLECT-FAILED-PW
+      enabled: true
+      kind: trigger
+      severity: high
+      group_by: src_ip
+      when:
+        type: auth
+        fields:
+          message_contains: "Failed password"
 
     - id: R-SEQ-PROCESS-TO-NET
       enabled: true

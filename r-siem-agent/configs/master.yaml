@@ -199,7 +199,7 @@ policies:
 
   approvals:
     # If approval is required, how long we wait before failing safe
-    timeout_ms: 60000
+    timeout_ms: 300000
 
   blast_radius:
     default_max: 1

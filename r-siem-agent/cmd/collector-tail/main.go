@@ -21,10 +21,11 @@ import (
 type tailConfigWrapper struct {
 	Collectors struct {
 		Tail struct {
-			Enabled        bool   `yaml:"enabled"`
-			Path           string `yaml:"path"`
-			CheckpointPath string `yaml:"checkpoint_path"`
-			PollMs         int    `yaml:"poll_ms"`
+			Enabled          bool   `yaml:"enabled"`
+			Path             string `yaml:"path"`
+			CheckpointPath   string `yaml:"checkpoint_path"`
+			PollMs           int    `yaml:"poll_ms"`
+			FingerprintBytes int    `yaml:"fingerprint_bytes"`
 		} `yaml:"tail"`
 	} `yaml:"collectors"`
 }
@@ -85,10 +86,11 @@ func loadTailConfig(path string) (*tail.Config, error) {
 	}
 	raw := wrapper.Collectors.Tail
 	cfg := &tail.Config{
-		Enabled:        raw.Enabled,
-		Path:           raw.Path,
-		CheckpointPath: raw.CheckpointPath,
-		PollInterval:   time.Duration(raw.PollMs) * time.Millisecond,
+		Enabled:          raw.Enabled,
+		Path:             raw.Path,
+		CheckpointPath:   raw.CheckpointPath,
+		PollInterval:     time.Duration(raw.PollMs) * time.Millisecond,
+		FingerprintBytes: raw.FingerprintBytes,
 	}
 	return cfg, nil
 }

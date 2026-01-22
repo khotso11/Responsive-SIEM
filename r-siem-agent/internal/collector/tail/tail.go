@@ -105,6 +105,7 @@ func (c *Collector) run(ctx context.Context) {
 		c.logger.Error("collector_tail_checkpoint_load_failed", slog.String("error", err.Error()))
 		state = checkpointState{}
 	}
+	lastFileID := state.FileID
 	c.lastOffset.Store(state.Offset)
 	c.lastSeq.Store(state.Seq)
 
@@ -116,7 +117,7 @@ func (c *Collector) run(ctx context.Context) {
 		slog.Uint64("offset", state.Offset),
 	)
 
-	file, err := os.OpenFile(c.cfg.Path, os.O_RDONLY|os.O_CREATE, 0644)
+	file, err := openTailFile(c.cfg.Path)
 	if err != nil {
 		c.setError(err)
 		c.logger.Error("collector_tail_open_failed", slog.String("error", err.Error()))
@@ -132,6 +133,45 @@ func (c *Collector) run(ctx context.Context) {
 	for {
 		if ctx.Err() != nil {
 			break
+		}
+
+		currentFileID, err := computeFileID(c.cfg.Path, c.cfg.FingerprintBytes)
+		if err != nil {
+			c.setError(err)
+			c.logger.Error("collector_tail_file_id_failed", slog.String("error", err.Error()))
+			time.Sleep(c.cfg.PollInterval)
+			continue
+		}
+		if !fileIDKnown(lastFileID) && fileIDKnown(currentFileID) {
+			lastFileID = currentFileID
+			if err := writeCheckpoint(c.cfg.CheckpointPath, checkpointState{Offset: committedOffset, Seq: seq, FileID: lastFileID}); err != nil {
+				c.setError(err)
+				c.logger.Error("collector_tail_checkpoint_write_failed", slog.String("error", err.Error()))
+			}
+		}
+		if isRotated(lastFileID, currentFileID) {
+			c.logger.LogAttrs(context.Background(), slog.LevelInfo, "collector_tail_rotated",
+				slog.Any("old", fileIDSummary(lastFileID)),
+				slog.Any("new", fileIDSummary(currentFileID)),
+				slog.Uint64("reset_offset", 0),
+			)
+			lastFileID = currentFileID
+			committedOffset = 0
+			currentOffset = 0
+			pending.Reset()
+			c.lastOffset.Store(0)
+			if err := writeCheckpoint(c.cfg.CheckpointPath, checkpointState{Offset: 0, Seq: seq, FileID: lastFileID}); err != nil {
+				c.setError(err)
+				c.logger.Error("collector_tail_checkpoint_write_failed", slog.String("error", err.Error()))
+			}
+			file.Close()
+			file, err = openTailFile(c.cfg.Path)
+			if err != nil {
+				c.setError(err)
+				c.logger.Error("collector_tail_open_failed", slog.String("error", err.Error()))
+				time.Sleep(c.cfg.PollInterval)
+				continue
+			}
 		}
 
 		if err := c.ensureOffset(&committedOffset, &currentOffset, &pending, file); err != nil {
@@ -188,7 +228,7 @@ func (c *Collector) run(ctx context.Context) {
 					committedOffset = currentOffset
 					c.lastOffset.Store(committedOffset)
 					c.lastSeq.Store(seq)
-					if err := writeCheckpoint(c.cfg.CheckpointPath, checkpointState{Offset: committedOffset, Seq: seq}); err != nil {
+					if err := writeCheckpoint(c.cfg.CheckpointPath, checkpointState{Offset: committedOffset, Seq: seq, FileID: lastFileID}); err != nil {
 						c.setError(err)
 						c.logger.Error("collector_tail_checkpoint_write_failed", slog.String("error", err.Error()))
 					}
@@ -305,4 +345,24 @@ func extractIP(line string) string {
 		return ""
 	}
 	return strings.TrimSpace(match[1])
+}
+
+func openTailFile(path string) (*os.File, error) {
+	return os.OpenFile(path, os.O_RDONLY|os.O_CREATE, 0644)
+}
+
+func isRotated(oldID, newID fileID) bool {
+	if !fileIDKnown(oldID) {
+		return false
+	}
+	if oldID.Device != 0 && newID.Device != 0 && oldID.Device != newID.Device {
+		return true
+	}
+	if oldID.Inode != 0 && newID.Inode != 0 && oldID.Inode != newID.Inode {
+		return true
+	}
+	if oldID.Fingerprint != "" && newID.Fingerprint != "" && oldID.Fingerprint != newID.Fingerprint {
+		return true
+	}
+	return false
 }

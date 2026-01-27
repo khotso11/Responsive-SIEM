@@ -25,8 +25,14 @@ type commandRequest struct {
 }
 
 type commandReply struct {
-	Status  string `json:"status"`
-	Message string `json:"message,omitempty"`
+	Status          string `json:"status"`
+	ExitCode        int    `json:"exit_code"`
+	DurationMs      int64  `json:"duration_ms"`
+	Stdout          string `json:"stdout,omitempty"`
+	Stderr          string `json:"stderr,omitempty"`
+	TruncatedStdout bool   `json:"truncated_stdout,omitempty"`
+	TruncatedStderr bool   `json:"truncated_stderr,omitempty"`
+	ErrorClass      string `json:"error_class,omitempty"`
 }
 
 func main() {
@@ -66,15 +72,26 @@ func main() {
 			return
 		}
 		status := "ok"
+		errClass := ""
+		exitCode := 0
 		if force := stringParam(req.Params, "force"); force != "" {
 			switch strings.ToLower(force) {
 			case "safe":
-				status = "fail_safe"
+				status = "error"
+				errClass = "allowlist_denied"
+				exitCode = -1
 			case "transient":
-				status = "fail_transient"
+				status = "error"
+				errClass = "timeout"
+				exitCode = -1
 			}
 		}
-		reply := commandReply{Status: status}
+		reply := commandReply{
+			Status:     status,
+			ExitCode:   exitCode,
+			DurationMs: 0,
+			ErrorClass: errClass,
+		}
 		data, err := json.Marshal(reply)
 		if err != nil {
 			return

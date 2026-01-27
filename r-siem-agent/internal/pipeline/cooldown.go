@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -20,12 +22,18 @@ type CooldownConfig struct {
 	WindowMs int64              `yaml:"window_ms"`
 	MaxKeys  int                `yaml:"max_keys"`
 	Persist  CooldownPersistCfg `yaml:"persist"`
+	PerRule  []CooldownRuleCfg  `yaml:"per_rule"`
 }
 
 type CooldownPersistCfg struct {
 	Enabled         bool   `yaml:"enabled"`
 	Path            string `yaml:"path"`
 	FlushIntervalMs int64  `yaml:"flush_interval_ms"`
+}
+
+type CooldownRuleCfg struct {
+	RuleID   string `yaml:"rule_id"`
+	WindowMs int64  `yaml:"window_ms"`
 }
 
 // ResolveCooldownConfig applies defaults to the provided config.
@@ -57,6 +65,9 @@ func ResolveCooldownConfig(raw *CooldownConfig) CooldownConfig {
 	if raw.Persist.FlushIntervalMs > 0 {
 		cfg.Persist.FlushIntervalMs = raw.Persist.FlushIntervalMs
 	}
+	if len(raw.PerRule) > 0 {
+		cfg.PerRule = raw.PerRule
+	}
 	return cfg
 }
 
@@ -68,13 +79,16 @@ type CooldownTracker struct {
 
 	dirty         bool
 	lastFlushUnix int64
+
+	perRuleWindows map[string]int64
 }
 
 // NewCooldownTracker creates a tracker with defaults applied.
 func NewCooldownTracker(cfg CooldownConfig) *CooldownTracker {
 	return &CooldownTracker{
-		cfg:  cfg,
-		last: make(map[string]int64),
+		cfg:            cfg,
+		last:           make(map[string]int64),
+		perRuleWindows: make(map[string]int64),
 	}
 }
 
@@ -83,6 +97,8 @@ func (t *CooldownTracker) Allow(key string, now int64) (bool, int64) {
 	if t == nil || !t.cfg.Enabled {
 		return true, 0
 	}
+	normalizedKey, windowMs := t.normalizeKey(key)
+	key = normalizedKey
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -92,7 +108,7 @@ func (t *CooldownTracker) Allow(key string, now int64) (bool, int64) {
 		if elapsed < 0 {
 			elapsed = 0
 		}
-		if elapsed < t.cfg.WindowMs {
+		if windowMs > 0 && elapsed < windowMs {
 			return false, elapsed
 		}
 	}
@@ -112,13 +128,42 @@ func (t *CooldownTracker) WindowMs() int64 {
 	return t.cfg.WindowMs
 }
 
+func (t *CooldownTracker) SetPerRuleWindows(windows map[string]int64) {
+	if t == nil {
+		return
+	}
+	copied := make(map[string]int64, len(windows))
+	for key, value := range windows {
+		copied[key] = value
+	}
+	t.mu.Lock()
+	t.perRuleWindows = copied
+	t.mu.Unlock()
+}
+
+func (t *CooldownTracker) EffectiveWindow(ruleID string) int64 {
+	if t == nil {
+		return 0
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.effectiveWindowUnlocked(ruleID)
+}
+
 func (t *CooldownTracker) cleanup(now int64) {
 	if t.cfg.MaxKeys <= 0 {
 		return
 	}
-	cutoff := now - t.cfg.WindowMs
 	for key, ts := range t.last {
-		if ts <= cutoff {
+		normalizedKey, windowMs := t.normalizeKey(key)
+		if normalizedKey != key {
+			delete(t.last, key)
+			if _, exists := t.last[normalizedKey]; !exists {
+				t.last[normalizedKey] = ts
+			}
+			key = normalizedKey
+		}
+		if windowMs > 0 && ts <= now-windowMs {
 			delete(t.last, key)
 		}
 	}
@@ -178,10 +223,11 @@ func (t *CooldownTracker) LoadFrom(path string, now int64) (int, int, error) {
 		if entry.LastPublishedUnix == 0 {
 			continue
 		}
-		if now > 0 && now-entry.LastPublishedUnix > t.cfg.WindowMs {
+		key, windowMs := t.normalizeKey(entry.Key)
+		if now > 0 && windowMs > 0 && now-entry.LastPublishedUnix > windowMs {
 			continue
 		}
-		t.last[entry.Key] = entry.LastPublishedUnix
+		t.last[key] = entry.LastPublishedUnix
 		kept++
 	}
 	t.cleanup(now)
@@ -248,4 +294,32 @@ func (t *CooldownTracker) FlushIfDirty(path string, now int64) (int, int, error)
 	t.mu.Unlock()
 
 	return len(payload), len(entries), nil
+}
+
+func (t *CooldownTracker) normalizeKey(key string) (string, int64) {
+	parts := strings.Split(key, "|")
+	if len(parts) >= 3 {
+		windowMs, err := strconv.ParseInt(parts[len(parts)-1], 10, 64)
+		if err == nil && windowMs > 0 {
+			return key, windowMs
+		}
+		return key, t.cfg.WindowMs
+	}
+	if len(parts) == 2 {
+		windowMs := t.effectiveWindowUnlocked(parts[0])
+		return fmt.Sprintf("%s|%s|%d", parts[0], parts[1], windowMs), windowMs
+	}
+	return key, t.cfg.WindowMs
+}
+
+func (t *CooldownTracker) effectiveWindowUnlocked(ruleID string) int64 {
+	if t == nil {
+		return 0
+	}
+	if t.perRuleWindows != nil {
+		if val, ok := t.perRuleWindows[ruleID]; ok && val > 0 {
+			return val
+		}
+	}
+	return t.cfg.WindowMs
 }

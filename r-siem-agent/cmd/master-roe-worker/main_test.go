@@ -73,12 +73,14 @@ func TestValidateStepParamsAllowlist(t *testing.T) {
 
 	if reason := validateStepParams(agentCmd.RequiredParams(), agentCmd.OptionalParams(), map[string]any{
 		"command": "ping",
+		"target":  "127.0.0.1",
 	}); reason != "" {
 		t.Fatalf("agent_command allowlist rejected command: %s", reason)
 	}
 
 	if reason := validateStepParams(agentCmd.RequiredParams(), agentCmd.OptionalParams(), map[string]any{
 		"name": "ping",
+		"args": []string{"-c", "1", "127.0.0.1"},
 	}); reason != "" {
 		t.Fatalf("agent_command allowlist rejected name: %s", reason)
 	}

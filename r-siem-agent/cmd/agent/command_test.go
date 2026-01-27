@@ -36,7 +36,7 @@ func TestPolicyDenied(t *testing.T) {
 		logger:    slog.Default(),
 		timeout:   time.Second,
 		runner:    runner,
-		allowlist: map[string]execSpec{"ping": {Command: "ping"}},
+		allowlist: map[string]execSpec{"ping": {Command: "ping", RequiresTarget: true}},
 	}
 	reply := exec.handle(context.Background(), commandRequest{
 		RunID:  "run-1",
@@ -46,7 +46,7 @@ func TestPolicyDenied(t *testing.T) {
 	if runner.called {
 		t.Fatalf("expected runner not called on deny")
 	}
-	if reply.Status != "fail_safe" || reply.Message != "policy_denied" {
+	if reply.Status != "error" || reply.ErrorClass != "allowlist_denied" {
 		t.Fatalf("unexpected reply: %#v", reply)
 	}
 }
@@ -58,7 +58,7 @@ func TestDryRunNetworkBlockPlan(t *testing.T) {
 		timeout: time.Second,
 		runner:  runner,
 		allowlist: map[string]execSpec{
-			"network_block": {},
+			"network_block": {DryRun: true},
 		},
 	}
 	reply := exec.handle(context.Background(), commandRequest{
@@ -74,7 +74,7 @@ func TestDryRunNetworkBlockPlan(t *testing.T) {
 		t.Fatalf("expected runner not called for dry-run")
 	}
 	want := "dry_run: network_block target=10.0.0.1 direction=ingress"
-	if reply.Status != "ok" || reply.Message != want {
+	if reply.Status != "ok" || reply.Stdout != want {
 		t.Fatalf("unexpected reply: %#v", reply)
 	}
 }
@@ -85,7 +85,7 @@ func TestDryRunNetworkRateLimitPlan(t *testing.T) {
 		timeout: time.Second,
 		runner:  &fakeRunner{},
 		allowlist: map[string]execSpec{
-			"network_rate_limit": {},
+			"network_rate_limit": {DryRun: true},
 		},
 	}
 	reply := exec.handle(context.Background(), commandRequest{
@@ -100,7 +100,7 @@ func TestDryRunNetworkRateLimitPlan(t *testing.T) {
 		},
 	})
 	want := "dry_run: network_rate_limit target=10.0.0.1 rate_kbps=100 burst_kb=0 duration_ms=60000"
-	if reply.Status != "ok" || reply.Message != want {
+	if reply.Status != "ok" || reply.Stdout != want {
 		t.Fatalf("unexpected reply: %#v", reply)
 	}
 }
@@ -111,7 +111,7 @@ func TestValidationFailureIsSafe(t *testing.T) {
 		timeout: time.Second,
 		runner:  &fakeRunner{},
 		allowlist: map[string]execSpec{
-			"network_block": {},
+			"network_block": {DryRun: true},
 		},
 	}
 	reply := exec.handle(context.Background(), commandRequest{
@@ -120,7 +120,7 @@ func TestValidationFailureIsSafe(t *testing.T) {
 		ActionType: "network_block",
 		Target:     "not-an-ip",
 	})
-	if reply.Status != "fail_safe" || !strings.HasPrefix(reply.Message, "validation_error:") {
+	if reply.Status != "error" || reply.ErrorClass != "allowlist_denied" {
 		t.Fatalf("unexpected validation reply: %#v", reply)
 	}
 }
@@ -133,14 +133,15 @@ func TestTimeoutMapping(t *testing.T) {
 		logger:    slog.Default(),
 		timeout:   time.Millisecond,
 		runner:    runner,
-		allowlist: map[string]execSpec{"ping": {Command: "ping"}},
+		allowlist: map[string]execSpec{"ping": {Command: "ping", RequiresTarget: true}},
 	}
 	reply := exec.handle(context.Background(), commandRequest{
 		RunID:  "run-1",
 		StepID: "step-1",
+		Target: "127.0.0.1",
 		Params: map[string]any{"command": "ping"},
 	})
-	if reply.Status != "fail_transient" || reply.Message != "timeout" {
+	if reply.Status != "error" || reply.ErrorClass != "timeout" {
 		t.Fatalf("unexpected timeout reply: %#v", reply)
 	}
 }

@@ -17,6 +17,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -58,6 +59,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "init logger: %v\n", err)
 		os.Exit(1)
 	}
+
+	logger.Info("master_consumer_config_loaded", slog.String("config_path", *configPath))
 
 	exportCfg, err := loadExportConfig(*configPath)
 	if err != nil {
@@ -126,6 +129,12 @@ func main() {
 		os.Exit(1)
 	}
 	cooldownTracker := pipeline.NewCooldownTracker(cooldownCfg)
+	overrides := parseCooldownOverrides(logger, cooldownCfg.PerRule)
+	cooldownTracker.SetPerRuleWindows(overrides)
+	logger.LogAttrs(context.Background(), slog.LevelInfo, "cooldown_per_rule_loaded",
+		slog.Int("count", len(overrides)),
+		slog.Any("mapping", formatCooldownOverrides(overrides)),
+	)
 	if cooldownCfg.Persist.Enabled {
 		now := time.Now().UnixMilli()
 		loaded, kept, err := cooldownTracker.LoadFrom(cooldownCfg.Persist.Path, now)
@@ -143,12 +152,24 @@ func main() {
 		}
 	}
 
+	triggerDedupeCfg, err := loadPipelineTriggerDedupeConfig(*configPath)
+	if err != nil {
+		logger.Error("pipeline_trigger_dedupe_config_load_failed", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	logger.LogAttrs(context.Background(), slog.LevelInfo, "trigger_dedupe_loaded",
+		slog.Bool("enabled", triggerDedupeCfg.Enabled),
+		slog.Int64("ttl_ms", triggerDedupeCfg.TTLMS),
+		slog.Int("max_keys", triggerDedupeCfg.MaxKeys),
+	)
+	triggerDedupe := pipeline.NewTriggerDedupe(triggerDedupeCfg, time.Now().UnixMilli)
+
 	rceCfg, err := loadRCEConfig(*configPath)
 	if err != nil {
 		logger.Error("rce_config_load_failed", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
-	rce := newRCE(logger, rceCfg, exporter, incidentMgr, triggerPublisher, rawTriggerPublisher, cooldownTracker)
+	rce := newRCE(logger, rceCfg, exporter, incidentMgr, triggerPublisher, rawTriggerPublisher, cooldownTracker, triggerDedupe)
 
 	if cooldownCfg.Persist.Enabled && cooldownCfg.Persist.FlushIntervalMs > 0 {
 		flushInterval := time.Duration(cooldownCfg.Persist.FlushIntervalMs) * time.Millisecond
@@ -745,7 +766,8 @@ type responseTriggerConfigRaw struct {
 }
 
 type pipelineConfigRaw struct {
-	Cooldown *pipeline.CooldownConfig `yaml:"cooldown"`
+	Cooldown      *pipeline.CooldownConfig      `yaml:"cooldown"`
+	TriggerDedupe *pipeline.TriggerDedupeConfig `yaml:"trigger_dedupe"`
 }
 
 func loadPipelineCooldownConfig(path string) (pipeline.CooldownConfig, error) {
@@ -763,6 +785,68 @@ func loadPipelineCooldownConfig(path string) (pipeline.CooldownConfig, error) {
 		return pipeline.ResolveCooldownConfig(nil), nil
 	}
 	return pipeline.ResolveCooldownConfig(wrapper.Pipeline.Cooldown), nil
+}
+
+func loadPipelineTriggerDedupeConfig(path string) (pipeline.TriggerDedupeConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return pipeline.TriggerDedupeConfig{}, fmt.Errorf("read config: %w", err)
+	}
+	var wrapper struct {
+		Pipeline *pipelineConfigRaw `yaml:"pipeline"`
+	}
+	if err := yaml.Unmarshal(data, &wrapper); err != nil {
+		return pipeline.TriggerDedupeConfig{}, fmt.Errorf("parse pipeline config: %w", err)
+	}
+	if wrapper.Pipeline == nil {
+		return pipeline.ResolveTriggerDedupeConfig(nil), nil
+	}
+	return pipeline.ResolveTriggerDedupeConfig(wrapper.Pipeline.TriggerDedupe), nil
+}
+
+func parseCooldownOverrides(logger *slog.Logger, entries []pipeline.CooldownRuleCfg) map[string]int64 {
+	overrides := make(map[string]int64)
+	for _, entry := range entries {
+		ruleID := strings.TrimSpace(entry.RuleID)
+		if ruleID == "" {
+			if logger != nil {
+				logger.Warn("cooldown_per_rule_invalid",
+					slog.String("rule_id", entry.RuleID),
+					slog.Int64("window_ms", entry.WindowMs),
+					slog.String("reason", "missing_rule_id"),
+				)
+			}
+			continue
+		}
+		if entry.WindowMs <= 0 {
+			if logger != nil {
+				logger.Warn("cooldown_per_rule_invalid",
+					slog.String("rule_id", ruleID),
+					slog.Int64("window_ms", entry.WindowMs),
+					slog.String("reason", "invalid_window_ms"),
+				)
+			}
+			continue
+		}
+		overrides[ruleID] = entry.WindowMs
+	}
+	return overrides
+}
+
+func formatCooldownOverrides(overrides map[string]int64) []string {
+	if len(overrides) == 0 {
+		return []string{}
+	}
+	keys := make([]string, 0, len(overrides))
+	for key := range overrides {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	formatted := make([]string, 0, len(keys))
+	for _, key := range keys {
+		formatted = append(formatted, fmt.Sprintf("%s=%d", key, overrides[key]))
+	}
+	return formatted
 }
 
 type ResponseTriggerPublisher struct {
@@ -1602,17 +1686,18 @@ type rceWork struct {
 }
 
 type RCE struct {
-	logger      *slog.Logger
-	cfg         RCEConfig
-	queue       chan *rceWork
-	mu          sync.Mutex
-	state       map[string]*ruleState
-	suppression map[string]int64
-	exporter    *Exporter
-	incidents   *IncidentManager
-	triggers    *ResponseTriggerPublisher
-	rawTriggers *trigger.Publisher
-	cooldown    *pipeline.CooldownTracker
+	logger        *slog.Logger
+	cfg           RCEConfig
+	queue         chan *rceWork
+	mu            sync.Mutex
+	state         map[string]*ruleState
+	suppression   map[string]int64
+	exporter      *Exporter
+	incidents     *IncidentManager
+	triggers      *ResponseTriggerPublisher
+	rawTriggers   *trigger.Publisher
+	cooldown      *pipeline.CooldownTracker
+	triggerDedupe *pipeline.TriggerDedupe
 }
 
 type ruleState struct {
@@ -1708,21 +1793,22 @@ func applyRCEDefaults(cfg *RCEConfig) {
 	}
 }
 
-func newRCE(logger *slog.Logger, cfg *RCEConfig, exporter *Exporter, incidents *IncidentManager, triggers *ResponseTriggerPublisher, rawTriggers *trigger.Publisher, cooldown *pipeline.CooldownTracker) *RCE {
+func newRCE(logger *slog.Logger, cfg *RCEConfig, exporter *Exporter, incidents *IncidentManager, triggers *ResponseTriggerPublisher, rawTriggers *trigger.Publisher, cooldown *pipeline.CooldownTracker, triggerDedupe *pipeline.TriggerDedupe) *RCE {
 	if cfg == nil {
 		return nil
 	}
 	r := &RCE{
-		logger:      logger,
-		cfg:         *cfg,
-		queue:       make(chan *rceWork, cfg.Dispatch.MaxQueue),
-		state:       make(map[string]*ruleState),
-		suppression: make(map[string]int64),
-		exporter:    exporter,
-		incidents:   incidents,
-		triggers:    triggers,
-		rawTriggers: rawTriggers,
-		cooldown:    cooldown,
+		logger:        logger,
+		cfg:           *cfg,
+		queue:         make(chan *rceWork, cfg.Dispatch.MaxQueue),
+		state:         make(map[string]*ruleState),
+		suppression:   make(map[string]int64),
+		exporter:      exporter,
+		incidents:     incidents,
+		triggers:      triggers,
+		rawTriggers:   rawTriggers,
+		cooldown:      cooldown,
+		triggerDedupe: triggerDedupe,
 	}
 	go r.worker()
 	go r.cleanupLoop()
@@ -2354,7 +2440,14 @@ func (r *RCE) emitTrigger(rule RCERule, rec NormalizedRecord, groupKey string) e
 	if key == "" {
 		key = "unknown"
 	}
-	cooldownKey := fmt.Sprintf("%s|%s", rule.ID, key)
+	var windowMs int64
+	if r.cooldown != nil {
+		windowMs = r.cooldown.EffectiveWindow(rule.ID)
+		if windowMs <= 0 {
+			windowMs = r.cooldown.WindowMs()
+		}
+	}
+	cooldownKey := fmt.Sprintf("%s|%s|%d", rule.ID, key, windowMs)
 	if r.cooldown != nil {
 		allowed, elapsed := r.cooldown.Allow(cooldownKey, rec.ObservedAt)
 		if !allowed {
@@ -2362,7 +2455,7 @@ func (r *RCE) emitTrigger(rule RCERule, rec NormalizedRecord, groupKey string) e
 				slog.String("lane", rec.Lane),
 				slog.String("rule_id", rule.ID),
 				slog.String("correlation_key", key),
-				slog.Int64("window_ms", r.cooldown.WindowMs()),
+				slog.Int64("window_ms", windowMs),
 				slog.Int64("elapsed_ms", elapsed),
 			)
 			return nil
@@ -2372,6 +2465,20 @@ func (r *RCE) emitTrigger(rule RCERule, rec NormalizedRecord, groupKey string) e
 	lane := strings.TrimSpace(rec.Lane)
 	if lane == "" {
 		lane = "STANDARD"
+	}
+	triggerID := fmt.Sprintf("trig.alert.%s", strings.TrimSpace(alertKey))
+	if r.triggerDedupe != nil {
+		if suppress, elapsed := r.triggerDedupe.ShouldSuppress(triggerID, rec.ObservedAt); suppress {
+			r.logger.LogAttrs(context.Background(), slog.LevelInfo, "pubtrigger_dedup_suppressed",
+				slog.String("lane", lane),
+				slog.String("trigger_idem_key", triggerID),
+				slog.String("rule_id", rule.ID),
+				slog.String("correlation_key", key),
+				slog.Int64("ttl_ms", r.triggerDedupe.TTLMS()),
+				slog.Int64("elapsed_ms", elapsed),
+			)
+			return nil
+		}
 	}
 	alert := trigger.Alert{
 		AlertKey:         alertKey,
@@ -2383,7 +2490,13 @@ func (r *RCE) emitTrigger(rule RCERule, rec NormalizedRecord, groupKey string) e
 		ObservedAtUnixMs: rec.ObservedAt,
 	}
 	_, _, err := r.rawTriggers.PublishAlert(alert)
-	return err
+	if err != nil {
+		return err
+	}
+	if r.triggerDedupe != nil {
+		r.triggerDedupe.Mark(triggerID, rec.ObservedAt)
+	}
+	return nil
 }
 
 func deterministicAlertKey(ruleID, groupKey string) string {

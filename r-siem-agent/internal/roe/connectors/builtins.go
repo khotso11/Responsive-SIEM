@@ -162,7 +162,7 @@ func (c *agentCommandStubConnector) RequiredParams() []string {
 }
 
 func (c *agentCommandStubConnector) OptionalParams() []string {
-	return []string{"command", "name", "force"}
+	return []string{"command", "name", "args", "target", "force"}
 }
 
 func (c *agentCommandStubConnector) Execute(ctx context.Context, step Step) (map[string]any, error) {
@@ -174,6 +174,7 @@ func (c *agentCommandStubConnector) Execute(ctx context.Context, step Step) (map
 		"step_id":     step.StepID,
 		"lane":        step.Lane,
 		"action_type": "agent_command",
+		"target":      step.Target,
 		"params":      step.Params,
 	}
 	data, err := json.Marshal(payload)
@@ -205,8 +206,14 @@ func (c *agentCommandStubConnector) Execute(ctx context.Context, step Step) (map
 		return nil, Retryable(err)
 	}
 	resp := struct {
-		Status  string `json:"status"`
-		Message string `json:"message,omitempty"`
+		Status          string `json:"status"`
+		ExitCode        int    `json:"exit_code"`
+		DurationMs      int64  `json:"duration_ms"`
+		Stdout          string `json:"stdout,omitempty"`
+		Stderr          string `json:"stderr,omitempty"`
+		TruncatedStdout bool   `json:"truncated_stdout,omitempty"`
+		TruncatedStderr bool   `json:"truncated_stderr,omitempty"`
+		ErrorClass      string `json:"error_class,omitempty"`
 	}{}
 	if err := json.Unmarshal(reply.Data, &resp); err != nil {
 		c.logger.LogAttrs(context.Background(), slog.LevelInfo, "agent_command_terminal",
@@ -221,6 +228,11 @@ func (c *agentCommandStubConnector) Execute(ctx context.Context, step Step) (map
 		slog.String("run_id", step.RunID),
 		slog.String("step_id", step.StepID),
 		slog.String("status", status),
+		slog.Int("exit_code", resp.ExitCode),
+		slog.Int64("duration_ms", resp.DurationMs),
+		slog.Bool("truncated_stdout", resp.TruncatedStdout),
+		slog.Bool("truncated_stderr", resp.TruncatedStderr),
+		slog.String("error_class", strings.ToLower(strings.TrimSpace(resp.ErrorClass))),
 	)
 	switch status {
 	case "ok":
@@ -229,21 +241,33 @@ func (c *agentCommandStubConnector) Execute(ctx context.Context, step Step) (map
 			slog.String("step_id", step.StepID),
 			slog.String("status", "succeeded"),
 		)
-		return map[string]any{"message": "command_sent_stub"}, nil
-	case "fail_safe":
+		receipt := fmt.Sprintf("agent_command: %s exit=%d dur_ms=%d stdout_trunc=%t stderr_trunc=%t",
+			agentCommandName(step.Params),
+			resp.ExitCode,
+			resp.DurationMs,
+			resp.TruncatedStdout,
+			resp.TruncatedStderr,
+		)
+		return map[string]any{"message": receipt}, nil
+	case "error":
+		errClass := strings.ToLower(strings.TrimSpace(resp.ErrorClass))
+		if errClass == "" {
+			errClass = "unknown"
+		}
+		if errClass == "timeout" {
+			c.logger.LogAttrs(context.Background(), slog.LevelInfo, "agent_command_terminal",
+				slog.String("run_id", step.RunID),
+				slog.String("step_id", step.StepID),
+				slog.String("status", "retryable"),
+			)
+			return nil, Retryable(fmt.Errorf("agent_command_%s", errClass))
+		}
 		c.logger.LogAttrs(context.Background(), slog.LevelInfo, "agent_command_terminal",
 			slog.String("run_id", step.RunID),
 			slog.String("step_id", step.StepID),
 			slog.String("status", "failed_safe"),
 		)
-		return nil, fmt.Errorf("agent_command_fail_safe")
-	case "fail_transient":
-		c.logger.LogAttrs(context.Background(), slog.LevelInfo, "agent_command_terminal",
-			slog.String("run_id", step.RunID),
-			slog.String("step_id", step.StepID),
-			slog.String("status", "retryable"),
-		)
-		return nil, Retryable(fmt.Errorf("agent_command_fail_transient"))
+		return nil, fmt.Errorf("agent_command_%s", errClass)
 	default:
 		c.logger.LogAttrs(context.Background(), slog.LevelInfo, "agent_command_terminal",
 			slog.String("run_id", step.RunID),
@@ -252,6 +276,32 @@ func (c *agentCommandStubConnector) Execute(ctx context.Context, step Step) (map
 		)
 		return nil, fmt.Errorf("agent_command_unknown_status")
 	}
+}
+
+func agentCommandName(params map[string]any) string {
+	name := strings.TrimSpace(stringParam(params, "command"))
+	if name == "" {
+		name = strings.TrimSpace(stringParam(params, "name"))
+	}
+	if name == "" {
+		return "unknown"
+	}
+	return name
+}
+
+func stringParam(params map[string]any, key string) string {
+	if params == nil {
+		return ""
+	}
+	val, ok := params[key]
+	if !ok {
+		return ""
+	}
+	str, ok := val.(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(str)
 }
 
 type networkBlockStubConnector struct {
@@ -336,8 +386,14 @@ func (c networkBlockStubConnector) Execute(ctx context.Context, step Step) (map[
 		return nil, Retryable(err)
 	}
 	resp := struct {
-		Status  string `json:"status"`
-		Message string `json:"message,omitempty"`
+		Status          string `json:"status"`
+		ExitCode        int    `json:"exit_code"`
+		DurationMs      int64  `json:"duration_ms"`
+		Stdout          string `json:"stdout,omitempty"`
+		Stderr          string `json:"stderr,omitempty"`
+		TruncatedStdout bool   `json:"truncated_stdout,omitempty"`
+		TruncatedStderr bool   `json:"truncated_stderr,omitempty"`
+		ErrorClass      string `json:"error_class,omitempty"`
 	}{}
 	if err := json.Unmarshal(reply.Data, &resp); err != nil {
 		c.logger.LogAttrs(context.Background(), slog.LevelInfo, "network_block_terminal",
@@ -352,6 +408,7 @@ func (c networkBlockStubConnector) Execute(ctx context.Context, step Step) (map[
 		slog.String("run_id", step.RunID),
 		slog.String("step_id", step.StepID),
 		slog.String("status", status),
+		slog.String("error_class", strings.ToLower(strings.TrimSpace(resp.ErrorClass))),
 	)
 	switch status {
 	case "ok":
@@ -360,30 +417,38 @@ func (c networkBlockStubConnector) Execute(ctx context.Context, step Step) (map[
 			slog.String("step_id", step.StepID),
 			slog.String("status", "succeeded"),
 		)
-		if resp.Message == "" {
-			return map[string]any{"message": "dry_run"}, nil
+		message := strings.TrimSpace(resp.Stdout)
+		if message == "" {
+			message = "dry_run"
 		}
-		return map[string]any{"message": resp.Message}, nil
-	case "fail_safe":
+		return map[string]any{
+			"message":          message,
+			"exit_code":        resp.ExitCode,
+			"duration_ms":      resp.DurationMs,
+			"stdout":           resp.Stdout,
+			"stderr":           resp.Stderr,
+			"truncated_stdout": resp.TruncatedStdout,
+			"truncated_stderr": resp.TruncatedStderr,
+		}, nil
+	case "error":
+		errClass := strings.ToLower(strings.TrimSpace(resp.ErrorClass))
+		if errClass == "" {
+			errClass = "unknown"
+		}
+		if errClass == "timeout" {
+			c.logger.LogAttrs(context.Background(), slog.LevelInfo, "network_block_terminal",
+				slog.String("run_id", step.RunID),
+				slog.String("step_id", step.StepID),
+				slog.String("status", "retryable"),
+			)
+			return nil, Retryable(fmt.Errorf("network_block_%s", errClass))
+		}
 		c.logger.LogAttrs(context.Background(), slog.LevelInfo, "network_block_terminal",
 			slog.String("run_id", step.RunID),
 			slog.String("step_id", step.StepID),
 			slog.String("status", "failed_safe"),
 		)
-		if resp.Message != "" {
-			return nil, fmt.Errorf("%s", resp.Message)
-		}
-		return nil, fmt.Errorf("network_block_fail_safe")
-	case "fail_transient":
-		c.logger.LogAttrs(context.Background(), slog.LevelInfo, "network_block_terminal",
-			slog.String("run_id", step.RunID),
-			slog.String("step_id", step.StepID),
-			slog.String("status", "retryable"),
-		)
-		if resp.Message != "" {
-			return nil, Retryable(fmt.Errorf("%s", resp.Message))
-		}
-		return nil, Retryable(fmt.Errorf("network_block_fail_transient"))
+		return nil, fmt.Errorf("network_block_%s", errClass)
 	default:
 		c.logger.LogAttrs(context.Background(), slog.LevelInfo, "network_block_terminal",
 			slog.String("run_id", step.RunID),
@@ -476,8 +541,14 @@ func (c networkRateLimitStubConnector) Execute(ctx context.Context, step Step) (
 		return nil, Retryable(err)
 	}
 	resp := struct {
-		Status  string `json:"status"`
-		Message string `json:"message,omitempty"`
+		Status          string `json:"status"`
+		ExitCode        int    `json:"exit_code"`
+		DurationMs      int64  `json:"duration_ms"`
+		Stdout          string `json:"stdout,omitempty"`
+		Stderr          string `json:"stderr,omitempty"`
+		TruncatedStdout bool   `json:"truncated_stdout,omitempty"`
+		TruncatedStderr bool   `json:"truncated_stderr,omitempty"`
+		ErrorClass      string `json:"error_class,omitempty"`
 	}{}
 	if err := json.Unmarshal(reply.Data, &resp); err != nil {
 		c.logger.LogAttrs(context.Background(), slog.LevelInfo, "network_rate_limit_terminal",
@@ -492,6 +563,7 @@ func (c networkRateLimitStubConnector) Execute(ctx context.Context, step Step) (
 		slog.String("run_id", step.RunID),
 		slog.String("step_id", step.StepID),
 		slog.String("status", status),
+		slog.String("error_class", strings.ToLower(strings.TrimSpace(resp.ErrorClass))),
 	)
 	switch status {
 	case "ok":
@@ -500,30 +572,38 @@ func (c networkRateLimitStubConnector) Execute(ctx context.Context, step Step) (
 			slog.String("step_id", step.StepID),
 			slog.String("status", "succeeded"),
 		)
-		if resp.Message == "" {
-			return map[string]any{"message": "dry_run"}, nil
+		message := strings.TrimSpace(resp.Stdout)
+		if message == "" {
+			message = "dry_run"
 		}
-		return map[string]any{"message": resp.Message}, nil
-	case "fail_safe":
+		return map[string]any{
+			"message":          message,
+			"exit_code":        resp.ExitCode,
+			"duration_ms":      resp.DurationMs,
+			"stdout":           resp.Stdout,
+			"stderr":           resp.Stderr,
+			"truncated_stdout": resp.TruncatedStdout,
+			"truncated_stderr": resp.TruncatedStderr,
+		}, nil
+	case "error":
+		errClass := strings.ToLower(strings.TrimSpace(resp.ErrorClass))
+		if errClass == "" {
+			errClass = "unknown"
+		}
+		if errClass == "timeout" {
+			c.logger.LogAttrs(context.Background(), slog.LevelInfo, "network_rate_limit_terminal",
+				slog.String("run_id", step.RunID),
+				slog.String("step_id", step.StepID),
+				slog.String("status", "retryable"),
+			)
+			return nil, Retryable(fmt.Errorf("network_rate_limit_%s", errClass))
+		}
 		c.logger.LogAttrs(context.Background(), slog.LevelInfo, "network_rate_limit_terminal",
 			slog.String("run_id", step.RunID),
 			slog.String("step_id", step.StepID),
 			slog.String("status", "failed_safe"),
 		)
-		if resp.Message != "" {
-			return nil, fmt.Errorf("%s", resp.Message)
-		}
-		return nil, fmt.Errorf("network_rate_limit_fail_safe")
-	case "fail_transient":
-		c.logger.LogAttrs(context.Background(), slog.LevelInfo, "network_rate_limit_terminal",
-			slog.String("run_id", step.RunID),
-			slog.String("step_id", step.StepID),
-			slog.String("status", "retryable"),
-		)
-		if resp.Message != "" {
-			return nil, Retryable(fmt.Errorf("%s", resp.Message))
-		}
-		return nil, Retryable(fmt.Errorf("network_rate_limit_fail_transient"))
+		return nil, fmt.Errorf("network_rate_limit_%s", errClass)
 	default:
 		c.logger.LogAttrs(context.Background(), slog.LevelInfo, "network_rate_limit_terminal",
 			slog.String("run_id", step.RunID),

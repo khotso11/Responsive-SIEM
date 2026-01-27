@@ -23,6 +23,12 @@ collectors:
     path: "tmp/demo.log"
     checkpoint_path: "tmp/tail.checkpoint.json"
     poll_ms: 200
+  syslog_udp:
+    enabled: true
+    listen_addr: "0.0.0.0:5514"
+    max_datagram_bytes: 2048
+    queue_size: 1024
+    read_timeout_ms: 500
 
 export:
   enabled: true
@@ -166,11 +172,30 @@ playbooks:
         backoff_ms: 0
         target_from: "group_key"
 
+  - id: "PB-AGENT-PING-LOCALHOST"
+    version: 1
+    enabled: true
+    selectors:
+      rule_ids: ["R-COLLECT-INVALID-USER"]
+    policy_requirements:
+      approval: "required_for_high"
+      max_blast_radius: 1
+    steps:
+      - name: "ping_localhost"
+        action_type: "agent_command"
+        timeout_ms: 3000
+        retries: 0
+        backoff_ms: 0
+        target_from: "global"
+        params:
+          command: "ping"
+          target: "127.0.0.1"
+
   - id: "PB-SEQ-PROCESS-TO-NET"
     version: 1
     enabled: true
     selectors:
-      rule_ids: ["R-SEQ-PROCESS-TO-NET", "R-COLLECT-FAILED-PW"]
+      rule_ids: ["R-SEQ-PROCESS-TO-NET", "R-COLLECT-FAILED-PW", "R-COLLECT-INVALID-USER", "R-COUNT-FAILED-PW-SRCIP"]
     policy_requirements:
       approval: "required_for_high"
       max_blast_radius: 1
@@ -226,6 +251,10 @@ consumer:
   pull_timeout_ms: 500
 
 pipeline:
+  trigger_dedupe:
+    enabled: true
+    ttl_ms: 600000
+    max_keys: 200000
   cooldown:
     enabled: true
     window_ms: 60000
@@ -233,7 +262,12 @@ pipeline:
     persist:
       enabled: true
       path: "tmp/cooldown.checkpoint.json"
-      flush_interval_ms: 5000
+      flush_interval_ms: 1000
+    per_rule:
+      - rule_id: "R-COLLECT-FAILED-PW"
+        window_ms: 2000
+      - rule_id: "R-SEQ-PROCESS-TO-NET"
+        window_ms: 300000
 
 ack_delay_ms: 0
 ack_drop_rate: 0.0
@@ -277,6 +311,28 @@ rce:
       kind: trigger
       severity: high
       group_by: src_ip
+      when:
+        type: auth
+        fields:
+          message_contains: "Failed password"
+
+    - id: R-COLLECT-INVALID-USER
+      enabled: true
+      kind: trigger
+      severity: high
+      group_by: src_ip
+      when:
+        type: auth
+        fields:
+          message_contains: "Invalid user"
+
+    - id: R-COUNT-FAILED-PW-SRCIP
+      enabled: true
+      kind: count
+      severity: high
+      group_by: src_ip
+      window_ms: 60000
+      threshold: 5
       when:
         type: auth
         fields:

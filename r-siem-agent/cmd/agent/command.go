@@ -20,8 +20,8 @@ import (
 const (
 	agentCommandSubject    = "rsiem.agent.command"
 	defaultAgentNatsURL    = "nats://127.0.0.1:4222"
-	defaultCmdTimeoutMs    = 2000
-	defaultOutputLimitByte = 1024
+	defaultCmdTimeoutMs    = 3000
+	defaultOutputLimitByte = 4096
 )
 
 type commandRequest struct {
@@ -34,13 +34,21 @@ type commandRequest struct {
 }
 
 type commandReply struct {
-	Status  string `json:"status"`
-	Message string `json:"message,omitempty"`
+	Status          string `json:"status"`
+	ExitCode        int    `json:"exit_code"`
+	DurationMs      int64  `json:"duration_ms"`
+	Stdout          string `json:"stdout,omitempty"`
+	Stderr          string `json:"stderr,omitempty"`
+	TruncatedStdout bool   `json:"truncated_stdout,omitempty"`
+	TruncatedStderr bool   `json:"truncated_stderr,omitempty"`
+	ErrorClass      string `json:"error_class,omitempty"`
 }
 
 type execSpec struct {
-	Command string
-	Args    []string
+	Command        string
+	Args           []string
+	RequiresTarget bool
+	DryRun         bool
 }
 
 type execResult struct {
@@ -112,14 +120,14 @@ func newCommandExecutor(logger *slog.Logger) *commandExecutor {
 	if runtime.GOOS == "windows" {
 		pingArgs = []string{"-n", "1", "127.0.0.1"}
 	}
+	pingBaseArgs := pingArgs[:len(pingArgs)-1]
 	return &commandExecutor{
 		logger:  logger,
 		timeout: time.Duration(timeoutMs) * time.Millisecond,
 		runner:  osExecRunner{outputLimit: outputLimit},
 		allowlist: map[string]execSpec{
-			"ping":               {Command: "ping", Args: pingArgs},
-			"network_block":      {},
-			"network_rate_limit": {},
+			"ping":               {Command: "ping", Args: pingBaseArgs, RequiresTarget: true},
+			"uname":              {Command: "uname", Args: []string{"-a"}},
 		},
 		outputLimit: outputLimit,
 	}
@@ -134,16 +142,51 @@ func (e *commandExecutor) handle(ctx context.Context, req commandRequest) comman
 	runID := strings.TrimSpace(req.RunID)
 	stepID := strings.TrimSpace(req.StepID)
 	actionKey := commandID
-	if actionType != "agent_command" {
-		actionKey = actionType
+	if actionType == "network_block" {
+		plan, err := buildNetworkBlockPlan(req.Target, req.Params)
+		if err != nil {
+			return commandReply{Status: "error", ExitCode: -1, ErrorClass: "allowlist_denied"}
+		}
+		e.logger.LogAttrs(context.Background(), slog.LevelInfo, "agent_command_exec_done",
+			slog.String("run_id", runID),
+			slog.String("step_id", stepID),
+			slog.String("command_id", "network_block"),
+			slog.Int("exit_code", 0),
+			slog.Int64("duration_ms", 0),
+			slog.Bool("stdout_truncated", false),
+			slog.Bool("stderr_truncated", false),
+		)
+		return commandReply{Status: "ok", ExitCode: 0, DurationMs: 0, Stdout: plan}
 	}
+
+	if actionType == "network_rate_limit" {
+		plan, err := buildNetworkRateLimitPlan(req.Target, req.Params)
+		if err != nil {
+			return commandReply{Status: "error", ExitCode: -1, ErrorClass: "allowlist_denied"}
+		}
+		e.logger.LogAttrs(context.Background(), slog.LevelInfo, "agent_command_exec_done",
+			slog.String("run_id", runID),
+			slog.String("step_id", stepID),
+			slog.String("command_id", "network_rate_limit"),
+			slog.Int("exit_code", 0),
+			slog.Int64("duration_ms", 0),
+			slog.Bool("stdout_truncated", false),
+			slog.Bool("stderr_truncated", false),
+		)
+		return commandReply{Status: "ok", ExitCode: 0, DurationMs: 0, Stdout: plan}
+	}
+
+	if actionType != "agent_command" {
+		return commandReply{Status: "error", ExitCode: -1, ErrorClass: "internal"}
+	}
+
 	if actionKey == "" {
 		e.logger.LogAttrs(context.Background(), slog.LevelInfo, "agent_command_exec_denied",
 			slog.String("run_id", runID),
 			slog.String("step_id", stepID),
 			slog.String("reason", "missing_command"),
 		)
-		return commandReply{Status: "fail_safe", Message: "policy_denied"}
+		return commandReply{Status: "error", ExitCode: -1, ErrorClass: "allowlist_denied"}
 	}
 
 	spec, ok := e.allowlist[actionKey]
@@ -154,7 +197,7 @@ func (e *commandExecutor) handle(ctx context.Context, req commandRequest) comman
 			slog.String("command_id", actionKey),
 			slog.String("reason", "not_allowlisted"),
 		)
-		return commandReply{Status: "fail_safe", Message: "policy_denied"}
+		return commandReply{Status: "error", ExitCode: -1, ErrorClass: "allowlist_denied"}
 	}
 
 	e.logger.LogAttrs(context.Background(), slog.LevelInfo, "agent_command_exec_start",
@@ -163,38 +206,16 @@ func (e *commandExecutor) handle(ctx context.Context, req commandRequest) comman
 		slog.String("command_id", actionKey),
 	)
 
-	if actionType == "network_block" {
-		plan, err := buildNetworkBlockPlan(req.Target, req.Params)
-		if err != nil {
-			return commandReply{Status: "fail_safe", Message: "validation_error:" + err.Error()}
+	if spec.RequiresTarget {
+		target := strings.TrimSpace(req.Target)
+		if target == "" {
+			target = strings.TrimSpace(stringParam(req.Params, "target"))
 		}
-		e.logger.LogAttrs(context.Background(), slog.LevelInfo, "agent_command_exec_done",
-			slog.String("run_id", runID),
-			slog.String("step_id", stepID),
-			slog.String("command_id", actionKey),
-			slog.Int("exit_code", 0),
-			slog.Int64("duration_ms", 0),
-			slog.Bool("stdout_truncated", false),
-			slog.Bool("stderr_truncated", false),
-		)
-		return commandReply{Status: "ok", Message: plan}
-	}
-
-	if actionType == "network_rate_limit" {
-		plan, err := buildNetworkRateLimitPlan(req.Target, req.Params)
-		if err != nil {
-			return commandReply{Status: "fail_safe", Message: "validation_error:" + err.Error()}
+		if !validPingTarget(target) {
+			return commandReply{Status: "error", ExitCode: -1, ErrorClass: "allowlist_denied"}
 		}
-		e.logger.LogAttrs(context.Background(), slog.LevelInfo, "agent_command_exec_done",
-			slog.String("run_id", runID),
-			slog.String("step_id", stepID),
-			slog.String("command_id", actionKey),
-			slog.Int("exit_code", 0),
-			slog.Int64("duration_ms", 0),
-			slog.Bool("stdout_truncated", false),
-			slog.Bool("stderr_truncated", false),
-		)
-		return commandReply{Status: "ok", Message: plan}
+		args := append([]string(nil), spec.Args...)
+		spec.Args = append(args, target)
 	}
 
 	execCtx, cancel := context.WithTimeout(ctx, e.timeout)
@@ -217,18 +238,53 @@ func (e *commandExecutor) handle(ctx context.Context, req commandRequest) comman
 			slog.String("step_id", stepID),
 			slog.String("command_id", commandID),
 		)
-		return commandReply{Status: "fail_transient", Message: "timeout"}
+		return commandReply{
+			Status:          "error",
+			ExitCode:        result.ExitCode,
+			DurationMs:      result.DurationMillis,
+			Stdout:          result.Stdout,
+			Stderr:          result.Stderr,
+			TruncatedStdout: result.StdoutTrunc,
+			TruncatedStderr: result.StderrTrunc,
+			ErrorClass:      "timeout",
+		}
 	}
 
 	if result.Err != nil {
-		return commandReply{Status: "fail_safe", Message: "exec_failed"}
+		return commandReply{
+			Status:          "error",
+			ExitCode:        result.ExitCode,
+			DurationMs:      result.DurationMillis,
+			Stdout:          result.Stdout,
+			Stderr:          result.Stderr,
+			TruncatedStdout: result.StdoutTrunc,
+			TruncatedStderr: result.StderrTrunc,
+			ErrorClass:      "exec_failed",
+		}
 	}
 
 	if result.ExitCode != 0 {
-		return commandReply{Status: "fail_safe", Message: fmt.Sprintf("exit_code:%d", result.ExitCode)}
+		return commandReply{
+			Status:          "error",
+			ExitCode:        result.ExitCode,
+			DurationMs:      result.DurationMillis,
+			Stdout:          result.Stdout,
+			Stderr:          result.Stderr,
+			TruncatedStdout: result.StdoutTrunc,
+			TruncatedStderr: result.StderrTrunc,
+			ErrorClass:      "exec_failed",
+		}
 	}
 
-	return commandReply{Status: "ok", Message: buildOutputMessage(result)}
+	return commandReply{
+		Status:          "ok",
+		ExitCode:        result.ExitCode,
+		DurationMs:      result.DurationMillis,
+		Stdout:          result.Stdout,
+		Stderr:          result.Stderr,
+		TruncatedStdout: result.StdoutTrunc,
+		TruncatedStderr: result.StderrTrunc,
+	}
 }
 
 func runCommandListener(ctx context.Context, logger *slog.Logger, natsURL string) error {
@@ -482,4 +538,43 @@ func validIPOrCIDR(value string) bool {
 	}
 	_, _, err := net.ParseCIDR(value)
 	return err == nil
+}
+
+func validPingTarget(target string) bool {
+	target = strings.TrimSpace(target)
+	if target == "" || strings.IndexFunc(target, func(r rune) bool {
+		return r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	}) >= 0 {
+		return false
+	}
+	if net.ParseIP(target) != nil {
+		return true
+	}
+	if strings.Contains(target, ":") {
+		return false
+	}
+	return validHostname(target)
+}
+
+func validHostname(host string) bool {
+	if len(host) == 0 || len(host) > 253 {
+		return false
+	}
+	labels := strings.Split(host, ".")
+	for _, label := range labels {
+		if len(label) == 0 || len(label) > 63 {
+			return false
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			ch := label[i]
+			if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' {
+				continue
+			}
+			return false
+		}
+	}
+	return true
 }

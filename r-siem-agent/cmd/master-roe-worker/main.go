@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -12,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -66,10 +69,11 @@ type failureInjectConfig struct {
 }
 
 type workerExportConfig struct {
-	Enabled   bool   `yaml:"enabled"`
-	Required  *bool  `yaml:"required"`
-	StepsPath string `yaml:"steps_path"`
-	Flush     *bool  `yaml:"flush"`
+	Enabled         bool   `yaml:"enabled"`
+	Required        *bool  `yaml:"required"`
+	StepsPath       string `yaml:"steps_path"`
+	StepsLatestPath string `yaml:"steps_latest_path"`
+	Flush           *bool  `yaml:"flush"`
 }
 
 type roeWorkerConfigWrapper struct {
@@ -138,11 +142,31 @@ type workerExporter struct {
 	cfg    workerExportConfig
 	mu     sync.Mutex
 	file   *os.File
+	latest map[string]latestRecord
+	seq    int64
 }
 
+type latestRecord struct {
+	finishedAt int64
+	seq        int64
+	payload    []byte
+}
 func main() {
 	configPath := flag.String("config", "configs/master.yaml", "Path to master config")
+	laneMode := flag.String("lane", "BOTH", "Lane mode: FAST, STANDARD, or BOTH")
 	flag.Parse()
+
+	lane := strings.ToUpper(strings.TrimSpace(*laneMode))
+	if lane == "" {
+		lane = "BOTH"
+	}
+	switch lane {
+	case "FAST", "STANDARD", "BOTH":
+	default:
+		fmt.Fprintf(os.Stderr, "invalid -lane value: %s\n", *laneMode)
+		flag.Usage()
+		os.Exit(2)
+	}
 
 	baseCfg, err := config.LoadMaster(*configPath)
 	if err != nil {
@@ -162,9 +186,19 @@ func main() {
 		os.Exit(1)
 	}
 
+	fastWorkers := cfg.FastWorkers
+	standardWorkers := cfg.StandardWorkers
+	switch lane {
+	case "FAST":
+		standardWorkers = 0
+	case "STANDARD":
+		fastWorkers = 0
+	}
+
 	logger.LogAttrs(context.Background(), slog.LevelInfo, "roe_worker_starting",
-		slog.Int("fast_workers", cfg.FastWorkers),
-		slog.Int("standard_workers", cfg.StandardWorkers),
+		slog.String("lane_mode", lane),
+		slog.Int("fast_workers", fastWorkers),
+		slog.Int("standard_workers", standardWorkers),
 		slog.Int("pull_batch", cfg.PullBatch),
 		slog.Int("pull_timeout_ms", cfg.PullTimeoutMs),
 		slog.Int("max_inflight", cfg.MaxInflight),
@@ -238,57 +272,76 @@ func main() {
 		slog.Int("connectors", runtime.connectors.Count()),
 	)
 
-	if err := ensureConsumer(js, responseStream, responseStepsFast, "roe-steps-fast"); err != nil {
-		logger.Error("ensure_consumer_failed", slog.String("lane", "FAST"), slog.String("error", err.Error()))
-		os.Exit(1)
+	var fastSub *nats.Subscription
+	var standardSub *nats.Subscription
+	if lane != "STANDARD" {
+		if err := ensureConsumer(js, responseStream, responseStepsFast, "roe-steps-fast"); err != nil {
+			logger.Error("ensure_consumer_failed", slog.String("lane", "FAST"), slog.String("error", err.Error()))
+			os.Exit(1)
+		}
+		fastSub, err = js.PullSubscribe(responseStepsFast, "roe-steps-fast", nats.BindStream(responseStream))
+		if err != nil {
+			logger.Error("subscribe_failed", slog.String("lane", "FAST"), slog.String("error", err.Error()))
+			os.Exit(1)
+		}
 	}
-	if err := ensureConsumer(js, responseStream, responseStepsStd, "roe-steps-standard"); err != nil {
-		logger.Error("ensure_consumer_failed", slog.String("lane", "STANDARD"), slog.String("error", err.Error()))
-		os.Exit(1)
-	}
-
-	fastSub, err := js.PullSubscribe(responseStepsFast, "roe-steps-fast", nats.BindStream(responseStream))
-	if err != nil {
-		logger.Error("subscribe_failed", slog.String("lane", "FAST"), slog.String("error", err.Error()))
-		os.Exit(1)
-	}
-	standardSub, err := js.PullSubscribe(responseStepsStd, "roe-steps-standard", nats.BindStream(responseStream))
-	if err != nil {
-		logger.Error("subscribe_failed", slog.String("lane", "STANDARD"), slog.String("error", err.Error()))
-		os.Exit(1)
+	if lane != "FAST" {
+		if err := ensureConsumer(js, responseStream, responseStepsStd, "roe-steps-standard"); err != nil {
+			logger.Error("ensure_consumer_failed", slog.String("lane", "STANDARD"), slog.String("error", err.Error()))
+			os.Exit(1)
+		}
+		standardSub, err = js.PullSubscribe(responseStepsStd, "roe-steps-standard", nats.BindStream(responseStream))
+		if err != nil {
+			logger.Error("subscribe_failed", slog.String("lane", "STANDARD"), slog.String("error", err.Error()))
+			os.Exit(1)
+		}
 	}
 
 	ctx, cancel := signalContext()
 	defer cancel()
 
-	fastQueue := make(chan *nats.Msg, cfg.MaxInflight)
-	standardQueue := make(chan *nats.Msg, cfg.MaxInflight)
+	var fastQueue chan *nats.Msg
+	var standardQueue chan *nats.Msg
+	if lane != "STANDARD" {
+		fastQueue = make(chan *nats.Msg, cfg.MaxInflight)
+	}
+	if lane != "FAST" {
+		standardQueue = make(chan *nats.Msg, cfg.MaxInflight)
+	}
 
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		fetchLoop(ctx, runtime, fastSub, "FAST", fastQueue, false)
-	}()
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		fetchLoop(ctx, runtime, standardSub, "STANDARD", standardQueue, true)
-	}()
-
-	for i := 0; i < cfg.FastWorkers; i++ {
+	if fastSub != nil && fastQueue != nil {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			workerLoop(ctx, runtime, fastQueue)
+			fetchLoop(ctx, runtime, fastSub, "FAST", fastQueue, false)
 		}()
 	}
-	for i := 0; i < cfg.StandardWorkers; i++ {
+	if standardSub != nil && standardQueue != nil {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			workerLoop(ctx, runtime, standardQueue)
+			fetchLoop(ctx, runtime, standardSub, "STANDARD", standardQueue, true)
 		}()
+	}
+
+	if fastQueue != nil {
+		for i := 0; i < fastWorkers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				workerLoop(ctx, runtime, fastQueue)
+			}()
+		}
+	}
+	if standardQueue != nil {
+		for i := 0; i < standardWorkers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				workerLoop(ctx, runtime, standardQueue)
+			}()
+		}
 	}
 
 	wg.Wait()
@@ -343,6 +396,9 @@ func applyWorkerDefaults(cfg *roeWorkerConfig) {
 	}
 	if strings.TrimSpace(cfg.Export.StepsPath) == "" {
 		cfg.Export.StepsPath = "exports/roe_steps.jsonl"
+	}
+	if strings.TrimSpace(cfg.Export.StepsLatestPath) == "" {
+		cfg.Export.StepsLatestPath = filepath.Join(filepath.Dir(cfg.Export.StepsPath), "roe_steps_latest.jsonl")
 	}
 }
 
@@ -1251,21 +1307,43 @@ func newWorkerExporter(logger *slog.Logger, cfg workerExportConfig) (*workerExpo
 	if !cfg.Enabled {
 		return nil, nil
 	}
-	dir := filepath.Dir(cfg.StepsPath)
-	if dir != "." && dir != "" {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return nil, err
-		}
+	stepsDir := filepath.Dir(cfg.StepsPath)
+	if stepsDir == "" {
+		stepsDir = "."
+	}
+	if err := os.MkdirAll(stepsDir, 0o755); err != nil {
+		return nil, err
+	}
+	latestDir := filepath.Dir(cfg.StepsLatestPath)
+	if latestDir == "" {
+		latestDir = "."
+	}
+	if err := os.MkdirAll(latestDir, 0o755); err != nil {
+		return nil, err
+	}
+	if logger != nil {
+		logger.LogAttrs(context.Background(), slog.LevelInfo, "export_steps_paths",
+			slog.String("steps_path", cfg.StepsPath),
+			slog.String("steps_latest_path", cfg.StepsLatestPath),
+		)
 	}
 	file, err := os.OpenFile(cfg.StepsPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, err
 	}
-	return &workerExporter{
+	exporter := &workerExporter{
 		logger: logger,
 		cfg:    cfg,
 		file:   file,
-	}, nil
+		latest: make(map[string]latestRecord),
+	}
+	if err := exporter.loadLatestFromAudit(); err != nil {
+		exporter.logError(err)
+		if exporter.isRequired() {
+			return nil, err
+		}
+	}
+	return exporter, nil
 }
 
 func (w *workerExporter) Close() {
@@ -1286,6 +1364,7 @@ func (w *workerExporter) WriteJSONL(payload []byte) error {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	// roe_steps.jsonl is the append-only audit log; keep all history.
 	if _, err := w.file.Write(append(payload, '\n')); err != nil {
 		w.logError(err)
 		if w.isRequired() {
@@ -1305,9 +1384,160 @@ func (w *workerExporter) WriteJSONL(payload []byte) error {
 			}
 		}
 	}
+	// roe_steps_latest.jsonl is a case-ready snapshot of the latest state per step_key.
+	if err := w.updateLatestSnapshot(payload); err != nil {
+		w.logError(err)
+		if w.isRequired() {
+			return err
+		}
+	}
 	return nil
 }
 
+func (w *workerExporter) updateLatestSnapshot(payload []byte) error {
+	if len(payload) == 0 {
+		return nil
+	}
+	type exportRecord struct {
+		StepKey          string `json:"step_key"`
+		FinishedAtUnixMs int64  `json:"finished_at_unix_ms"`
+	}
+	var rec exportRecord
+	if err := json.Unmarshal(payload, &rec); err != nil {
+		return err
+	}
+	if strings.TrimSpace(rec.StepKey) == "" {
+		return nil
+	}
+	w.seq++
+	if !w.shouldUpdateLatest(rec.StepKey, rec.FinishedAtUnixMs, w.seq) {
+		return nil
+	}
+	w.latest[rec.StepKey] = latestRecord{
+		finishedAt: rec.FinishedAtUnixMs,
+		seq:        w.seq,
+		payload:    append([]byte(nil), payload...),
+	}
+	return w.writeLatestSnapshot()
+}
+
+func (w *workerExporter) shouldUpdateLatest(stepKey string, finishedAt int64, seq int64) bool {
+	if existing, ok := w.latest[stepKey]; ok {
+		if finishedAt > 0 && existing.finishedAt > 0 {
+			if finishedAt < existing.finishedAt {
+				return false
+			}
+			if finishedAt == existing.finishedAt && seq <= existing.seq {
+				return false
+			}
+		} else if seq <= existing.seq {
+			return false
+		}
+	}
+	return true
+}
+
+func (w *workerExporter) loadLatestFromAudit() error {
+	path := strings.TrimSpace(w.cfg.StepsPath)
+	if path == "" {
+		return nil
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return w.writeLatestSnapshot()
+		}
+		return err
+	}
+	defer file.Close()
+
+	type exportRecord struct {
+		StepKey          string `json:"step_key"`
+		FinishedAtUnixMs int64  `json:"finished_at_unix_ms"`
+	}
+	scanner := bufio.NewScanner(file)
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var rec exportRecord
+		if err := json.Unmarshal(line, &rec); err != nil {
+			w.logError(fmt.Errorf("roe_steps_audit_parse_failed: %w", err))
+			continue
+		}
+		stepKey := strings.TrimSpace(rec.StepKey)
+		if stepKey == "" {
+			continue
+		}
+		w.seq++
+		if !w.shouldUpdateLatest(stepKey, rec.FinishedAtUnixMs, w.seq) {
+			continue
+		}
+		w.latest[stepKey] = latestRecord{
+			finishedAt: rec.FinishedAtUnixMs,
+			seq:        w.seq,
+			payload:    append([]byte(nil), line...),
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	return w.writeLatestSnapshot()
+}
+func (w *workerExporter) writeLatestSnapshot() error {
+	dir := filepath.Dir(w.cfg.StepsLatestPath)
+	if dir == "" {
+		dir = "."
+	}
+	tmpFile, err := os.CreateTemp(dir, ".roe_steps_latest_*.jsonl")
+	if err != nil {
+		return err
+	}
+	if err := tmpFile.Chmod(0o644); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpFile.Name())
+		return err
+	}
+	type snapshotItem struct {
+		stepKey    string
+		finishedAt int64
+		payload    []byte
+	}
+	items := make([]snapshotItem, 0, len(w.latest))
+	for key, entry := range w.latest {
+		items = append(items, snapshotItem{
+			stepKey:    key,
+			finishedAt: entry.finishedAt,
+			payload:    entry.payload,
+		})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].finishedAt != items[j].finishedAt {
+			return items[i].finishedAt < items[j].finishedAt
+		}
+		return items[i].stepKey < items[j].stepKey
+	})
+	for _, item := range items {
+		if _, err := tmpFile.Write(append(item.payload, '\n')); err != nil {
+			_ = tmpFile.Close()
+			_ = os.Remove(tmpFile.Name())
+			return err
+		}
+	}
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpFile.Name())
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmpFile.Name())
+		return err
+	}
+	return os.Rename(tmpFile.Name(), w.cfg.StepsLatestPath)
+}
 func (w *workerExporter) isRequired() bool {
 	if w.cfg.Required != nil {
 		return *w.cfg.Required

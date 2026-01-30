@@ -135,6 +135,11 @@ type workerRuntime struct {
 	workerID   string
 	connectors *connectors.Manager
 	allowlist  map[string]struct{}
+	exitFunc   func(int)
+	failpoint  workerFailpoint
+	failpointTriggered atomic.Bool
+	publishResultPayloadOverride func([]byte) error
+	executeConnectorOverride     func(context.Context, connectors.Connector, stepMessage) (map[string]any, error)
 }
 
 type workerExporter struct {
@@ -150,6 +155,14 @@ type latestRecord struct {
 	finishedAt int64
 	seq        int64
 	payload    []byte
+}
+
+type workerFailpoint struct {
+	enabled bool
+	stage   string
+	runID   string
+	stepID  string
+	once    bool
 }
 func main() {
 	configPath := flag.String("config", "configs/master.yaml", "Path to master config")
@@ -262,6 +275,8 @@ func main() {
 		testFailKV: isTestFailAfterKVEnabled(),
 		exporter:   exporter,
 		workerID:   newWorkerID(),
+		exitFunc:   os.Exit,
+		failpoint:  loadWorkerFailpoint(),
 		connectors: connectors.NewManager(connectors.Builtins(connectors.BuiltinOptions{
 			Logger: logger,
 			NATS:   nc,
@@ -578,7 +593,8 @@ func processStep(runtime *workerRuntime, msg *nats.Msg) error {
 		return nil
 	}
 	stepKey := stepKey(step)
-	resultKey := workerResultKey(step)
+	resultKey := resultDedupeKey(step)
+	legacyKey := workerResultKey(step)
 	lockKey := fmt.Sprintf("lock.run.%s", step.RunID)
 	runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "step_received",
 		slog.String("run_id", step.RunID),
@@ -588,8 +604,15 @@ func processStep(runtime *workerRuntime, msg *nats.Msg) error {
 		slog.Uint64("js_seq", jsSeq),
 	)
 
+	if handled, err := handleResultReplay(runtime, step, stepKey, resultKey, legacyKey, resultKey); err != nil {
+		runtime.logger.Error("roe_step_result_publish_failed", slog.String("error", err.Error()))
+		return err
+	} else if handled {
+		return msg.Ack()
+	}
+
 	var priorState *stepState
-	if payload, found, err := runtime.getTerminalResult(resultKey); err != nil {
+	if payload, found, err := runtime.getTerminalResultAny(resultKey, legacyKey); err != nil {
 		runtime.logger.Error("roe_result_kv_error", slog.String("error", err.Error()))
 		return nil
 	} else if found {
@@ -732,6 +755,9 @@ func processStep(runtime *workerRuntime, msg *nats.Msg) error {
 			runtime.logger.Error("roe_result_kv_error", slog.String("error", err.Error()))
 			return nil
 		}
+		if err := runtime.maybeFailpoint(step, final, "after_persist_terminal"); err != nil {
+			return err
+		}
 		if err := runtime.maybeFailAfterKV(step, jsSeq); err != nil {
 			return err
 		}
@@ -765,6 +791,9 @@ func processStep(runtime *workerRuntime, msg *nats.Msg) error {
 		if err := runtime.persistTerminalResult(step, final); err != nil {
 			runtime.logger.Error("roe_result_kv_error", slog.String("error", err.Error()))
 			return nil
+		}
+		if err := runtime.maybeFailpoint(step, final, "after_persist_terminal"); err != nil {
+			return err
 		}
 		if err := runtime.maybeFailAfterKV(step, jsSeq); err != nil {
 			return err
@@ -803,6 +832,9 @@ func processStep(runtime *workerRuntime, msg *nats.Msg) error {
 			runtime.logger.Error("roe_result_kv_error", slog.String("error", err.Error()))
 			return nil
 		}
+		if err := runtime.maybeFailpoint(step, final, "after_persist_terminal"); err != nil {
+			return err
+		}
 		if err := runtime.maybeFailAfterKV(step, jsSeq); err != nil {
 			return err
 		}
@@ -835,7 +867,7 @@ func processStep(runtime *workerRuntime, msg *nats.Msg) error {
 	result, err := runtime.executeConnector(ctx, connector, step)
 	finished := time.Now().UnixMilli()
 	if err != nil {
-		if connectors.IsRetryable(err) && attempt < maxAttempts {
+		if connectors.IsRetryable(err) && (attempt < maxAttempts || allowAgentNoResponderRetry(step, err, running, priorState, maxAttempts, baseBackoff, maxBackoff)) {
 			backoff := computeBackoff(attempt, baseBackoff, maxBackoff)
 			final := running
 			final.Status = "FAILED_TRANSIENT"
@@ -880,6 +912,9 @@ func processStep(runtime *workerRuntime, msg *nats.Msg) error {
 				runtime.logger.Error("roe_result_kv_error", slog.String("error", err.Error()))
 				return nil
 			}
+			if err := runtime.maybeFailpoint(step, final, "after_persist_terminal"); err != nil {
+				return err
+			}
 			if err := runtime.maybeFailAfterKV(step, jsSeq); err != nil {
 				return err
 			}
@@ -910,6 +945,9 @@ func processStep(runtime *workerRuntime, msg *nats.Msg) error {
 		if err := runtime.persistTerminalResult(step, final); err != nil {
 			runtime.logger.Error("roe_result_kv_error", slog.String("error", err.Error()))
 			return nil
+		}
+		if err := runtime.maybeFailpoint(step, final, "after_persist_terminal"); err != nil {
+			return err
 		}
 		if err := runtime.maybeFailAfterKV(step, jsSeq); err != nil {
 			return err
@@ -942,6 +980,9 @@ func processStep(runtime *workerRuntime, msg *nats.Msg) error {
 	if err := runtime.persistTerminalResult(step, final); err != nil {
 		runtime.logger.Error("roe_result_kv_error", slog.String("error", err.Error()))
 		return nil
+	}
+	if err := runtime.maybeFailpoint(step, final, "after_persist_terminal"); err != nil {
+		return err
 	}
 	if err := runtime.maybeFailAfterKV(step, jsSeq); err != nil {
 		return err
@@ -1043,6 +1084,10 @@ func workerResultKey(step stepMessage) string {
 	return fmt.Sprintf("worker_result.%s.%s", step.RunID, step.StepID)
 }
 
+func resultDedupeKey(step stepMessage) string {
+	return fmt.Sprintf("result.%s.%s", step.RunID, step.StepID)
+}
+
 func putState(kv nats.KeyValue, key string, state stepState) error {
 	payload, err := json.Marshal(state)
 	if err != nil {
@@ -1053,6 +1098,9 @@ func putState(kv nats.KeyValue, key string, state stepState) error {
 }
 
 func (r *workerRuntime) executeConnector(ctx context.Context, connector connectors.Connector, step stepMessage) (map[string]any, error) {
+	if r.executeConnectorOverride != nil {
+		return r.executeConnectorOverride(ctx, connector, step)
+	}
 	if r.cfg.FailureInject.Enabled && r.cfg.FailureInject.EveryN > 0 {
 		count := r.execCount.Add(1)
 		if int(count)%r.cfg.FailureInject.EveryN == 0 {
@@ -1079,6 +1127,9 @@ func (r *workerRuntime) publishResult(step stepMessage, final stepState) error {
 }
 
 func (r *workerRuntime) publishResultPayload(payload []byte) error {
+	if r.publishResultPayloadOverride != nil {
+		return r.publishResultPayloadOverride(payload)
+	}
 	record := resultRecord{}
 	if err := json.Unmarshal(payload, &record); err != nil {
 		return err
@@ -1103,8 +1154,42 @@ func (r *workerRuntime) persistTerminalResult(step stepMessage, final stepState)
 	if err != nil {
 		return err
 	}
+	if final.Status == "SUCCEEDED" || final.Status == "FAILED_SAFE" {
+		if _, err := r.resultsKV.Create(resultDedupeKey(step), payload); err != nil && !errors.Is(err, nats.ErrKeyExists) {
+			return err
+		}
+	}
 	_, err = r.resultsKV.Put(workerResultKey(step), payload)
 	return err
+}
+
+func (r *workerRuntime) maybeFailpoint(step stepMessage, final stepState, stage string) error {
+	if !r.failpoint.enabled || r.failpoint.stage != stage {
+		return nil
+	}
+	if final.Status != "SUCCEEDED" && final.Status != "FAILED_SAFE" {
+		return nil
+	}
+	if r.failpoint.runID != "" && r.failpoint.runID != step.RunID {
+		return nil
+	}
+	if r.failpoint.stepID != "" && r.failpoint.stepID != step.StepID {
+		return nil
+	}
+	if r.failpoint.once {
+		if !r.failpointTriggered.CompareAndSwap(false, true) {
+			return nil
+		}
+	}
+	r.logger.LogAttrs(context.Background(), slog.LevelError, "roe_failpoint_triggered",
+		slog.String("run_id", step.RunID),
+		slog.String("step_id", step.StepID),
+		slog.String("stage", stage),
+	)
+	if r.exitFunc != nil {
+		r.exitFunc(2)
+	}
+	return fmt.Errorf("failpoint_triggered")
 }
 
 func (r *workerRuntime) maybeFailAfterKV(step stepMessage, jsSeq uint64) error {
@@ -1129,6 +1214,94 @@ func (r *workerRuntime) getTerminalResult(key string) ([]byte, bool, error) {
 		return nil, false, nil
 	}
 	return nil, false, err
+}
+
+func (r *workerRuntime) getTerminalResultAny(primary string, fallback string) ([]byte, bool, error) {
+	if payload, found, err := r.getTerminalResult(primary); err != nil || found {
+		return payload, found, err
+	}
+	if fallback == "" {
+		return nil, false, nil
+	}
+	return r.getTerminalResult(fallback)
+}
+
+func (r *workerRuntime) hasResultDedupe(key string) (bool, error) {
+	if _, err := r.resultsKV.Get(key); err == nil {
+		return true, nil
+	} else if errors.Is(err, nats.ErrKeyNotFound) {
+		return false, nil
+	} else {
+		return false, err
+	}
+}
+
+func (r *workerRuntime) replayFromState(step stepMessage, key string) (bool, error) {
+	existing, err := r.kv.Get(key)
+	if err != nil {
+		if errors.Is(err, nats.ErrKeyNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	state := stepState{}
+	if err := json.Unmarshal(existing.Value(), &state); err != nil {
+		return false, err
+	}
+	switch state.Status {
+	case "SUCCEEDED", "FAILED_SAFE":
+		if err := r.persistTerminalResult(step, state); err != nil {
+			return false, err
+		}
+		if err := r.publishResult(step, state); err != nil {
+			return false, err
+		}
+		return true, nil
+	default:
+		return false, nil
+	}
+}
+
+func handleResultReplay(runtime *workerRuntime, step stepMessage, stepKey string, resultKey string, legacyKey string, dedupeKey string) (bool, error) {
+	if exists, err := runtime.hasResultDedupe(dedupeKey); err != nil {
+		return false, err
+	} else if !exists {
+		return false, nil
+	}
+	runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "worker_result_replay",
+		slog.String("run_id", step.RunID),
+		slog.String("step_id", step.StepID),
+		slog.String("result_key", dedupeKey),
+	)
+	if payload, found, err := runtime.getTerminalResultAny(resultKey, legacyKey); err != nil {
+		return false, err
+	} else if found {
+		if err := runtime.publishResultPayload(payload); err != nil {
+			return false, err
+		}
+		runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "step_duplicate_succeeded",
+			slog.String("run_id", step.RunID),
+			slog.String("step_id", step.StepID),
+		)
+		return true, nil
+	}
+	handled, err := runtime.replayFromState(step, stepKey)
+	if err != nil {
+		return false, err
+	}
+	if handled {
+		runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "step_duplicate_succeeded",
+			slog.String("run_id", step.RunID),
+			slog.String("step_id", step.StepID),
+		)
+		return true, nil
+	}
+	runtime.logger.Error("roe_result_replay_missing",
+		slog.String("run_id", step.RunID),
+		slog.String("step_id", step.StepID),
+		slog.String("result_key", dedupeKey),
+	)
+	return false, fmt.Errorf("result_replay_missing")
 }
 
 type resultRecord struct {
@@ -1301,6 +1474,54 @@ func validateStepParams(required []string, optional []string, params map[string]
 		}
 	}
 	return ""
+}
+
+func allowAgentNoResponderRetry(step stepMessage, err error, running stepState, prior *stepState, maxAttempts int, baseBackoff int64, maxBackoff int64) bool {
+	if !isAgentNoResponder(step, err) {
+		return false
+	}
+	_ = baseBackoff
+	startMs := step.EmittedAtUnixMs
+	if startMs <= 0 {
+		startMs = step.PlannedAtUnixMs
+	}
+	if startMs <= 0 && prior != nil && prior.StartedAtUnixMs > 0 {
+		startMs = prior.StartedAtUnixMs
+	}
+	if startMs <= 0 {
+		startMs = running.StartedAtUnixMs
+	}
+	if startMs <= 0 {
+		return false
+	}
+	windowMs := agentNoResponderRetryWindowMs(step, maxAttempts, baseBackoff, maxBackoff)
+	if windowMs <= 0 {
+		return false
+	}
+	now := time.Now().UnixMilli()
+	return now-startMs <= windowMs
+}
+
+func agentNoResponderRetryWindowMs(step stepMessage, maxAttempts int, baseBackoff int64, maxBackoff int64) int64 {
+	_ = baseBackoff
+	timeout := resolveTimeout(step)
+	if timeout > 0 {
+		return int64(timeout / time.Millisecond)
+	}
+	if maxAttempts <= 0 {
+		return 0
+	}
+	return int64(maxAttempts) * maxBackoff
+}
+
+func isAgentNoResponder(step stepMessage, err error) bool {
+	if !strings.EqualFold(strings.TrimSpace(step.ActionType), "agent_command") {
+		return false
+	}
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "no responders available for request")
 }
 
 func newWorkerExporter(logger *slog.Logger, cfg workerExportConfig) (*workerExporter, error) {
@@ -1572,6 +1793,28 @@ func newWorkerID() string {
 	host, _ := os.Hostname()
 	pid := os.Getpid()
 	return fmt.Sprintf("%s-%d-%d", host, pid, time.Now().UnixNano())
+}
+
+func loadWorkerFailpoint() workerFailpoint {
+	stage := strings.TrimSpace(os.Getenv("RSIEM_WORKER_FAILPOINT"))
+	if stage == "" {
+		return workerFailpoint{}
+	}
+	fp := workerFailpoint{
+		enabled: stage == "after_persist_terminal",
+		stage:   stage,
+		runID:   strings.TrimSpace(os.Getenv("RSIEM_WORKER_FAILPOINT_RUN_ID")),
+		stepID:  strings.TrimSpace(os.Getenv("RSIEM_WORKER_FAILPOINT_STEP_ID")),
+		once:    true,
+	}
+	onceEnv := strings.TrimSpace(os.Getenv("RSIEM_WORKER_FAILPOINT_ONCE"))
+	if onceEnv != "" {
+		lower := strings.ToLower(onceEnv)
+		if lower == "false" || lower == "0" || lower == "no" {
+			fp.once = false
+		}
+	}
+	return fp
 }
 
 func isTestFailAfterKVEnabled() bool {

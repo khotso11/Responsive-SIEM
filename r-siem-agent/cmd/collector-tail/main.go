@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -10,31 +11,18 @@ import (
 	"syscall"
 	"time"
 
-	"gopkg.in/yaml.v3"
+	"github.com/nats-io/nats.go"
 
-	"r-siem-agent/internal/buffer"
 	"r-siem-agent/internal/collector/tail"
 	"r-siem-agent/internal/config"
 	"r-siem-agent/internal/logging"
 )
 
-type tailConfigWrapper struct {
-	Collectors struct {
-		Tail struct {
-			Enabled          bool   `yaml:"enabled"`
-			Path             string `yaml:"path"`
-			CheckpointPath   string `yaml:"checkpoint_path"`
-			PollMs           int    `yaml:"poll_ms"`
-			FingerprintBytes int    `yaml:"fingerprint_bytes"`
-		} `yaml:"tail"`
-	} `yaml:"collectors"`
-}
-
 func main() {
-	configPath := flag.String("config", "configs/master.yaml", "Path to master config")
+	configPath := flag.String("config", "configs/collector.yaml", "Path to collector config")
 	flag.Parse()
 
-	cfg, err := config.LoadMaster(*configPath)
+	cfg, err := config.LoadCollector(*configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
 		os.Exit(1)
@@ -45,24 +33,30 @@ func main() {
 		os.Exit(1)
 	}
 
-	collectorCfg, err := loadTailConfig(*configPath)
+	nc, err := nats.Connect(cfg.JetStream.URL, nats.Name("r-siem-collector-tail"))
 	if err != nil {
-		logger.Error("collector_tail_config_load_failed", slog.String("error", err.Error()))
+		logger.Error("nats_connect_failed", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
-	if collectorCfg == nil || !collectorCfg.Enabled {
-		logger.Info("collector_tail_disabled")
-		return
-	}
+	defer nc.Close()
 
-	publisher, err := buffer.NewJetStreamPublisher(context.Background(), cfg.JetStream, logger)
+	js, err := nc.JetStream()
 	if err != nil {
-		logger.Error("collector_tail_publisher_init_failed", slog.String("error", err.Error()))
+		logger.Error("jetstream_context_failed", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
-	defer publisher.Close()
+	if err := ensureEventsStream(js, cfg.JetStream.Stream, cfg.JetStream.Subject); err != nil {
+		logger.Error("ensure_events_stream_failed", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
 
-	collector := tail.New(*collectorCfg, logger, publisher)
+	collector := tail.New(tail.Config{
+		Path:           cfg.Tail.Path,
+		CheckpointPath: cfg.Tail.CheckpointPath,
+		PollInterval:   time.Duration(cfg.Tail.PollMs) * time.Millisecond,
+		Stream:         cfg.JetStream.Stream,
+		Subject:        cfg.JetStream.Subject,
+	}, logger, js)
 	ctx, cancel := signalContext()
 	defer cancel()
 
@@ -75,26 +69,6 @@ func main() {
 	_ = collector.Stop()
 }
 
-func loadTailConfig(path string) (*tail.Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read config: %w", err)
-	}
-	var wrapper tailConfigWrapper
-	if err := yaml.Unmarshal(data, &wrapper); err != nil {
-		return nil, fmt.Errorf("parse collectors config: %w", err)
-	}
-	raw := wrapper.Collectors.Tail
-	cfg := &tail.Config{
-		Enabled:          raw.Enabled,
-		Path:             raw.Path,
-		CheckpointPath:   raw.CheckpointPath,
-		PollInterval:     time.Duration(raw.PollMs) * time.Millisecond,
-		FingerprintBytes: raw.FingerprintBytes,
-	}
-	return cfg, nil
-}
-
 func signalContext() (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
 	ch := make(chan os.Signal, 1)
@@ -104,4 +78,15 @@ func signalContext() (context.Context, context.CancelFunc) {
 		cancel()
 	}()
 	return ctx, cancel
+}
+
+func ensureEventsStream(js nats.JetStreamContext, stream, subject string) error {
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     stream,
+		Subjects: []string{subject},
+	})
+	if err != nil && !errors.Is(err, nats.ErrStreamNameAlreadyInUse) {
+		return err
+	}
+	return nil
 }

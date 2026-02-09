@@ -1,0 +1,4 @@
+Command 'nats-server' not found, but can be installed with:
+sudo snap install nats-server  # version 0.9.4, or
+sudo apt  install nats-server  # version 2.10.7-1ubuntu0.3
+See 'snap info nats-server' for additional versions.

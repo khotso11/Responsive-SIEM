@@ -1,0 +1,15 @@
+log_level: INFO
+
+jetstream:
+  url: nats://127.0.0.1:4222
+  stream: RSIEM_EVENTS
+  subject: rsiem.events.raw
+  durable: detector-v0
+
+dedupe:
+  bucket: RSIEM_DETECT_DEDUPE
+
+cooldown:
+  bucket: RSIEM_DETECT_COOLDOWN
+
+cooldown_ms: 60000

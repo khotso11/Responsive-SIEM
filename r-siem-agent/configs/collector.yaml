@@ -1,0 +1,11 @@
+log_level: INFO
+
+jetstream:
+  url: nats://127.0.0.1:4222
+  stream: RSIEM_EVENTS
+  subject: rsiem.events.raw
+
+tail:
+  path: "tmp/demo.log"
+  checkpoint_path: "tmp/tail.checkpoint.json"
+  poll_ms: 200

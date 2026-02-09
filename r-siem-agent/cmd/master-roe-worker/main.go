@@ -755,6 +755,16 @@ func processStep(runtime *workerRuntime, msg *nats.Msg) error {
 			runtime.logger.Error("roe_result_kv_error", slog.String("error", err.Error()))
 			return nil
 		}
+		if os.Getenv("RSIEM_WORKER_CRASH_AFTER_PERSIST") == "1" &&
+			(final.Status == "SUCCEEDED" || final.Status == "FAILED_SAFE") {
+
+			runtime.logger.LogAttrs(context.Background(), slog.LevelError, "worker_crash_after_persist",
+				slog.String("run_id", step.RunID),
+				slog.String("step_id", step.StepID),
+				slog.String("status", final.Status),
+			)
+			os.Exit(42)
+		}
 		if err := runtime.maybeFailpoint(step, final, "after_persist_terminal"); err != nil {
 			return err
 		}
@@ -791,6 +801,16 @@ func processStep(runtime *workerRuntime, msg *nats.Msg) error {
 		if err := runtime.persistTerminalResult(step, final); err != nil {
 			runtime.logger.Error("roe_result_kv_error", slog.String("error", err.Error()))
 			return nil
+		}
+		if os.Getenv("RSIEM_WORKER_CRASH_AFTER_PERSIST") == "1" &&
+			(final.Status == "SUCCEEDED" || final.Status == "FAILED_SAFE") {
+
+			runtime.logger.LogAttrs(context.Background(), slog.LevelError, "worker_crash_after_persist",
+				slog.String("run_id", step.RunID),
+				slog.String("step_id", step.StepID),
+				slog.String("status", final.Status),
+			)
+			os.Exit(42)
 		}
 		if err := runtime.maybeFailpoint(step, final, "after_persist_terminal"); err != nil {
 			return err
@@ -831,6 +851,16 @@ func processStep(runtime *workerRuntime, msg *nats.Msg) error {
 		if err := runtime.persistTerminalResult(step, final); err != nil {
 			runtime.logger.Error("roe_result_kv_error", slog.String("error", err.Error()))
 			return nil
+		}
+		if os.Getenv("RSIEM_WORKER_CRASH_AFTER_PERSIST") == "1" &&
+			(final.Status == "SUCCEEDED" || final.Status == "FAILED_SAFE") {
+
+			runtime.logger.LogAttrs(context.Background(), slog.LevelError, "worker_crash_after_persist",
+				slog.String("run_id", step.RunID),
+				slog.String("step_id", step.StepID),
+				slog.String("status", final.Status),
+			)
+			os.Exit(42)
 		}
 		if err := runtime.maybeFailpoint(step, final, "after_persist_terminal"); err != nil {
 			return err
@@ -912,6 +942,16 @@ func processStep(runtime *workerRuntime, msg *nats.Msg) error {
 				runtime.logger.Error("roe_result_kv_error", slog.String("error", err.Error()))
 				return nil
 			}
+			if os.Getenv("RSIEM_WORKER_CRASH_AFTER_PERSIST") == "1" &&
+				(final.Status == "SUCCEEDED" || final.Status == "FAILED_SAFE") {
+
+				runtime.logger.LogAttrs(context.Background(), slog.LevelError, "worker_crash_after_persist",
+					slog.String("run_id", step.RunID),
+					slog.String("step_id", step.StepID),
+					slog.String("status", final.Status),
+				)
+				os.Exit(42)
+			}
 			if err := runtime.maybeFailpoint(step, final, "after_persist_terminal"); err != nil {
 				return err
 			}
@@ -945,6 +985,16 @@ func processStep(runtime *workerRuntime, msg *nats.Msg) error {
 		if err := runtime.persistTerminalResult(step, final); err != nil {
 			runtime.logger.Error("roe_result_kv_error", slog.String("error", err.Error()))
 			return nil
+		}
+		if os.Getenv("RSIEM_WORKER_CRASH_AFTER_PERSIST") == "1" &&
+			(final.Status == "SUCCEEDED" || final.Status == "FAILED_SAFE") {
+
+			runtime.logger.LogAttrs(context.Background(), slog.LevelError, "worker_crash_after_persist",
+				slog.String("run_id", step.RunID),
+				slog.String("step_id", step.StepID),
+				slog.String("status", final.Status),
+			)
+			os.Exit(42)
 		}
 		if err := runtime.maybeFailpoint(step, final, "after_persist_terminal"); err != nil {
 			return err
@@ -980,6 +1030,16 @@ func processStep(runtime *workerRuntime, msg *nats.Msg) error {
 	if err := runtime.persistTerminalResult(step, final); err != nil {
 		runtime.logger.Error("roe_result_kv_error", slog.String("error", err.Error()))
 		return nil
+	}
+	if os.Getenv("RSIEM_WORKER_CRASH_AFTER_PERSIST") == "1" &&
+		(final.Status == "SUCCEEDED" || final.Status == "FAILED_SAFE") {
+
+		runtime.logger.LogAttrs(context.Background(), slog.LevelError, "worker_crash_after_persist",
+			slog.String("run_id", step.RunID),
+			slog.String("step_id", step.StepID),
+			slog.String("status", final.Status),
+		)
+		os.Exit(42)
 	}
 	if err := runtime.maybeFailpoint(step, final, "after_persist_terminal"); err != nil {
 		return err

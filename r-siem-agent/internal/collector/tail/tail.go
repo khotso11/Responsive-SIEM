@@ -4,32 +4,26 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
-	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"google.golang.org/protobuf/proto"
-
-	"r-siem-agent/internal/buffer"
-	"r-siem-agent/internal/collector"
-	"r-siem-agent/internal/event"
-	"r-siem-agent/internal/proto/pb"
+	"github.com/nats-io/nats.go"
 )
 
-var failedPasswordIP = regexp.MustCompile(`from (\d+\.\d+\.\d+\.\d+)`)
-
 type Collector struct {
-	cfg       Config
-	logger    *slog.Logger
-	publisher *buffer.JetStreamPublisher
+	cfg    Config
+	logger *slog.Logger
+	js     nats.JetStreamContext
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -39,24 +33,22 @@ type Collector struct {
 	published  atomic.Uint64
 	errors     atomic.Uint64
 	lastOffset atomic.Uint64
-	lastSeq    atomic.Uint64
 }
 
-func New(cfg Config, logger *slog.Logger, publisher *buffer.JetStreamPublisher) *Collector {
+func New(cfg Config, logger *slog.Logger, js nats.JetStreamContext) *Collector {
 	cfg.applyDefaults()
-	return &Collector{cfg: cfg, logger: logger, publisher: publisher}
-}
-
-func (c *Collector) Name() string {
-	return "collector-tail"
+	return &Collector{cfg: cfg, logger: logger, js: js}
 }
 
 func (c *Collector) Start(ctx context.Context) error {
-	if c.publisher == nil {
-		return fmt.Errorf("publisher required")
+	if c.js == nil {
+		return fmt.Errorf("jetstream required")
 	}
 	if strings.TrimSpace(c.cfg.Path) == "" {
 		return fmt.Errorf("path required")
+	}
+	if strings.TrimSpace(c.cfg.Subject) == "" || strings.TrimSpace(c.cfg.Stream) == "" {
+		return fmt.Errorf("stream and subject required")
 	}
 	if c.running.Load() {
 		return fmt.Errorf("collector already running")
@@ -83,21 +75,6 @@ func (c *Collector) Stop() error {
 	return nil
 }
 
-func (c *Collector) Health() collector.Health {
-	var lastErr string
-	if val := c.lastErr.Load(); val != nil {
-		lastErr, _ = val.(string)
-	}
-	return collector.Health{
-		Running:    c.running.Load(),
-		LastError:  lastErr,
-		Published:  c.published.Load(),
-		Errors:     c.errors.Load(),
-		LastOffset: c.lastOffset.Load(),
-		LastSeq:    c.lastSeq.Load(),
-	}
-}
-
 func (c *Collector) run(ctx context.Context) {
 	state, err := loadCheckpoint(c.cfg.CheckpointPath)
 	if err != nil {
@@ -105,16 +82,14 @@ func (c *Collector) run(ctx context.Context) {
 		c.logger.Error("collector_tail_checkpoint_load_failed", slog.String("error", err.Error()))
 		state = checkpointState{}
 	}
-	lastFileID := state.FileID
-	c.lastOffset.Store(state.Offset)
-	c.lastSeq.Store(state.Seq)
+	offset := state.Offset
+	c.lastOffset.Store(offset)
 
-	c.logger.LogAttrs(context.Background(), slog.LevelInfo, "collector_tail_started",
+	c.logger.LogAttrs(context.Background(), slog.LevelInfo, "collector_started",
 		slog.String("path", c.cfg.Path),
-		slog.String("checkpoint", c.cfg.CheckpointPath),
-	)
-	c.logger.LogAttrs(context.Background(), slog.LevelInfo, "collector_tail_checkpoint_loaded",
-		slog.Uint64("offset", state.Offset),
+		slog.String("subject", c.cfg.Subject),
+		slog.String("stream", c.cfg.Stream),
+		slog.String("checkpoint_path", c.cfg.CheckpointPath),
 	)
 
 	file, err := openTailFile(c.cfg.Path)
@@ -125,63 +100,37 @@ func (c *Collector) run(ctx context.Context) {
 	}
 	defer file.Close()
 
-	committedOffset := state.Offset
-	currentOffset := state.Offset
-	seq := state.Seq
 	pending := bytes.Buffer{}
+	pendingOffset := offset
 
 	for {
 		if ctx.Err() != nil {
 			break
 		}
 
-		currentFileID, err := computeFileID(c.cfg.Path, c.cfg.FingerprintBytes)
+		info, err := file.Stat()
 		if err != nil {
 			c.setError(err)
-			c.logger.Error("collector_tail_file_id_failed", slog.String("error", err.Error()))
+			c.logger.Error("collector_tail_stat_failed", slog.String("error", err.Error()))
 			time.Sleep(c.cfg.PollInterval)
 			continue
 		}
-		if !fileIDKnown(lastFileID) && fileIDKnown(currentFileID) {
-			lastFileID = currentFileID
-			if err := writeCheckpoint(c.cfg.CheckpointPath, checkpointState{Offset: committedOffset, Seq: seq, FileID: lastFileID}); err != nil {
-				c.setError(err)
-				c.logger.Error("collector_tail_checkpoint_write_failed", slog.String("error", err.Error()))
-			}
-		}
-		if isRotated(lastFileID, currentFileID) {
-			c.logger.LogAttrs(context.Background(), slog.LevelInfo, "collector_tail_rotated",
-				slog.Any("old", fileIDSummary(lastFileID)),
-				slog.Any("new", fileIDSummary(currentFileID)),
-				slog.Uint64("reset_offset", 0),
-			)
-			lastFileID = currentFileID
-			committedOffset = 0
-			currentOffset = 0
+		if uint64(info.Size()) < offset {
+			offset = 0
 			pending.Reset()
+			pendingOffset = 0
 			c.lastOffset.Store(0)
-			if err := writeCheckpoint(c.cfg.CheckpointPath, checkpointState{Offset: 0, Seq: seq, FileID: lastFileID}); err != nil {
+			if err := writeCheckpoint(c.cfg.CheckpointPath, checkpointState{Offset: 0}); err != nil {
 				c.setError(err)
 				c.logger.Error("collector_tail_checkpoint_write_failed", slog.String("error", err.Error()))
-			}
-			file.Close()
-			file, err = openTailFile(c.cfg.Path)
-			if err != nil {
-				c.setError(err)
-				c.logger.Error("collector_tail_open_failed", slog.String("error", err.Error()))
-				time.Sleep(c.cfg.PollInterval)
-				continue
+			} else {
+				c.logger.LogAttrs(context.Background(), slog.LevelInfo, "checkpoint_written",
+					slog.Uint64("offset", 0),
+				)
 			}
 		}
 
-		if err := c.ensureOffset(&committedOffset, &currentOffset, &pending, file); err != nil {
-			c.setError(err)
-			c.logger.Error("collector_tail_offset_check_failed", slog.String("error", err.Error()))
-			time.Sleep(c.cfg.PollInterval)
-			continue
-		}
-
-		if _, err := file.Seek(int64(currentOffset), io.SeekStart); err != nil {
+		if _, err := file.Seek(int64(offset), io.SeekStart); err != nil {
 			c.setError(err)
 			c.logger.Error("collector_tail_seek_failed", slog.String("error", err.Error()))
 			time.Sleep(c.cfg.PollInterval)
@@ -195,7 +144,11 @@ func (c *Collector) run(ctx context.Context) {
 			}
 			chunk, err := reader.ReadBytes('\n')
 			if len(chunk) > 0 {
-				currentOffset += uint64(len(chunk))
+				if pending.Len() == 0 {
+					pendingOffset = offset
+				}
+				offset += uint64(len(chunk))
+				pending.Write(chunk)
 			}
 			if err != nil && !errors.Is(err, io.EOF) {
 				c.setError(err)
@@ -206,37 +159,31 @@ func (c *Collector) run(ctx context.Context) {
 				break
 			}
 
-			if len(chunk) > 0 {
-				pending.Write(chunk)
-				if chunk[len(chunk)-1] != '\n' {
-					if errors.Is(err, io.EOF) {
-						break
-					}
-					continue
-				}
-				line := strings.TrimRight(pending.String(), "\r\n")
+			if len(chunk) > 0 && chunk[len(chunk)-1] == '\n' {
+				lineBytes := pending.Bytes()
+				line := strings.TrimRight(string(lineBytes), "\r\n")
+				bytesRead := len(lineBytes)
 				pending.Reset()
-				seq++
-				published, publishErr := c.publishLine(ctx, line, seq)
+				eventID, publishErr := c.publishLine(ctx, line, pendingOffset)
 				if publishErr != nil {
-					seq--
-					currentOffset = committedOffset
+					offset = pendingOffset
 					pending.Reset()
 					break
 				}
-				if published {
-					committedOffset = currentOffset
-					c.lastOffset.Store(committedOffset)
-					c.lastSeq.Store(seq)
-					if err := writeCheckpoint(c.cfg.CheckpointPath, checkpointState{Offset: committedOffset, Seq: seq, FileID: lastFileID}); err != nil {
-						c.setError(err)
-						c.logger.Error("collector_tail_checkpoint_write_failed", slog.String("error", err.Error()))
-					}
-					c.logger.LogAttrs(context.Background(), slog.LevelInfo, "collector_tail_event_published",
-						slog.Uint64("count", c.published.Load()),
-						slog.Uint64("last_offset", committedOffset),
+				c.lastOffset.Store(offset)
+				if err := writeCheckpoint(c.cfg.CheckpointPath, checkpointState{Offset: offset}); err != nil {
+					c.setError(err)
+					c.logger.Error("collector_tail_checkpoint_write_failed", slog.String("error", err.Error()))
+				} else {
+					c.logger.LogAttrs(context.Background(), slog.LevelInfo, "checkpoint_written",
+						slog.Uint64("offset", offset),
 					)
 				}
+				c.logger.LogAttrs(context.Background(), slog.LevelInfo, "event_published",
+					slog.String("event_idem_key", eventID),
+					slog.Uint64("offset", pendingOffset),
+					slog.Int("bytes", bytesRead),
+				)
 			}
 			if errors.Is(err, io.EOF) {
 				break
@@ -249,67 +196,32 @@ func (c *Collector) run(ctx context.Context) {
 	c.logger.LogAttrs(context.Background(), slog.LevelInfo, "collector_tail_stopped")
 }
 
-func (c *Collector) ensureOffset(committedOffset, currentOffset *uint64, pending *bytes.Buffer, file *os.File) error {
-	info, err := file.Stat()
-	if err != nil {
-		return err
+func (c *Collector) publishLine(ctx context.Context, line string, offset uint64) (string, error) {
+	source := fmt.Sprintf("tail:%s", c.cfg.Path)
+	eventID := eventIdemKey(source, offset, line)
+	payload := map[string]any{
+		"event_idem_key": eventID,
+		"source":         source,
+		"ingest_unix_ms": time.Now().UnixMilli(),
+		"line":           line,
 	}
-	size := uint64(info.Size())
-	if size < *committedOffset {
-		c.logger.Warn("collector_tail_checkpoint_truncated",
-			slog.Uint64("offset", *committedOffset),
-			slog.Uint64("size", size),
-		)
-		*committedOffset = 0
-		*currentOffset = 0
-		pending.Reset()
-		return nil
-	}
-	if *currentOffset < *committedOffset {
-		*currentOffset = *committedOffset
-	}
-	return nil
-}
-
-func (c *Collector) publishLine(ctx context.Context, line string, seq uint64) (bool, error) {
-	if strings.TrimSpace(line) == "" {
-		return false, nil
-	}
-	ip := extractIP(line)
-	if ip == "" {
-		ip = "unknown"
-	}
-	payload := tailEventPayload(line, ip, seq)
 	data, err := json.Marshal(payload)
 	if err != nil {
 		c.setError(err)
 		c.errors.Add(1)
 		c.logger.Error("collector_tail_event_encode_failed", slog.String("error", err.Error()))
-		return false, err
+		return "", err
 	}
-	batch := &pb.Batch{
-		ProducerId: "collector-tail",
-		Lane:       "FAST",
-		SeqStart:   seq,
-		SeqEnd:     seq,
-		Payload:    data,
-	}
-	encoded, err := proto.Marshal(batch)
-	if err != nil {
-		c.setError(err)
-		c.errors.Add(1)
-		c.logger.Error("collector_tail_batch_encode_failed", slog.String("error", err.Error()))
-		return false, err
-	}
-	if _, err := c.publisher.PublishBatch(ctx, "FAST", encoded); err != nil {
+
+	if _, err := c.js.Publish(c.cfg.Subject, data, nats.MsgId(eventID)); err != nil {
 		c.setError(err)
 		c.errors.Add(1)
 		c.logger.Error("collector_tail_publish_failed", slog.String("error", err.Error()))
 		time.Sleep(c.cfg.PollInterval)
-		return false, err
+		return "", err
 	}
 	c.published.Add(1)
-	return true, nil
+	return eventID, nil
 }
 
 func (c *Collector) setError(err error) {
@@ -319,50 +231,12 @@ func (c *Collector) setError(err error) {
 	c.lastErr.Store(err.Error())
 }
 
-type tailEvent struct {
-	event.Event
-	SrcIP string `json:"src_ip,omitempty"`
-}
-
-func tailEventPayload(line string, srcIP string, seq uint64) tailEvent {
-	return tailEvent{
-		Event: event.Event{
-			ID:        fmt.Sprintf("tail-%d", seq),
-			Seq:       seq,
-			Timestamp: time.Now().UTC(),
-			Source:    "collector-tail",
-			Type:      "auth",
-			Severity:  "high",
-			Message:   line,
-		},
-		SrcIP: srcIP,
-	}
-}
-
-func extractIP(line string) string {
-	match := failedPasswordIP.FindStringSubmatch(line)
-	if len(match) < 2 {
-		return ""
-	}
-	return strings.TrimSpace(match[1])
+func eventIdemKey(source string, offset uint64, line string) string {
+	raw := fmt.Sprintf("%s:%d:%s", source, offset, line)
+	sum := sha256.Sum256([]byte(raw))
+	return "evt." + hex.EncodeToString(sum[:])
 }
 
 func openTailFile(path string) (*os.File, error) {
 	return os.OpenFile(path, os.O_RDONLY|os.O_CREATE, 0644)
-}
-
-func isRotated(oldID, newID fileID) bool {
-	if !fileIDKnown(oldID) {
-		return false
-	}
-	if oldID.Device != 0 && newID.Device != 0 && oldID.Device != newID.Device {
-		return true
-	}
-	if oldID.Inode != 0 && newID.Inode != 0 && oldID.Inode != newID.Inode {
-		return true
-	}
-	if oldID.Fingerprint != "" && newID.Fingerprint != "" && oldID.Fingerprint != newID.Fingerprint {
-		return true
-	}
-	return false
 }

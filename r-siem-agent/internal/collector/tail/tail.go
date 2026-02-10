@@ -12,12 +12,21 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/nats-io/nats.go"
+)
+
+const maxBytesPerPoll = uint64(1 << 20) // 1 MiB per poll to bound backlog
+
+var (
+	ipv4FromPattern = regexp.MustCompile(`(?i)\bfrom\s+(\d{1,3}(?:\.\d{1,3}){3})\b`)
+	userPattern     = regexp.MustCompile(`(?i)\buser(?:name)?[=: ]+([a-z0-9._-]+)\b`)
+	hostPattern     = regexp.MustCompile(`(?i)\bhost[=: ]+([a-z0-9._-]+)\b`)
 )
 
 type Collector struct {
@@ -137,6 +146,7 @@ func (c *Collector) run(ctx context.Context) {
 			continue
 		}
 		reader := bufio.NewReader(file)
+		bytesThisPoll := uint64(0)
 
 		for {
 			if ctx.Err() != nil {
@@ -148,6 +158,7 @@ func (c *Collector) run(ctx context.Context) {
 					pendingOffset = offset
 				}
 				offset += uint64(len(chunk))
+				bytesThisPoll += uint64(len(chunk))
 				pending.Write(chunk)
 			}
 			if err != nil && !errors.Is(err, io.EOF) {
@@ -188,6 +199,9 @@ func (c *Collector) run(ctx context.Context) {
 			if errors.Is(err, io.EOF) {
 				break
 			}
+			if bytesThisPoll >= maxBytesPerPoll {
+				break
+			}
 		}
 
 		time.Sleep(c.cfg.PollInterval)
@@ -199,11 +213,25 @@ func (c *Collector) run(ctx context.Context) {
 func (c *Collector) publishLine(ctx context.Context, line string, offset uint64) (string, error) {
 	source := fmt.Sprintf("tail:%s", c.cfg.Path)
 	eventID := eventIdemKey(source, offset, line)
+	host := extractHost(line)
+	if host == "" {
+		host = resolveHost()
+	}
+	groupKey := host
+	if ip := extractIPv4(line); ip != "" {
+		groupKey = ip
+	}
+	user := extractUser(line)
 	payload := map[string]any{
-		"event_idem_key": eventID,
-		"source":         source,
-		"ingest_unix_ms": time.Now().UnixMilli(),
-		"line":           line,
+		"event_idem_key":       eventID,
+		"observed_at_unix_ms":  time.Now().UnixMilli(),
+		"message":              line,
+		"host":                 host,
+		"group_key":            groupKey,
+		"source":               source,
+	}
+	if user != "" {
+		payload["user"] = user
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -235,6 +263,38 @@ func eventIdemKey(source string, offset uint64, line string) string {
 	raw := fmt.Sprintf("%s:%d:%s", source, offset, line)
 	sum := sha256.Sum256([]byte(raw))
 	return "evt." + hex.EncodeToString(sum[:])
+}
+
+func resolveHost() string {
+	host, err := os.Hostname()
+	if err != nil || strings.TrimSpace(host) == "" {
+		return "unknown"
+	}
+	return strings.TrimSpace(host)
+}
+
+func extractIPv4(line string) string {
+	match := ipv4FromPattern.FindStringSubmatch(line)
+	if len(match) < 2 {
+		return ""
+	}
+	return match[1]
+}
+
+func extractUser(line string) string {
+	match := userPattern.FindStringSubmatch(line)
+	if len(match) < 2 {
+		return ""
+	}
+	return match[1]
+}
+
+func extractHost(line string) string {
+	match := hostPattern.FindStringSubmatch(line)
+	if len(match) < 2 {
+		return ""
+	}
+	return match[1]
 }
 
 func openTailFile(path string) (*os.File, error) {

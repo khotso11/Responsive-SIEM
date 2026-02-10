@@ -456,6 +456,24 @@ Agent proofs:
 ./scripts/m38_agent_allowlist_denied_proof.sh
 ```
 
+Notes:
+- `PB-COUNT-PROCESS-HOST` includes an `agent_command` step without `params.command` or `params.name`.
+- That intentionally yields `missing_command` and `agent_command_exec_denied`, proving the deny path.
+- `PB-AGENT-PING-LOCALHOST` sets `params.command=ping` and `params.target=127.0.0.1`.
+- With approval, that playbook produces `agent_command_exec_start` and `agent_command_exec_done`.
+
+## Demo (Sprint C)
+
+Start the services in the usual A–I terminal order as documented above. Then run:
+
+```
+DEMO_EVIDENCE_LOG="logs/demo_$(date +%Y%m%d_%H%M%S).log"
+chmod +x scripts/demo_runner_sprint_c.sh
+DEMO_EVIDENCE_LOG="$DEMO_EVIDENCE_LOG" ./scripts/demo_runner_sprint_c.sh |& tee "$DEMO_EVIDENCE_LOG"
+```
+
+The demo orchestrates M40 → M41 → M37-style success → M42 in sequence. Evidence logs land in `logs/demo_YYYYMMDD_HHMMSS.log`.
+
 ## Configuration
 
 Configuration lives in `configs/agent.yaml` and currently supports:

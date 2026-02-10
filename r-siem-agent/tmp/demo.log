@@ -35,3 +35,38 @@ M33 invalid user from 10.0.0.77 ts=1770300643
 M33 invalid user from 10.0.0.77 ts=1770300663
 M34 collector line 1 ts=1770300677
 M34 collector line 2 ts=1770300694
+M40 collector publish ts=1770641654
+M41 invalid user from 10.0.0.55 ts=1770641654
+M42 process_count=3 host=m42-1770641654 ts=1770641654
+M40 collector publish ts=1770641799
+M41 invalid user from 10.0.0.200 ts=1770641799
+M42 process_count=3 host=m42-1770641799 ts=1770641799
+M42 process_count=3 host=m42-1770642185 ts=1770642185
+M42 process_count=3 host=m42-1770643454 ts=1770643454 idx=1
+M42 process_count=3 host=m42-1770643454 ts=1770643454 idx=2
+M42 process_count=3 host=m42-1770643454 ts=1770643454 idx=3
+M42 process_count=3 host=m42-1770643748 ts=1770643748 idx=1
+M42 process_count=3 host=m42-1770643748 ts=1770643748 idx=2
+M42 process_count=3 host=m42-1770643748 ts=1770643748 idx=3
+M42 process_count=3 host=m42-1770643948 ts=1770643948 idx=1
+M42 process_count=3 host=m42-1770643948 ts=1770643948 idx=2
+M42 process_count=3 host=m42-1770643948 ts=1770643948 idx=3
+M42 process_count=3 host=m42-1770646976 ts=1770646976 idx=1
+M42 process_count=3 host=m42-1770646976 ts=1770646976 idx=2
+M42 process_count=3 host=m42-1770646976 ts=1770646976 idx=3
+M42 process_count=3 host=m42-1770647191 ts=1770647191 idx=1
+M42 process_count=3 host=m42-1770647191 ts=1770647191 idx=2
+M42 process_count=3 host=m42-1770647191 ts=1770647191 idx=3
+M42 process_count=3 host=m42-1770647290 ts=1770647290 idx=1
+M42 process_count=3 host=m42-1770647290 ts=1770647290 idx=2
+M42 process_count=3 host=m42-1770647290 ts=1770647290 idx=3
+M40 collector publish ts=1770650364
+M41 invalid user from 10.0.0.165 ts=1770650364
+M42 process_count=3 host=m42-1770650365 ts=1770650365 idx=1
+M42 process_count=3 host=m42-1770650365 ts=1770650365 idx=2
+M42 process_count=3 host=m42-1770650365 ts=1770650365 idx=3
+M40 collector publish ts=1770650552
+M41 invalid user from 10.0.0.153 ts=1770650552
+M42 process_count=3 host=m42-1770650554 ts=1770650554 idx=1
+M42 process_count=3 host=m42-1770650554 ts=1770650554 idx=2
+M42 process_count=3 host=m42-1770650554 ts=1770650554 idx=3

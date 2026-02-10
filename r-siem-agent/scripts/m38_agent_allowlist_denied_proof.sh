@@ -55,28 +55,6 @@ wait_new_line() {
   return 1
 }
 
-wait_new_line_for_run() {
-  local pattern="$1"
-  local file="$2"
-  local baseline="$3"
-  local run_id="$4"
-  local max_wait="$5"
-  local last line elapsed=0
-  while (( elapsed < max_wait )); do
-    last="$(rg -n "\"run_id\":\"${run_id}\"" "$file" | rg "$pattern" | tail -n 1 || true)"
-    if [[ -n "$last" ]]; then
-      line="${last%%:*}"
-      if [[ "$line" =~ ^[0-9]+$ ]] && (( line > baseline )); then
-        echo "$last"
-        return 0
-      fi
-    fi
-    sleep 1
-    elapsed=$((elapsed + 1))
-  done
-  return 1
-}
-
 echo "=== M38 agent allowlist denied proof ==="
 
 ALERT_KEY="A-M38-DENY-$(date +%s)"
@@ -85,10 +63,6 @@ SEVERITY="high"
 GROUP_KEY="10.0.0.77"
 
 baseline_run_created="$(last_line_num '"msg":"response_run_created"' "$LOG_MASTER")"
-baseline_step_result="$(last_line_num '"msg":"response_step_result_received"' "$LOG_MASTER")"
-baseline_step_published="$(last_line_num '"msg":"response_step_published"' "$LOG_MASTER")"
-baseline_agent_denied="$(last_line_num '"msg":"agent_command_exec_denied"' "$LOG_AGENT")"
-
 
 if ! go run -mod=vendor ./cmd/master-roe-pubtrigger -config configs/master.yaml -alert-key "$ALERT_KEY" -rule-id "$RULE_ID" -severity "$SEVERITY" -group-key "$GROUP_KEY" -lane STANDARD; then
   echo "Missing NATS? Start Terminal A (NATS) and retry." >&2
@@ -106,7 +80,6 @@ if [[ -z "$RUN_ID" ]]; then
   exit 1
 fi
 
-
 echo "$run_created_line"
 echo "run_id: ${RUN_ID}"
 
@@ -117,69 +90,38 @@ if [[ -z "$start_line" || ! "$start_line" =~ ^[0-9]+$ ]]; then
 fi
 end_line=$((start_line + 300))
 slice="$(sed -n "${start_line},${end_line}p" "$LOG_MASTER")"
-step_published_line="$(printf "%s\n" "$slice" | rg "\"run_id\":\"${RUN_ID}\"" | rg '\"msg\":\"response_step_published\"' | rg '\"action_type\":\"agent_command\"' | head -n 1 || true)"
-if [[ -z "$step_published_line" ]]; then
-  echo "FAIL: response_step_published agent_command not found in slice" >&2
+
+step_published_lines="$(printf "%s\n" "$slice" | rg "\"run_id\":\"${RUN_ID}\"" | rg '"msg":"response_step_published"' || true)"
+agent_step_line="$(printf "%s\n" "$step_published_lines" | rg '"action_type":"agent_command"' | head -n 1 || true)"
+if [[ -z "$agent_step_line" ]]; then
+  echo "FAIL: response_step_published did not show action_type=agent_command" >&2
   echo "Context: response_step_published lines for run_id in slice:" >&2
-  printf "%s\n" "$slice" | rg "\"run_id\":\"${RUN_ID}\"" | rg '\"msg\":\"response_step_published\"' >&2 || true
+  printf "%s\n" "$step_published_lines" >&2 || true
   exit 1
 fi
 
-AGENT_STEP_ID="$(printf "%s\n" "$step_published_line" | sed -n 's/.*"step_id":"\([^"]*\)".*/\1/p')"
+AGENT_STEP_ID="$(printf "%s\n" "$agent_step_line" | sed -n 's/.*"step_id":"\([^"]*\)".*/\1/p')"
 if [[ -z "$AGENT_STEP_ID" ]]; then
   echo "FAIL: unable to extract agent step_id" >&2
   exit 1
 fi
 
-agent_denied_line="$(rg -n "\"run_id\":\"${RUN_ID}\"" "$LOG_AGENT" | rg "\"step_id\":\"${AGENT_STEP_ID}\"" | rg '"msg":"agent_command_exec_denied"' | rg '"reason":"missing_command"|"reason":"not_allowlisted"' | tail -n 1 || true)"
+agent_denied_line="$(rg "\"run_id\":\"${RUN_ID}\"" "$LOG_AGENT" | rg "\"step_id\":\"${AGENT_STEP_ID}\"" | rg '"msg":"agent_command_exec_denied"' | rg '"reason":"missing_command"|"reason":"not_allowlisted"' | tail -n 1 || true)"
 if [[ -z "$agent_denied_line" ]]; then
-  agent_denied_line="$(wait_new_line '"msg":"agent_command_exec_denied"' "$LOG_AGENT" "$baseline_agent_denied" 20 || true)"
-fi
-if [[ -z "$agent_denied_line" ]]; then
-  echo "FAIL: timeout waiting for agent_command_exec_denied" >&2
-  exit 1
-fi
-if ! printf "%s" "$agent_denied_line" | rg -q "\"run_id\":\"${RUN_ID}\""; then
-  echo "FAIL: agent_command_exec_denied did not match run_id" >&2
-  echo "$agent_denied_line" >&2
-  exit 1
-fi
-if ! printf "%s" "$agent_denied_line" | rg -q "\"step_id\":\"${AGENT_STEP_ID}\""; then
-  echo "FAIL: agent_command_exec_denied did not match step_id" >&2
-  echo "$agent_denied_line" >&2
-  exit 1
-fi
-if ! printf "%s" "$agent_denied_line" | rg -q '"reason":"missing_command"|"reason":"not_allowlisted"'; then
-  echo "FAIL: agent_command_exec_denied reason not accepted" >&2
-  echo "$agent_denied_line" >&2
+  echo "FAIL: agent_command_exec_denied not found for run_id=${RUN_ID} step_id=${AGENT_STEP_ID}" >&2
+  echo "Context: recent agent log lines for run_id:" >&2
+  rg "\"run_id\":\"${RUN_ID}\"" "$LOG_AGENT" | tail -n 80 >&2 || true
   exit 1
 fi
 
-step_failed_line="$(rg -n "\"run_id\":\"${RUN_ID}\"" "$LOG_MASTER" | rg "\"step_id\":\"${AGENT_STEP_ID}\"" | rg '"msg":"response_step_result_received"' | rg '"status":"FAILED_SAFE"' | tail -n 1 || true)"
+step_failed_line="$(printf "%s\n" "$slice" | rg "\"run_id\":\"${RUN_ID}\"" | rg "\"step_id\":\"${AGENT_STEP_ID}\"" | rg '"msg":"response_step_result_received"' | rg '"status":"FAILED_SAFE"' | head -n 1 || true)"
 if [[ -z "$step_failed_line" ]]; then
-  step_failed_line="$(wait_new_line_for_run '\"msg\":\"response_step_result_received\"' "$LOG_MASTER" "$baseline_step_result" "$RUN_ID" 20 || true)"
-fi
-if [[ -z "$step_failed_line" ]]; then
-  echo "FAIL: timeout waiting for response_step_result_received" >&2
-  exit 1
-fi
-if ! printf "%s" "$step_failed_line" | rg -q "\"run_id\":\"${RUN_ID}\""; then
-  echo "FAIL: response_step_result_received did not match run_id" >&2
-  echo "$step_failed_line" >&2
-  exit 1
-fi
-if ! printf "%s" "$step_failed_line" | rg -q "\"step_id\":\"${AGENT_STEP_ID}\""; then
-  echo "FAIL: response_step_result_received did not match agent step_id" >&2
-  echo "$step_failed_line" >&2
-  exit 1
-fi
-if ! printf "%s" "$step_failed_line" | rg -q '"status":"FAILED_SAFE"'; then
-  echo "FAIL: expected response_step_result_received status FAILED_SAFE" >&2
-  echo "$step_failed_line" >&2
+  echo "FAIL: response_step_result_received FAILED_SAFE not found for agent step" >&2
+  echo "Context: response_step_result_received lines for run_id in slice:" >&2
+  printf "%s\n" "$slice" | rg "\"run_id\":\"${RUN_ID}\"" | rg '"msg":"response_step_result_received"' >&2 || true
   exit 1
 fi
 
-echo "$step_published_line"
 echo "agent_step_id: ${AGENT_STEP_ID}"
 echo "$agent_denied_line"
 echo "$step_failed_line"

@@ -23,21 +23,31 @@ import (
 )
 
 const (
-	ruleID             = "R-COLLECT-INVALID-USER"
-	detectorLane       = "FAST"
-	detectorSeverity   = "high"
-	defaultPullBatch   = 10
-	defaultPullTimeout = 500 * time.Millisecond
+	invalidUserRuleID        = "R-COLLECT-INVALID-USER"
+	processCountRuleID       = "R-COUNT-PROCESS-HOST"
+	invalidUserLane          = "FAST"
+	processCountLane         = "STANDARD"
+	detectorSeverityHigh     = "high"
+	processCountThreshold    = 3
+	defaultPullBatch         = 10
+	defaultPullTimeout       = 500 * time.Millisecond
 )
 
 var (
 	invalidUserPattern = "invalid user"
 	ipv4FromPattern    = regexp.MustCompile(`(?i)\bfrom\s+(\d{1,3}(?:\.\d{1,3}){3})\b`)
+	processCountPattern = regexp.MustCompile(`(?i)\bprocess_count=(\d+)\b`)
 )
 
 type rawEvent struct {
-	EventIdemKey string `json:"event_idem_key"`
-	Line         string `json:"line"`
+	EventIdemKey     string `json:"event_idem_key"`
+	ObservedAtUnixMs int64  `json:"observed_at_unix_ms"`
+	Message          string `json:"message"`
+	Host             string `json:"host"`
+	User             string `json:"user,omitempty"`
+	GroupKey         string `json:"group_key"`
+	Source           string `json:"source"`
+	Line             string `json:"line"`
 }
 
 func main() {
@@ -147,20 +157,24 @@ func handleMessage(ctx context.Context, logger *slog.Logger, kv nats.KeyValue, c
 
 	logger.Info("event_received", slog.String("event_idem_key", evt.EventIdemKey))
 
-	if !matchesRule(evt.Line) {
+	message := eventMessage(evt)
+	match, ok := matchRule(message, evt)
+	if !ok {
 		_ = msg.Ack()
 		return
 	}
-
-	groupKey := extractIPv4(evt.Line)
-	if groupKey == "" {
-		logger.Info("missing_group_key", slog.String("event_idem_key", evt.EventIdemKey))
+	if strings.TrimSpace(match.GroupKey) == "" {
+		logger.Info("missing_group_key",
+			slog.String("event_idem_key", evt.EventIdemKey),
+			slog.String("rule_id", match.RuleID),
+		)
 		_ = msg.Ack()
 		return
 	}
 	logger.Info("rule_matched",
 		slog.String("event_idem_key", evt.EventIdemKey),
-		slog.String("group_key", groupKey),
+		slog.String("rule_id", match.RuleID),
+		slog.String("group_key", match.GroupKey),
 	)
 
 	entry, err := kv.Get(evt.EventIdemKey)
@@ -179,15 +193,15 @@ func handleMessage(ctx context.Context, logger *slog.Logger, kv nats.KeyValue, c
 		return
 	}
 
-	cooldownKey := fmt.Sprintf("cd.%s.%s", ruleID, groupKey)
+	cooldownKey := fmt.Sprintf("cd.%s.%s", match.RuleID, match.GroupKey)
 	if remaining, hit, err := checkCooldown(cooldownKV, cooldownKey, cooldownMs); err != nil {
 		logger.Error("cooldown_check_failed", slog.String("error", err.Error()))
 		_ = kv.Delete(evt.EventIdemKey)
 		return
 	} else if hit {
 		logger.Info("cooldown_hit",
-			slog.String("rule_id", ruleID),
-			slog.String("group_key", groupKey),
+			slog.String("rule_id", match.RuleID),
+			slog.String("group_key", match.GroupKey),
 			slog.Int64("remaining_ms", remaining),
 		)
 		_ = msg.Ack()
@@ -201,13 +215,13 @@ func handleMessage(ctx context.Context, logger *slog.Logger, kv nats.KeyValue, c
 		return
 	}
 
-	alertKey := "A-COLLECT-INVALID-USER-" + evt.EventIdemKey
+	alertKey := alertKeyForRule(match.RuleID, evt.EventIdemKey)
 	alert := trigger.Alert{
 		AlertKey:         alertKey,
-		RuleID:           ruleID,
-		Severity:         detectorSeverity,
-		Lane:             detectorLane,
-		GroupKey:         groupKey,
+		RuleID:           match.RuleID,
+		Severity:         match.Severity,
+		Lane:             match.Lane,
+		GroupKey:         match.GroupKey,
 		ObservedAtUnixMs: time.Now().UnixMilli(),
 	}
 	_, triggerID, err := publisher.PublishAlert(alert)
@@ -225,8 +239,45 @@ func handleMessage(ctx context.Context, logger *slog.Logger, kv nats.KeyValue, c
 	_ = msg.Ack()
 }
 
-func matchesRule(line string) bool {
-	return strings.Contains(strings.ToLower(line), invalidUserPattern)
+type ruleMatch struct {
+	RuleID   string
+	Lane     string
+	Severity string
+	GroupKey string
+}
+
+func eventMessage(evt rawEvent) string {
+	msg := strings.TrimSpace(evt.Message)
+	if msg != "" {
+		return msg
+	}
+	return strings.TrimSpace(evt.Line)
+}
+
+func matchRule(message string, evt rawEvent) (ruleMatch, bool) {
+	if strings.Contains(strings.ToLower(message), invalidUserPattern) {
+		groupKey := extractIPv4(message)
+		return ruleMatch{
+			RuleID:   invalidUserRuleID,
+			Lane:     invalidUserLane,
+			Severity: detectorSeverityHigh,
+			GroupKey: groupKey,
+		}, true
+	}
+
+	if count, ok := parseProcessCount(message); ok && count >= processCountThreshold {
+		groupKey := strings.TrimSpace(evt.Host)
+		if groupKey == "" {
+			groupKey = strings.TrimSpace(evt.GroupKey)
+		}
+		return ruleMatch{
+			RuleID:   processCountRuleID,
+			Lane:     processCountLane,
+			Severity: detectorSeverityHigh,
+			GroupKey: groupKey,
+		}, true
+	}
+	return ruleMatch{}, false
 }
 
 func extractIPv4(line string) string {
@@ -235,6 +286,29 @@ func extractIPv4(line string) string {
 		return ""
 	}
 	return match[1]
+}
+
+func parseProcessCount(message string) (int, bool) {
+	match := processCountPattern.FindStringSubmatch(message)
+	if len(match) < 2 {
+		return 0, false
+	}
+	parsed, err := strconv.Atoi(match[1])
+	if err != nil {
+		return 0, false
+	}
+	return parsed, true
+}
+
+func alertKeyForRule(ruleID, eventID string) string {
+	switch ruleID {
+	case invalidUserRuleID:
+		return "A-COLLECT-INVALID-USER-" + eventID
+	case processCountRuleID:
+		return "A-COUNT-PROCESS-HOST-" + eventID
+	default:
+		return "A-UNKNOWN-" + eventID
+	}
 }
 
 func checkCooldown(kv nats.KeyValue, key string, cooldownMs int) (int64, bool, error) {

@@ -464,7 +464,8 @@ Notes:
 
 ## Demo (Sprint C)
 
-Start the services in the usual A–I terminal order as documented above. Then run:
+Start services in A–I order first: A NATS, B master, C master-consume, D one-shot shell, E master-roe, F roe-worker, G agent, H collector-tail, I detector-v0.
+Run the demo pack and tee evidence output:
 
 ```
 DEMO_EVIDENCE_LOG="logs/demo_$(date +%Y%m%d_%H%M%S).log"
@@ -472,7 +473,8 @@ chmod +x scripts/demo_runner_sprint_c.sh
 DEMO_EVIDENCE_LOG="$DEMO_EVIDENCE_LOG" ./scripts/demo_runner_sprint_c.sh |& tee "$DEMO_EVIDENCE_LOG"
 ```
 
-The demo orchestrates M40 → M41 → M37-style success → M42 in sequence. Evidence logs land in `logs/demo_YYYYMMDD_HHMMSS.log`.
+The runner orchestrates `M40 -> M41 -> M37-style success -> M42`.
+Evidence logs are saved at `logs/demo_YYYYMMDD_HHMMSS.log`.
 
 ## Configuration
 

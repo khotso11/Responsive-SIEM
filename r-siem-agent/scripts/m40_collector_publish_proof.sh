@@ -49,20 +49,30 @@ wait_in_slice() {
   return 1
 }
 
+debug_recent() {
+  local pattern="$1"
+  local file="$2"
+  echo "Context: last 10 relevant lines from ${file}:" >&2
+  rg "$pattern" "$file" | tail -n 10 >&2 || true
+}
+
 echo "=== M40 collector publish proof ==="
 
 baseline_line="$(last_line_num '"msg":"event_published"' "$LOG_COLLECTOR")"
 
-
 echo "M40 collector publish ts=$(date +%s)" >> "$DEMO_LOG"
 
-match_line="$(wait_in_slice '"msg":"event_published"' "$LOG_COLLECTOR" "$baseline_line" 300 20 || true)"
+match_line="$(wait_in_slice '"msg":"event_published"' "$LOG_COLLECTOR" "$((baseline_line + 1))" 300 20 || true)"
 if [[ -z "$match_line" ]]; then
   echo "FAIL: timeout waiting for event_published" >&2
-  echo "Context: recent event_published lines:" >&2
-  rg '"msg":"event_published"' "$LOG_COLLECTOR" | tail -n 10 >&2 || true
+  debug_recent '"msg":"event_published"' "$LOG_COLLECTOR"
   exit 1
 fi
 
+EVENT_ID="$(printf "%s\n" "$match_line" | sed -n 's/.*"event_idem_key":"\([^"]*\)".*/\1/p')"
+if [[ -z "$EVENT_ID" ]]; then
+  EVENT_ID="unknown"
+fi
+
 echo "$match_line"
-echo "PASS: M40 collector publish proof"
+echo "PASS: M40 collector publish proof event_idem_key=${EVENT_ID}"

@@ -59,6 +59,13 @@ wait_in_slice() {
   return 1
 }
 
+debug_recent() {
+  local pattern="$1"
+  local file="$2"
+  echo "Context: last 10 relevant lines from ${file}:" >&2
+  rg "$pattern" "$file" | tail -n 10 >&2 || true
+}
+
 echo "=== M42 process_count rule proof ==="
 
 baseline_trigger="$(last_line_num '\"msg\":\"trigger_published\"' "$LOG_DETECTOR")"
@@ -73,14 +80,12 @@ done
 trigger_line="$(wait_in_slice '\"msg\":\"trigger_published\".*\"alert_key\":\"A-COUNT-PROCESS-HOST-' "$LOG_DETECTOR" "$((baseline_trigger + 1))" 300 20 || true)"
 if [[ -z "$trigger_line" ]]; then
   echo "FAIL: timeout waiting for detector trigger_published (A-COUNT-PROCESS-HOST)" >&2
-  echo "Context: recent trigger_published lines:" >&2
-  rg '\"msg\":\"trigger_published\"' "$LOG_DETECTOR" | tail -n 15 >&2 || true
+  debug_recent '\"msg\":\"trigger_published\"' "$LOG_DETECTOR"
   exit 1
 fi
 if ! printf "%s" "$trigger_line" | rg -q '\"alert_key\":\"A-COUNT-PROCESS-HOST-'; then
   echo "FAIL: trigger_published did not match A-COUNT-PROCESS-HOST" >&2
-  echo "Context: recent trigger_published lines:" >&2
-  rg '\"msg\":\"trigger_published\"' "$LOG_DETECTOR" | tail -n 15 >&2 || true
+  debug_recent '\"msg\":\"trigger_published\"' "$LOG_DETECTOR"
   exit 1
 fi
 if printf "%s" "$trigger_line" | rg -q '\"alert_key\":\"A-COLLECT-INVALID-USER-'; then
@@ -92,36 +97,26 @@ fi
 run_created_line="$(wait_in_slice '\"msg\":\"response_run_created\".*\"rule_id\":\"R-COUNT-PROCESS-HOST\".*\"playbook_id\":\"PB-COUNT-PROCESS-HOST\"' "$LOG_MASTER" "$((baseline_run_created + 1))" 300 20 || true)"
 if [[ -z "$run_created_line" ]]; then
   echo "FAIL: timeout waiting for response_run_created (R-COUNT-PROCESS-HOST / PB-COUNT-PROCESS-HOST)" >&2
-  echo "Context: recent response_run_created lines:" >&2
-  rg '\"msg\":\"response_run_created\"' "$LOG_MASTER" | tail -n 15 >&2 || true
+  debug_recent '\"msg\":\"response_run_created\"' "$LOG_MASTER"
   exit 1
 fi
-RUN_LINE="$(grep -E '\"msg\":\"response_run_created\".*\"rule_id\":\"R-COUNT-PROCESS-HOST\".*\"playbook_id\":\"PB-COUNT-PROCESS-HOST\"' "$LOG_MASTER" | tail -n 1 || true)"
-RUN_ID="$(printf "%s\n" "$RUN_LINE" | awk 'match($0, /"run_id":"([^"]+)"/, a){print a[1]}')"
+RUN_ID="$(printf "%s\n" "$run_created_line" | sed -n 's/.*"run_id":"\([^"]*\)".*/\1/p')"
 if [[ -z "$RUN_ID" ]]; then
   echo "FAIL: unable to extract run_id from response_run_created" >&2
-  echo "Context: raw line parsed:" >&2
-  echo "$RUN_LINE" >&2
-  echo "Context: last 10 matching response_run_created lines (rule/playbook):" >&2
-  grep -E '\"msg\":\"response_run_created\".*\"rule_id\":\"R-COUNT-PROCESS-HOST\".*\"playbook_id\":\"PB-COUNT-PROCESS-HOST\"' "$LOG_MASTER" | tail -n 10 >&2 || true
+  echo "$run_created_line" >&2
+  debug_recent '\"msg\":\"response_run_created\".*\"rule_id\":\"R-COUNT-PROCESS-HOST\".*\"playbook_id\":\"PB-COUNT-PROCESS-HOST\"' "$LOG_MASTER"
   exit 1
 fi
 if ! printf "%s" "$run_created_line" | rg -q '\"rule_id\":\"R-COUNT-PROCESS-HOST\"'; then
   echo "FAIL: response_run_created rule_id mismatch" >&2
   echo "$run_created_line" >&2
-  echo "Context: response_run_created lines around start:" >&2
-  start_line="${run_created_line%%:*}"
-  end_line=$((start_line + 300))
-  sed -n "${start_line},${end_line}p" "$LOG_MASTER" | rg '\"msg\":\"response_run_created\"' >&2 || true
+  debug_recent '\"msg\":\"response_run_created\"' "$LOG_MASTER"
   exit 1
 fi
 if ! printf "%s" "$run_created_line" | rg -q '\"playbook_id\":\"PB-COUNT-PROCESS-HOST\"'; then
   echo "FAIL: response_run_created playbook_id mismatch" >&2
   echo "$run_created_line" >&2
-  echo "Context: response_run_created lines around start:" >&2
-  start_line="${run_created_line%%:*}"
-  end_line=$((start_line + 300))
-  sed -n "${start_line},${end_line}p" "$LOG_MASTER" | rg '\"msg\":\"response_run_created\"' >&2 || true
+  debug_recent '\"msg\":\"response_run_created\"' "$LOG_MASTER"
   exit 1
 fi
 if printf "%s" "$run_created_line" | rg -q '\"rule_id\":\"R-COLLECT-INVALID-USER\"|\"playbook_id\":\"PB-AGENT-PING-LOCALHOST\"'; then
@@ -130,23 +125,12 @@ if printf "%s" "$run_created_line" | rg -q '\"rule_id\":\"R-COLLECT-INVALID-USER
   exit 1
 fi
 
-start_line="${run_created_line%%:*}"
-if [[ -z "$start_line" || ! "$start_line" =~ ^[0-9]+$ ]]; then
-  echo "FAIL: unable to derive response_run_created line number" >&2
-  echo "$run_created_line" >&2
-  exit 1
-fi
-end_line=$((start_line + 300))
-slice="$(sed -n "${start_line},${end_line}p" "$LOG_MASTER")"
-context_created="$(printf "%s\n" "$slice" | rg '\"msg\":\"response_run_created\"' || true)"
-if [[ -z "$context_created" ]]; then
-  echo "Context: response_run_created lines around start (bounded slice) is empty" >&2
-else
-  echo "Context: response_run_created lines around start (bounded slice):" >&2
-  printf "%s\n" "$context_created" >&2
+ALERT_KEY="$(printf "%s\n" "$trigger_line" | sed -n 's/.*"alert_key":"\([^"]*\)".*/\1/p')"
+if [[ -z "$ALERT_KEY" ]]; then
+  ALERT_KEY="unknown"
 fi
 
 echo "$trigger_line"
 echo "$run_created_line"
 
-echo "PASS: M42 process_count rule proof"
+echo "PASS: M42 process_count rule proof alert_key=${ALERT_KEY} run_id=${RUN_ID}"

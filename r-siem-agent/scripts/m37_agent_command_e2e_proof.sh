@@ -34,20 +34,25 @@ last_line_num() {
   echo "${last%%:*}"
 }
 
-wait_new_line() {
+wait_in_slice() {
   local pattern="$1"
   local file="$2"
-  local baseline="$3"
-  local max_wait="$4"
-  local last line elapsed=0
+  local start_line="$3"
+  local span="$4"
+  local max_wait="$5"
+  local elapsed=0
   while (( elapsed < max_wait )); do
-    last="$(rg -n "$pattern" "$file" | tail -n 1 || true)"
-    if [[ -n "$last" ]]; then
-      line="${last%%:*}"
-      if [[ "$line" =~ ^[0-9]+$ ]] && (( line > baseline )); then
-        echo "$last"
-        return 0
-      fi
+    if (( start_line < 1 )); then
+      start_line=1
+    fi
+    local end_line=$((start_line + span))
+    local slice
+    slice="$(sed -n "${start_line},${end_line}p" "$file" | nl -ba -v "$start_line" -s ":")"
+    local match
+    match="$(printf "%s\n" "$slice" | rg "$pattern" | head -n 1 || true)"
+    if [[ -n "$match" ]]; then
+      echo "$match"
+      return 0
     fi
     sleep 1
     elapsed=$((elapsed + 1))
@@ -55,26 +60,11 @@ wait_new_line() {
   return 1
 }
 
-wait_new_line_for_run() {
+debug_recent() {
   local pattern="$1"
   local file="$2"
-  local baseline="$3"
-  local run_id="$4"
-  local max_wait="$5"
-  local last line elapsed=0
-  while (( elapsed < max_wait )); do
-    last="$(rg -n "\"run_id\":\"${run_id}\"" "$file" | rg "$pattern" | tail -n 1 || true)"
-    if [[ -n "$last" ]]; then
-      line="${last%%:*}"
-      if [[ "$line" =~ ^[0-9]+$ ]] && (( line > baseline )); then
-        echo "$last"
-        return 0
-      fi
-    fi
-    sleep 1
-    elapsed=$((elapsed + 1))
-  done
-  return 1
+  echo "Context: last 10 relevant lines from ${file}:" >&2
+  rg "$pattern" "$file" | tail -n 10 >&2 || true
 }
 
 fail_if_timeout_or_failed_safe() {
@@ -154,30 +144,33 @@ if ! go run -mod=vendor ./cmd/master-pubevent -config configs/master.yaml -event
   exit 2
 fi
 
-run_created_line="$(wait_new_line '"msg":"response_run_created"' "$LOG_MASTER" "$baseline_run_created" 20 || true)"
+run_created_line="$(wait_in_slice '"msg":"response_run_created".*"rule_id":"R-COLLECT-INVALID-USER".*"playbook_id":"PB-AGENT-PING-LOCALHOST"' "$LOG_MASTER" "$((baseline_run_created + 1))" 400 30 || true)"
 if [[ -z "$run_created_line" ]]; then
-  echo "FAIL: timeout waiting for response_run_created" >&2
+  echo "FAIL: timeout waiting for response_run_created rule_id=R-COLLECT-INVALID-USER playbook_id=PB-AGENT-PING-LOCALHOST" >&2
+  debug_recent '"msg":"response_run_created"' "$LOG_MASTER"
   exit 1
 fi
 
-approval_req_line="$(wait_new_line '"msg":"approval_request_published"' "$LOG_MASTER" "$baseline_approval_req" 20 || true)"
-if [[ -z "$approval_req_line" ]]; then
-  echo "FAIL: timeout waiting for approval_request_published" >&2
-  exit 1
-fi
-
-waiting_line="$(wait_new_line '"msg":"response_run_waiting_approval"' "$LOG_MASTER" "$baseline_waiting" 20 || true)"
-if [[ -z "$waiting_line" ]]; then
-  echo "FAIL: timeout waiting for response_run_waiting_approval" >&2
-  exit 1
-fi
-
-RUN_ID="$(printf "%s\n" "$waiting_line" | sed -n 's/.*"run_id":"\([^"]*\)".*/\1/p')"
+RUN_ID="$(printf "%s\n" "$run_created_line" | sed -n 's/.*"run_id":"\([^"]*\)".*/\1/p')"
 if [[ -z "$RUN_ID" ]]; then
   echo "FAIL: unable to extract run_id" >&2
+  echo "$run_created_line" >&2
   exit 1
 fi
 
+approval_req_line="$(wait_in_slice "\"msg\":\"approval_request_published\".*\"run_id\":\"${RUN_ID}\"" "$LOG_MASTER" "$((baseline_approval_req + 1))" 400 20 || true)"
+if [[ -z "$approval_req_line" ]]; then
+  echo "FAIL: timeout waiting for approval_request_published run_id=${RUN_ID}" >&2
+  debug_recent "\"msg\":\"approval_request_published\".*\"run_id\":\"${RUN_ID}\"" "$LOG_MASTER"
+  exit 1
+fi
+
+waiting_line="$(wait_in_slice "\"msg\":\"response_run_waiting_approval\".*\"run_id\":\"${RUN_ID}\"" "$LOG_MASTER" "$((baseline_waiting + 1))" 400 20 || true)"
+if [[ -z "$waiting_line" ]]; then
+  echo "FAIL: timeout waiting for response_run_waiting_approval run_id=${RUN_ID}" >&2
+  debug_recent "\"msg\":\"response_run_waiting_approval\".*\"run_id\":\"${RUN_ID}\"" "$LOG_MASTER"
+  exit 1
+fi
 
 echo "$run_created_line"
 echo "$approval_req_line"
@@ -201,12 +194,12 @@ while (( elapsed < max_wait )); do
   fail_if_timeout_or_failed_safe "$RUN_ID" "$baseline_fail_state"
   fail_if_agent_denied "$RUN_ID" "$baseline_agent_denied"
   if [[ -n "$LOG_WORKER" ]]; then
-    step_received_line="$(wait_new_line_for_run '"msg":"step_received"' "$LOG_WORKER" "$baseline_step_received" "$RUN_ID" 1 || true)"
+    step_received_line="$(wait_in_slice "\"run_id\":\"${RUN_ID}\".*\"msg\":\"step_received\"" "$LOG_WORKER" "$((baseline_step_received + 1))" 400 1 || true)"
     if [[ -n "$step_received_line" ]]; then
       break
     fi
   fi
-  step_published_line="$(wait_new_line_for_run '"msg":"response_step_published"' "$LOG_MASTER" "$baseline_step_result" "$RUN_ID" 1 || true)"
+  step_published_line="$(wait_in_slice "\"run_id\":\"${RUN_ID}\".*\"msg\":\"response_step_published\"" "$LOG_MASTER" "$((baseline_step_result + 1))" 400 1 || true)"
   if [[ -n "$step_published_line" ]]; then
     if printf "%s" "$step_published_line" | rg -q '"action_type":"agent_command"'; then
       break
@@ -217,6 +210,10 @@ while (( elapsed < max_wait )); do
 done
 if [[ -z "$step_received_line" && -z "$step_published_line" ]]; then
   echo "FAIL: timeout waiting for agent_command step (step_received or response_step_published)" >&2
+  if [[ -n "$LOG_WORKER" ]]; then
+    debug_recent "\"run_id\":\"${RUN_ID}\".*\"msg\":\"step_received\"" "$LOG_WORKER"
+  fi
+  debug_recent "\"run_id\":\"${RUN_ID}\".*\"msg\":\"response_step_published\"" "$LOG_MASTER"
   exit 1
 fi
 
@@ -255,6 +252,7 @@ while (( elapsed < max_wait )); do
 done
 if [[ -z "$step_result_line" ]]; then
   echo "FAIL: timeout waiting for response_step_result_received SUCCEEDED" >&2
+  debug_recent "\"run_id\":\"${RUN_ID}\".*\"msg\":\"response_step_result_received\"" "$LOG_MASTER"
   exit 1
 fi
 
@@ -277,6 +275,7 @@ while (( elapsed < max_wait )); do
 done
 if [[ -z "$agent_start_line" ]]; then
   echo "FAIL: timeout waiting for agent_command_exec_start" >&2
+  debug_recent "\"run_id\":\"${RUN_ID}\".*\"msg\":\"agent_command_exec_start\"" "$LOG_AGENT"
   exit 1
 fi
 
@@ -296,6 +295,7 @@ agent_done_line="$(rg -n "\"run_id\":\"${RUN_ID}\"" "$LOG_AGENT" | rg '"msg":"ag
 done
 if [[ -z "$agent_done_line" ]]; then
   echo "FAIL: timeout waiting for agent_command_exec_done" >&2
+  debug_recent "\"run_id\":\"${RUN_ID}\".*\"msg\":\"agent_command_exec_done\"" "$LOG_AGENT"
   exit 1
 fi
 
@@ -311,4 +311,4 @@ echo "$agent_start_line"
 echo "$agent_done_line"
 
 echo "command_id: ${COMMAND_ID}"
-echo "PASS: M37 agent_command end-to-end"
+echo "PASS: M37 agent_command end-to-end run_id=${RUN_ID} step_id=${STEP_ID} command_id=${COMMAND_ID}"

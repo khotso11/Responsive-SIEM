@@ -59,32 +59,54 @@ wait_in_slice() {
   return 1
 }
 
+debug_recent() {
+  local pattern="$1"
+  local file="$2"
+  echo "Context: last 10 relevant lines from ${file}:" >&2
+  rg "$pattern" "$file" | tail -n 10 >&2 || true
+}
+
 echo "=== M41 invalid user rule proof ==="
 
 baseline_trigger="$(last_line_num '"msg":"trigger_published"' "$LOG_DETECTOR")"
-baseline_waiting="$(last_line_num '"msg":"response_run_waiting_approval"' "$LOG_MASTER")"
+baseline_run_created="$(last_line_num '"msg":"response_run_created"' "$LOG_MASTER")"
 
 
 octet=$(( ( $(date +%s) % 200 ) + 1 ))
 echo "M41 invalid user from 10.0.0.${octet} ts=$(date +%s)" >> "$DEMO_LOG"
 
-trigger_line="$(wait_in_slice '"msg":"trigger_published"' "$LOG_DETECTOR" "$baseline_trigger" 300 20 || true)"
+trigger_line="$(wait_in_slice '"msg":"trigger_published".*"alert_key":"A-COLLECT-INVALID-USER-' "$LOG_DETECTOR" "$((baseline_trigger + 1))" 300 20 || true)"
 if [[ -z "$trigger_line" ]]; then
-  echo "FAIL: timeout waiting for detector trigger_published" >&2
-  echo "Context: recent detector lines:" >&2
-  rg '"msg":"trigger_published"|"msg":"rule_matched"' "$LOG_DETECTOR" | tail -n 10 >&2 || true
+  echo "FAIL: timeout waiting for detector trigger_published alert_key=A-COLLECT-INVALID-USER-*" >&2
+  debug_recent '"msg":"trigger_published"|"msg":"rule_matched"' "$LOG_DETECTOR"
+  exit 1
+fi
+ALERT_KEY="$(printf "%s\n" "$trigger_line" | sed -n 's/.*"alert_key":"\([^"]*\)".*/\1/p')"
+if [[ -z "$ALERT_KEY" ]]; then
+  echo "FAIL: unable to extract alert_key from trigger_published" >&2
+  echo "$trigger_line" >&2
+  exit 1
+fi
+if [[ "$ALERT_KEY" != A-COLLECT-INVALID-USER-* ]]; then
+  echo "FAIL: alert_key prefix mismatch alert_key=${ALERT_KEY}" >&2
+  echo "$trigger_line" >&2
   exit 1
 fi
 
-waiting_line="$(wait_in_slice '"msg":"response_run_waiting_approval"' "$LOG_MASTER" "$baseline_waiting" 300 20 || true)"
-if [[ -z "$waiting_line" ]]; then
-  echo "FAIL: timeout waiting for response_run_waiting_approval" >&2
-  echo "Context: recent master-roe lines:" >&2
-  rg '"msg":"response_run_waiting_approval"' "$LOG_MASTER" | tail -n 10 >&2 || true
+run_created_line="$(wait_in_slice '"msg":"response_run_created".*"rule_id":"R-COLLECT-INVALID-USER".*"playbook_id":"PB-AGENT-PING-LOCALHOST"' "$LOG_MASTER" "$((baseline_run_created + 1))" 300 20 || true)"
+if [[ -z "$run_created_line" ]]; then
+  echo "FAIL: timeout waiting for response_run_created R-COLLECT-INVALID-USER/PB-AGENT-PING-LOCALHOST" >&2
+  debug_recent '"msg":"response_run_created"' "$LOG_MASTER"
+  exit 1
+fi
+RUN_ID="$(printf "%s\n" "$run_created_line" | sed -n 's/.*"run_id":"\([^"]*\)".*/\1/p')"
+if [[ -z "$RUN_ID" ]]; then
+  echo "FAIL: unable to extract run_id from response_run_created" >&2
+  echo "$run_created_line" >&2
   exit 1
 fi
 
 echo "$trigger_line"
-echo "$waiting_line"
+echo "$run_created_line"
 
-echo "PASS: M41 invalid user rule proof"
+echo "PASS: M41 invalid user rule proof alert_key=${ALERT_KEY} run_id=${RUN_ID}"

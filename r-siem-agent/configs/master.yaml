@@ -107,6 +107,7 @@ roe:
   # ROE v0.3 journaling / exports (JSONL)
   # Worker writes step result journal
   worker:
+    notify_allow_missing_webhook: true
     export:
       enabled: true
       required: false
@@ -163,7 +164,10 @@ playbooks:
         timeout_ms: 5000
         retries: 2
         backoff_ms: 500
-        target_from: "group_key"
+        target_from: "global"
+        params:
+          command: "ping"
+          target: "127.0.0.1"
 
       - name: "notify_after"
         action_type: "notify"

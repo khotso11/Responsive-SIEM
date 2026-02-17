@@ -10,6 +10,7 @@ type Step struct {
 	Target     string
 	RunID      string
 	StepID     string
+	StepIndex  int
 	Lane       string
 	Params     map[string]any
 	TimeoutMs  *int64

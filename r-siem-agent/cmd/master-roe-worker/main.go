@@ -48,19 +48,20 @@ const (
 )
 
 type roeWorkerConfig struct {
-	FastWorkers             int                 `yaml:"fast_workers"`
-	StandardWorkers         int                 `yaml:"standard_workers"`
-	PullBatch               int                 `yaml:"pull_batch"`
-	PullTimeoutMs           int                 `yaml:"pull_timeout_ms"`
-	MaxInflight             int                 `yaml:"max_inflight"`
-	MaxAttempts             int                 `yaml:"max_attempts"`
-	BaseBackoffMs           int64               `yaml:"base_backoff_ms"`
-	MaxBackoffMs            int64               `yaml:"max_backoff_ms"`
-	DegradeHighWatermarkPct int                 `yaml:"degrade_high_watermark_pct"`
-	LockTTLms               int64               `yaml:"lock_ttl_ms"`
-	FailureInject           failureInjectConfig `yaml:"failure_inject"`
-	Export                  workerExportConfig  `yaml:"export"`
-	AllowedActionTypes      []string            `yaml:"-"`
+	FastWorkers               int                 `yaml:"fast_workers"`
+	StandardWorkers           int                 `yaml:"standard_workers"`
+	PullBatch                 int                 `yaml:"pull_batch"`
+	PullTimeoutMs             int                 `yaml:"pull_timeout_ms"`
+	NotifyAllowMissingWebhook bool                `yaml:"notify_allow_missing_webhook"`
+	MaxInflight               int                 `yaml:"max_inflight"`
+	MaxAttempts               int                 `yaml:"max_attempts"`
+	BaseBackoffMs             int64               `yaml:"base_backoff_ms"`
+	MaxBackoffMs              int64               `yaml:"max_backoff_ms"`
+	DegradeHighWatermarkPct   int                 `yaml:"degrade_high_watermark_pct"`
+	LockTTLms                 int64               `yaml:"lock_ttl_ms"`
+	FailureInject             failureInjectConfig `yaml:"failure_inject"`
+	Export                    workerExportConfig  `yaml:"export"`
+	AllowedActionTypes        []string            `yaml:"-"`
 }
 
 type failureInjectConfig struct {
@@ -121,23 +122,23 @@ type stepState struct {
 }
 
 type workerRuntime struct {
-	logger     *slog.Logger
-	js         nats.JetStreamContext
-	kv         nats.KeyValue
-	resultsKV  nats.KeyValue
-	lockKV     nats.KeyValue
-	cfg        roeWorkerConfig
-	inflight   atomic.Int64
-	degraded   atomic.Bool
-	execCount  atomic.Int64
-	testFailKV bool
-	exporter   *workerExporter
-	workerID   string
-	connectors *connectors.Manager
-	allowlist  map[string]struct{}
-	exitFunc   func(int)
-	failpoint  workerFailpoint
-	failpointTriggered atomic.Bool
+	logger                       *slog.Logger
+	js                           nats.JetStreamContext
+	kv                           nats.KeyValue
+	resultsKV                    nats.KeyValue
+	lockKV                       nats.KeyValue
+	cfg                          roeWorkerConfig
+	inflight                     atomic.Int64
+	degraded                     atomic.Bool
+	execCount                    atomic.Int64
+	testFailKV                   bool
+	exporter                     *workerExporter
+	workerID                     string
+	connectors                   *connectors.Manager
+	allowlist                    map[string]struct{}
+	exitFunc                     func(int)
+	failpoint                    workerFailpoint
+	failpointTriggered           atomic.Bool
 	publishResultPayloadOverride func([]byte) error
 	executeConnectorOverride     func(context.Context, connectors.Connector, stepMessage) (map[string]any, error)
 }
@@ -164,6 +165,7 @@ type workerFailpoint struct {
 	stepID  string
 	once    bool
 }
+
 func main() {
 	configPath := flag.String("config", "configs/master.yaml", "Path to master config")
 	laneMode := flag.String("lane", "BOTH", "Lane mode: FAST, STANDARD, or BOTH")
@@ -278,8 +280,9 @@ func main() {
 		exitFunc:   os.Exit,
 		failpoint:  loadWorkerFailpoint(),
 		connectors: connectors.NewManager(connectors.Builtins(connectors.BuiltinOptions{
-			Logger: logger,
-			NATS:   nc,
+			Logger:                    logger,
+			NATS:                      nc,
+			NotifyAllowMissingWebhook: cfg.NotifyAllowMissingWebhook,
 		})...),
 		allowlist: buildAllowlist(cfg.AllowedActionTypes),
 	}
@@ -1172,6 +1175,7 @@ func (r *workerRuntime) executeConnector(ctx context.Context, connector connecto
 		Target:     step.Target,
 		RunID:      step.RunID,
 		StepID:     step.StepID,
+		StepIndex:  step.StepIndex,
 		Lane:       step.Lane,
 		Params:     step.Params,
 		TimeoutMs:  step.TimeoutMs,

@@ -8,6 +8,37 @@ mkdir -p logs tmp
 echo "=== Sprint C Demo Runner ==="
 echo "Evidence log: ${DEMO_EVIDENCE_LOG}"
 
+preflight_failed=0
+missing_logs=()
+
+check_log() {
+  local file="$1"
+  if [[ ! -s "$file" ]]; then
+    missing_logs+=("$file")
+    preflight_failed=1
+  fi
+}
+
+check_log "logs/collector-tail.log"
+check_log "logs/detector-v0.log"
+check_log "logs/master-roe.log"
+check_log "logs/roe-worker.log"
+check_log "logs/agent.log"
+
+if [[ "$preflight_failed" -ne 0 ]]; then
+  echo "FAIL: preflight check failed; required logs are missing or empty:"
+  for file in "${missing_logs[@]}"; do
+    echo "  - ${file}"
+  done
+  echo "Start these terminals/services, then rerun:"
+  echo "  - Terminal H (collector-tail): go run -mod=vendor ./cmd/collector-tail -config configs/collector.yaml | tee logs/collector-tail.log"
+  echo "  - Terminal I (detector-v0): go run -mod=vendor ./cmd/detector-v0 -config configs/detector.yaml | tee logs/detector-v0.log"
+  echo "  - Terminal E (master-roe): go run -mod=vendor ./cmd/master-roe --config configs/master.yaml | tee logs/master-roe.log"
+  echo "  - Terminal F (roe-worker): go run -mod=vendor ./cmd/master-roe-worker --config configs/master.yaml | tee logs/roe-worker.log"
+  echo "  - Terminal G (agent): go run -mod=vendor ./cmd/agent --config configs/agent.yaml | tee logs/agent.log"
+  exit 2
+fi
+
 run_optional_script() {
   local script="$1"
   if [[ ! -x "$script" ]]; then

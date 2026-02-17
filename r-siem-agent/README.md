@@ -465,6 +465,12 @@ Notes:
 ## Demo (Sprint C)
 
 Start services in A–I order first: A NATS, B master, C master-consume, D one-shot shell, E master-roe, F roe-worker, G agent, H collector-tail, I detector-v0.
+Use the trigger helper to append deterministic test lines:
+
+```
+./scripts/trigger_demo_events.sh both
+```
+
 Run the demo pack and tee evidence output:
 
 ```
@@ -475,6 +481,7 @@ DEMO_EVIDENCE_LOG="$DEMO_EVIDENCE_LOG" ./scripts/demo_runner_sprint_c.sh |& tee 
 
 The runner orchestrates `M40 -> M41 -> M37-style success -> M42`.
 Evidence logs are saved at `logs/demo_YYYYMMDD_HHMMSS.log`.
+If preflight fails (exit `2`), start the missing services using the exact terminal commands printed by the runner and rerun.
 
 ## Configuration
 

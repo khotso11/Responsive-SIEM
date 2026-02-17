@@ -8,24 +8,33 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go"
 )
 
 type BuiltinOptions struct {
-	Logger *slog.Logger
-	NATS   *nats.Conn
+	Logger                    *slog.Logger
+	NATS                      *nats.Conn
+	NotifyAllowMissingWebhook bool
 }
 
 type notifyConnector struct {
-	logger     *slog.Logger
-	webhookURL string
-	timeout    time.Duration
-	client     *http.Client
+	logger                  *slog.Logger
+	webhookURL              string
+	allowMissingWebhookNoop bool
+	artifactPath            string
+	timeout                 time.Duration
+	client                  *http.Client
 }
+
+var notifyArtifactMu sync.Mutex
+
+const notifyMessageMaxBytes = 2048
 
 func newNotifyConnector(opts BuiltinOptions) *notifyConnector {
 	timeoutMs := envInt("RSIEM_NOTIFY_TIMEOUT_MS", 2000)
@@ -34,10 +43,12 @@ func newNotifyConnector(opts BuiltinOptions) *notifyConnector {
 		logger = slog.Default()
 	}
 	return &notifyConnector{
-		logger:     logger,
-		webhookURL: strings.TrimSpace(os.Getenv("RSIEM_NOTIFY_WEBHOOK_URL")),
-		timeout:    time.Duration(timeoutMs) * time.Millisecond,
-		client:     &http.Client{Timeout: time.Duration(timeoutMs) * time.Millisecond},
+		logger:                  logger,
+		webhookURL:              strings.TrimSpace(os.Getenv("RSIEM_NOTIFY_WEBHOOK_URL")),
+		allowMissingWebhookNoop: opts.NotifyAllowMissingWebhook,
+		artifactPath:            notifyArtifactPath(),
+		timeout:                 time.Duration(timeoutMs) * time.Millisecond,
+		client:                  &http.Client{Timeout: time.Duration(timeoutMs) * time.Millisecond},
 	}
 }
 
@@ -59,6 +70,17 @@ func (c *notifyConnector) OptionalParams() []string {
 
 func (c *notifyConnector) Execute(ctx context.Context, step Step) (map[string]any, error) {
 	if c.webhookURL == "" {
+		if c.allowMissingWebhookNoop {
+			receipt := "notify: noop (missing webhook; allowed by config)"
+			if err := c.writeArtifact(step, receipt); err != nil {
+				return nil, err
+			}
+			c.logger.LogAttrs(context.Background(), slog.LevelInfo, "notify_noop_missing_webhook",
+				slog.String("run_id", step.RunID),
+				slog.String("step_id", step.StepID),
+			)
+			return map[string]any{"message": receipt}, nil
+		}
 		return nil, fmt.Errorf("notify_webhook_missing")
 	}
 	payload := map[string]any{
@@ -98,13 +120,17 @@ func (c *notifyConnector) Execute(ctx context.Context, step Step) (map[string]an
 	defer resp.Body.Close()
 	status := resp.StatusCode
 	if status >= 200 && status < 300 {
+		receipt := "notified"
+		if err := c.writeArtifact(step, receipt); err != nil {
+			return nil, err
+		}
 		c.logger.LogAttrs(context.Background(), slog.LevelInfo, "notify_webhook_terminal",
 			slog.String("run_id", step.RunID),
 			slog.String("step_id", step.StepID),
 			slog.String("status", "succeeded"),
 			slog.Int("http_code", status),
 		)
-		return map[string]any{"message": "notified"}, nil
+		return map[string]any{"message": receipt}, nil
 	}
 	if status >= 400 && status < 500 {
 		c.logger.LogAttrs(context.Background(), slog.LevelInfo, "notify_webhook_terminal",
@@ -122,6 +148,45 @@ func (c *notifyConnector) Execute(ctx context.Context, step Step) (map[string]an
 		slog.Int("http_code", status),
 	)
 	return nil, Retryable(fmt.Errorf("notify_webhook_http_%d", status))
+}
+
+func (c *notifyConnector) writeArtifact(step Step, message string) error {
+	safeMessage, truncated := truncateForArtifact(message, notifyMessageMaxBytes)
+	record := map[string]any{
+		"time":       time.Now().Format(time.RFC3339Nano),
+		"run_id":     step.RunID,
+		"step_id":    step.StepID,
+		"step_index": step.StepIndex,
+		"step_key":   fmt.Sprintf("step.%s.%s", step.RunID, step.StepID),
+		"action_type": "notify",
+		"lane":       step.Lane,
+		"message":    safeMessage,
+		"truncated":  truncated,
+	}
+	data, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(c.artifactPath), 0o755); err != nil {
+		return err
+	}
+	notifyArtifactMu.Lock()
+	defer notifyArtifactMu.Unlock()
+
+	f, err := os.OpenFile(c.artifactPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := f.Write(append(data, '\n')); err != nil {
+		return err
+	}
+	c.logger.LogAttrs(context.Background(), slog.LevelInfo, "notify_file_written",
+		slog.String("run_id", step.RunID),
+		slog.String("step_id", step.StepID),
+		slog.String("path", c.artifactPath),
+	)
+	return nil
 }
 
 type agentCommandStubConnector struct {
@@ -636,6 +701,24 @@ func envInt(key string, fallback int) int {
 		return fallback
 	}
 	return parsed
+}
+
+func notifyArtifactPath() string {
+	path := strings.TrimSpace(os.Getenv("RSIEM_NOTIFY_EXPORT_PATH"))
+	if path == "" {
+		path = "exports/notify.jsonl"
+	}
+	return path
+}
+
+func truncateForArtifact(value string, maxBytes int) (string, bool) {
+	if maxBytes <= 0 {
+		return "", value != ""
+	}
+	if len(value) <= maxBytes {
+		return value, false
+	}
+	return value[:maxBytes], true
 }
 
 func withOptionalTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {

@@ -45,6 +45,9 @@ type rawEvent struct {
 	Message          string `json:"message"`
 	Host             string `json:"host"`
 	User             string `json:"user,omitempty"`
+	SrcIP            string `json:"src_ip,omitempty"`
+	EventType        string `json:"event_type,omitempty"`
+	Ts               int64  `json:"ts,omitempty"`
 	GroupKey         string `json:"group_key"`
 	Source           string `json:"source"`
 	Line             string `json:"line"`
@@ -176,6 +179,18 @@ func handleMessage(ctx context.Context, logger *slog.Logger, kv nats.KeyValue, c
 		slog.String("rule_id", match.RuleID),
 		slog.String("group_key", match.GroupKey),
 	)
+	ts := evt.Ts
+	if ts == 0 && evt.ObservedAtUnixMs > 0 {
+		ts = evt.ObservedAtUnixMs / 1000
+	}
+	logger.Info("detector_rule_matched",
+		slog.String("rule_id", match.RuleID),
+		slog.String("event_idem_key", evt.EventIdemKey),
+		slog.String("event_type", evt.EventType),
+		slog.String("src_ip", evt.SrcIP),
+		slog.String("user", evt.User),
+		slog.Int64("ts", ts),
+	)
 
 	entry, err := kv.Get(evt.EventIdemKey)
 	if err == nil && entry != nil {
@@ -255,6 +270,18 @@ func eventMessage(evt rawEvent) string {
 }
 
 func matchRule(message string, evt rawEvent) (ruleMatch, bool) {
+	if strings.EqualFold(strings.TrimSpace(evt.EventType), "auth_failed") {
+		groupKey := strings.TrimSpace(evt.SrcIP)
+		if groupKey == "" {
+			groupKey = extractIPv4(message)
+		}
+		return ruleMatch{
+			RuleID:   invalidUserRuleID,
+			Lane:     invalidUserLane,
+			Severity: detectorSeverityHigh,
+			GroupKey: groupKey,
+		}, true
+	}
 	if strings.Contains(strings.ToLower(message), invalidUserPattern) {
 		groupKey := extractIPv4(message)
 		return ruleMatch{

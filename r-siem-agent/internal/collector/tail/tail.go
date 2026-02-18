@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,8 +26,11 @@ const maxBytesPerPoll = uint64(1 << 20) // 1 MiB per poll to bound backlog
 
 var (
 	ipv4FromPattern = regexp.MustCompile(`(?i)\bfrom\s+(\d{1,3}(?:\.\d{1,3}){3})\b`)
+	ipv4SrcPattern  = regexp.MustCompile(`(?i)\bsrc[=: ]+(\d{1,3}(?:\.\d{1,3}){3})\b`)
 	userPattern     = regexp.MustCompile(`(?i)\buser(?:name)?[=: ]+([a-z0-9._-]+)\b`)
 	hostPattern     = regexp.MustCompile(`(?i)\bhost[=: ]+([a-z0-9._-]+)\b`)
+	authFailedA     = regexp.MustCompile(`(?i)^FAILED login user=([a-z0-9._-]+)\s+src=(\d{1,3}(?:\.\d{1,3}){3})\s+ts=([0-9]{9,13})$`)
+	sshdFailed      = regexp.MustCompile(`(?i)Failed password for(?: invalid user)? ([a-z0-9._-]+) from (\d{1,3}(?:\.\d{1,3}){3})`)
 )
 
 type Collector struct {
@@ -217,11 +221,18 @@ func (c *Collector) publishLine(ctx context.Context, line string, offset uint64)
 	if host == "" {
 		host = resolveHost()
 	}
+	eventType, srcIP, user, tsUnix := extractAuthMetadata(line)
+
 	groupKey := host
-	if ip := extractIPv4(line); ip != "" {
+	if srcIP != "" {
+		groupKey = srcIP
+	} else if ip := extractIPv4(line); ip != "" {
 		groupKey = ip
+		srcIP = ip
 	}
-	user := extractUser(line)
+	if user == "" {
+		user = extractUser(line)
+	}
 	payload := map[string]any{
 		"event_idem_key":       eventID,
 		"observed_at_unix_ms":  time.Now().UnixMilli(),
@@ -232,6 +243,15 @@ func (c *Collector) publishLine(ctx context.Context, line string, offset uint64)
 	}
 	if user != "" {
 		payload["user"] = user
+	}
+	if srcIP != "" {
+		payload["src_ip"] = srcIP
+	}
+	if eventType != "" {
+		payload["event_type"] = eventType
+	}
+	if tsUnix > 0 {
+		payload["ts"] = tsUnix
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -249,6 +269,13 @@ func (c *Collector) publishLine(ctx context.Context, line string, offset uint64)
 		return "", err
 	}
 	c.published.Add(1)
+	c.logger.LogAttrs(context.Background(), slog.LevelInfo, "collector_event_published",
+		slog.String("event_idem_key", eventID),
+		slog.String("event_type", eventType),
+		slog.String("src_ip", srcIP),
+		slog.String("user", user),
+		slog.Int64("ts", tsUnix),
+	)
 	return eventID, nil
 }
 
@@ -275,6 +302,10 @@ func resolveHost() string {
 
 func extractIPv4(line string) string {
 	match := ipv4FromPattern.FindStringSubmatch(line)
+	if len(match) >= 2 {
+		return match[1]
+	}
+	match = ipv4SrcPattern.FindStringSubmatch(line)
 	if len(match) < 2 {
 		return ""
 	}
@@ -295,6 +326,54 @@ func extractHost(line string) string {
 		return ""
 	}
 	return match[1]
+}
+
+func extractAuthMetadata(line string) (eventType, srcIP, user string, tsUnix int64) {
+	if m := authFailedA.FindStringSubmatch(line); len(m) == 4 {
+		eventType = "auth_failed"
+		user = m[1]
+		srcIP = m[2]
+		parsedTs, err := parseUnix(m[3])
+		if err == nil {
+			tsUnix = parsedTs
+		}
+		if tsUnix == 0 {
+			tsUnix = time.Now().Unix()
+		}
+		return
+	}
+
+	if m := sshdFailed.FindStringSubmatch(line); len(m) == 3 {
+		eventType = "auth_failed"
+		user = m[1]
+		srcIP = m[2]
+		tsUnix = time.Now().Unix()
+		return
+	}
+
+	if strings.Contains(strings.ToLower(line), "invalid user") {
+		eventType = "invalid_user"
+		tsUnix = time.Now().Unix()
+		return
+	}
+
+	return "", "", "", 0
+}
+
+func parseUnix(raw string) (int64, error) {
+	if len(raw) >= 13 {
+		// Treat as unix milliseconds and convert to seconds.
+		tsMs, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return 0, err
+		}
+		return tsMs / 1000, nil
+	}
+	ts, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return ts, nil
 }
 
 func openTailFile(path string) (*os.File, error) {

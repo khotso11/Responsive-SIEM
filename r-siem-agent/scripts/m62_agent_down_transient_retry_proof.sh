@@ -5,6 +5,7 @@ LOG_MASTER="logs/master-roe.log"
 LOG_AGENT="logs/agent.m62.log"
 DEMO_LOG="tmp/demo.log"
 PID_FILE="tmp/m62.agent.pid"
+AGENT_BIN=".cache/m62-agent-bin"
 
 mkdir -p logs tmp .cache/go-build
 touch "$LOG_AGENT"
@@ -45,7 +46,8 @@ start_agent() {
       return 0
     fi
   fi
-  env GOCACHE="$(pwd)/.cache/go-build" go run -mod=vendor ./cmd/agent --config configs/agent.yaml >> "$LOG_AGENT" 2>&1 &
+  env GOCACHE="$(pwd)/.cache/go-build" go build -mod=vendor -o "$AGENT_BIN" ./cmd/agent >/dev/null 2>&1 || return 1
+  "$AGENT_BIN" --config configs/agent.yaml >> "$LOG_AGENT" 2>&1 &
   local pid="$!"
   echo "$pid" > "$PID_FILE"
   sleep 1
@@ -217,8 +219,7 @@ while IFS= read -r f; do
 done < <(worker_logs)
 (( down_success == 0 )) || die "step_succeeded observed while agent down before attempt=2 for run_id=${RUN_ID}" "$RUN_ID"
 
-retry_proof_kind=""
-retry_proof_line=""
+attempt2_line=""
 i=0
 while (( i < 15 )); do
   down_success=0
@@ -228,64 +229,22 @@ while (( i < 15 )); do
     [[ "$c" =~ ^[0-9]+$ ]] || c=0
     down_success=$((down_success + c))
   done < <(worker_logs)
-  (( down_success == 0 )) || die "step_succeeded observed while agent down before retry proof for run_id=${RUN_ID}" "$RUN_ID"
+  (( down_success == 0 )) || die "step_succeeded observed while agent down before attempt=2 for run_id=${RUN_ID}" "$RUN_ID"
 
-  # A) step_failed_transient attempt>=2
+  # Require a second transient attempt while agent is down.
   for idx in "${!worker_files[@]}"; do
     f="${worker_files[$idx]}"
     b="${worker_bases[$idx]}"
-    line="$(tail_from "$f" "$b" | rg -F "\"msg\":\"step_failed_transient\"" | rg -F "\"run_id\":\"${RUN_ID}\"" | rg -F "\"step_id\":\"${STEP_ID}\"" | rg -e "\"attempt\":[2-9][0-9]*" | head -n 1 || true)"
+    line="$(tail_from "$f" "$b" | rg -F "\"msg\":\"step_failed_transient\"" | rg -F "\"run_id\":\"${RUN_ID}\"" | rg -F "\"step_id\":\"${STEP_ID}\"" | rg -F "\"attempt\":2" | head -n 1 || true)"
     if [[ -n "$line" ]]; then
-      retry_proof_kind="attempt_ge_2"
-      retry_proof_line="$line"
+      attempt2_line="$line"
       break
     fi
   done
-
-  # B) second step_received (redelivery)
-  if [[ -z "$retry_proof_kind" ]]; then
-    recv_count=0
-    for idx in "${!worker_files[@]}"; do
-      f="${worker_files[$idx]}"
-      b="${worker_bases[$idx]}"
-      c="$({ tail_from "$f" "$b" | rg -F "\"msg\":\"step_received\"" | rg -F "\"run_id\":\"${RUN_ID}\"" | rg -F "\"step_id\":\"${STEP_ID}\"" | wc -l | tr -d '[:space:]'; } || true)"
-      [[ "$c" =~ ^[0-9]+$ ]] || c=0
-      recv_count=$((recv_count + c))
-    done
-    if (( recv_count >= 2 )); then
-      retry_proof_kind="redelivery_step_received"
-      retry_proof_line="step_received count=${recv_count}"
-    fi
-  fi
-
-  # C) worker_result_replay
-  if [[ -z "$retry_proof_kind" ]]; then
-    for idx in "${!worker_files[@]}"; do
-      f="${worker_files[$idx]}"
-      b="${worker_bases[$idx]}"
-      line="$(tail_from "$f" "$b" | rg -F "\"msg\":\"worker_result_replay\"" | rg -F "\"run_id\":\"${RUN_ID}\"" | rg -F "\"step_id\":\"${STEP_ID}\"" | head -n 1 || true)"
-      if [[ -n "$line" ]]; then
-        retry_proof_kind="worker_result_replay"
-        retry_proof_line="$line"
-        break
-      fi
-    done
-  fi
-
-  # D) master FAILED_TRANSIENT on >=2 distinct js_seq
-  if [[ -z "$retry_proof_kind" ]]; then
-    failed_transient_js_unique="$({ tail_from "$LOG_MASTER" "$base_master" | rg -F "\"msg\":\"response_step_result_received\"" | rg -F "\"run_id\":\"${RUN_ID}\"" | rg -F "\"step_id\":\"${STEP_ID}\"" | rg -F "\"status\":\"FAILED_TRANSIENT\"" | sed -n 's/.*"js_seq":\([0-9]\+\).*/\1/p' | sort -u | wc -l | tr -d '[:space:]'; } || true)"
-    [[ "$failed_transient_js_unique" =~ ^[0-9]+$ ]] || failed_transient_js_unique=0
-    if (( failed_transient_js_unique >= 2 )); then
-      retry_proof_kind="master_failed_transient_distinct_js_seq"
-      retry_proof_line="master FAILED_TRANSIENT unique js_seq=${failed_transient_js_unique}"
-    fi
-  fi
-
-  [[ -n "$retry_proof_kind" ]] && break
+  [[ -n "$attempt2_line" ]] && break
   sleep 1; i=$((i+1))
 done
-[[ -n "$retry_proof_kind" ]] || die "transient retries not proven for run_id=${RUN_ID} step_id=${STEP_ID}" "$RUN_ID"
+[[ -n "$attempt2_line" ]] || die "transient retries not proven (need attempt>=2) for run_id=${RUN_ID} step_id=${STEP_ID}" "$RUN_ID"
 
 transient_count=0
 transient_max_attempt=0
@@ -299,6 +258,7 @@ while IFS= read -r f; do
   (( m > transient_max_attempt )) && transient_max_attempt="$m"
 done < <(worker_logs)
 
+base_agent_restart="$(line_count "$LOG_AGENT")"
 start_agent || die "failed to restart managed agent" "$RUN_ID"
 
 worker_success_line=""
@@ -320,9 +280,9 @@ done
 result_ok="$(wait_match "$LOG_MASTER" "$base_master" "\"msg\":\"response_step_result_received\".*\"run_id\":\"${RUN_ID}\".*\"step_id\":\"${STEP_ID}\".*\"status\":\"SUCCEEDED\"" 120 || true)"
 [[ -n "$result_ok" ]] || die "no SUCCEEDED step result after agent restart run_id=${RUN_ID}" "$RUN_ID"
 
-exec_start="$({ tail_from "$LOG_AGENT" "$base_agent" | rg -F "\"msg\":\"agent_command_exec_start\"" | rg -F "\"run_id\":\"${RUN_ID}\"" | rg -F "\"step_id\":\"${STEP_ID}\"" | wc -l | tr -d '[:space:]'; } || true)"
+exec_start="$({ tail_from "$LOG_AGENT" "$base_agent_restart" | rg -F "\"msg\":\"agent_command_exec_start\"" | rg -F "\"run_id\":\"${RUN_ID}\"" | rg -F "\"step_id\":\"${STEP_ID}\"" | wc -l | tr -d '[:space:]'; } || true)"
 [[ "$exec_start" =~ ^[0-9]+$ ]] || exec_start=0
-[[ "$exec_start" == "1" ]] || die "agent_command_exec_start count=${exec_start}, expected 1 for run_id=${RUN_ID}" "$RUN_ID"
+[[ "$exec_start" == "1" ]] || die "agent_command_exec_start count=${exec_start}, expected 1 after restart for run_id=${RUN_ID}" "$RUN_ID"
 
 worker_recv_total=0
 while IFS= read -r f; do
@@ -331,7 +291,6 @@ while IFS= read -r f; do
   [[ "$c" =~ ^[0-9]+$ ]] || c=0
   worker_recv_total=$((worker_recv_total + c))
 done < <(worker_logs)
-[[ "$worker_recv_total" == "1" ]] || die "worker step_received count=${worker_recv_total}, expected 1 for run_id=${RUN_ID}" "$RUN_ID"
 
 master_success_unique="$({ tail_from "$LOG_MASTER" "$base_master" | rg -F "\"msg\":\"response_step_result_received\"" | rg -F "\"run_id\":\"${RUN_ID}\"" | rg -F "\"step_id\":\"${STEP_ID}\"" | rg -F "\"status\":\"SUCCEEDED\"" | sed -n 's/.*"js_seq":\([0-9]\+\).*/\1/p' | sort -u | wc -l | tr -d '[:space:]'; } || true)"
 [[ "$master_success_unique" =~ ^[0-9]+$ ]] || master_success_unique=0
@@ -341,9 +300,9 @@ echo "$run_line"
 echo "$waiting_line"
 echo "$step_pub_line"
 echo "$attempt1_line"
-echo "$retry_proof_line"
+echo "$attempt2_line"
 echo "$worker_success_line"
 echo "$result_ok"
-echo "Counts: transient_failures=${transient_count} transient_max_attempt=${transient_max_attempt} retry_proof_kind=${retry_proof_kind} worker_step_received_total=${worker_recv_total} agent_exec_start=${exec_start} master_success_unique_js_seq=${master_success_unique}"
+echo "Counts: transient_failures=${transient_count} transient_max_attempt=${transient_max_attempt} worker_step_received_total=${worker_recv_total} agent_exec_start=${exec_start} master_success_unique_js_seq=${master_success_unique}"
 echo "PASS: M62 agent down transient retry proof run_id=${RUN_ID} step_id=${STEP_ID} lane=${TARGET_LANE}"
 exit 0

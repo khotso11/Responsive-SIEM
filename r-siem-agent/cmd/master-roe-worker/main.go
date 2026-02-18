@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -676,10 +677,6 @@ func processStep(runtime *workerRuntime, msg *nats.Msg) error {
 			return msg.Ack()
 		case "FAILED_TRANSIENT":
 			priorState = &state
-			if err := runtime.publishResult(step, state); err != nil {
-				runtime.logger.Error("roe_step_result_publish_failed", slog.String("error", err.Error()))
-				return nil
-			}
 			if delayMs := retryDelayMs(time.Now().UnixMilli(), &state); delayMs > 0 {
 				if err := msg.NakWithDelay(time.Duration(delayMs) * time.Millisecond); err != nil {
 					runtime.logger.Error("roe_step_nak_failed", slog.String("error", err.Error()))
@@ -911,10 +908,6 @@ func processStep(runtime *workerRuntime, msg *nats.Msg) error {
 				runtime.logger.Error("roe_step_kv_error", slog.String("error", err.Error()))
 				return nil
 			}
-			if err := runtime.publishResult(step, final); err != nil {
-				runtime.logger.Error("roe_step_result_publish_failed", slog.String("error", err.Error()))
-				return nil
-			}
 			runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "roe_connector_retry",
 				slog.Int("attempt", attempt),
 				slog.Int64("sleep_ms", backoff),
@@ -1050,14 +1043,15 @@ func processStep(runtime *workerRuntime, msg *nats.Msg) error {
 	if err := runtime.maybeFailAfterKV(step, jsSeq); err != nil {
 		return err
 	}
-	if err := runtime.publishResult(step, final); err != nil {
-		runtime.logger.Error("roe_step_result_publish_failed", slog.String("error", err.Error()))
-		return nil
-	}
 	runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "step_succeeded",
 		slog.String("run_id", step.RunID),
 		slog.String("step_id", step.StepID),
 	)
+	runtime.maybeDelayResultPublish(step)
+	if err := runtime.publishResult(step, final); err != nil {
+		runtime.logger.Error("roe_step_result_publish_failed", slog.String("error", err.Error()))
+		return nil
+	}
 	runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "roe_connector_terminal",
 		slog.String("status", final.Status),
 	)
@@ -1267,6 +1261,23 @@ func (r *workerRuntime) maybeFailAfterKV(step stepMessage, jsSeq uint64) error {
 		slog.Uint64("js_seq", jsSeq),
 	)
 	return fmt.Errorf("test_fail_after_kv")
+}
+
+func (r *workerRuntime) maybeDelayResultPublish(step stepMessage) {
+	raw := strings.TrimSpace(os.Getenv("RSIEM_TEST_DELAY_RESULT_PUBLISH_MS"))
+	if raw == "" || raw == "0" {
+		return
+	}
+	delayMs, err := strconv.Atoi(raw)
+	if err != nil || delayMs <= 0 {
+		return
+	}
+	r.logger.LogAttrs(context.Background(), slog.LevelInfo, "test_delay_result_publish",
+		slog.Int("delay_ms", delayMs),
+		slog.String("run_id", step.RunID),
+		slog.String("step_id", step.StepID),
+	)
+	time.Sleep(time.Duration(delayMs) * time.Millisecond)
 }
 
 func (r *workerRuntime) getTerminalResult(key string) ([]byte, bool, error) {

@@ -214,3 +214,82 @@ M62 invalid user from 10.0.0.167 ts=1771253427
 M62 invalid user from 10.0.0.142 ts=1771254662
 M62 invalid user from 10.0.0.78 ts=1771254958
 M62 invalid user from 10.0.0.124 ts=1771255184
+M62 invalid user from 10.0.0.88 ts=1771329128
+M62 invalid user from 10.0.0.20 ts=1771329780
+M62 invalid user from 10.0.0.143 ts=1771330083
+M62 invalid user from 10.0.0.71 ts=1771330371
+M62 invalid user from 10.0.0.168 ts=1771331008
+M62 invalid user from 10.0.0.145 ts=1771331525
+M62 invalid user from 10.0.0.135 ts=1771332235
+M62 invalid user from 10.0.0.133 ts=1771332413
+M62 invalid user from 10.0.0.45 ts=1771332685
+M62 invalid user from 10.0.0.63 ts=1771332883
+M62 invalid user from 10.0.0.161 ts=1771332981
+M62 invalid user from 10.0.0.169 ts=1771332989
+M62 invalid user from 10.0.0.177 ts=1771332997
+M63 invalid user from 10.0.0.32 ts=1771333752
+M63 invalid user from 10.0.0.46 ts=1771333766
+M63 invalid user from 10.0.0.57 ts=1771333777
+M65 invalid user from 10.0.0.85 ts=1771335425
+M65 invalid user from 10.0.0.98 ts=1771335438
+M65 invalid user from 10.0.0.117 ts=1771335457
+M65 invalid user from 10.0.0.196 ts=1771335716
+M65 invalid user from 10.0.0.38 ts=1771335738
+M66 invalid user from 10.0.0.159 ts=1771336399
+M66 invalid user from 10.0.0.170 ts=1771336410
+M67 invalid user from 10.0.0.59 ts=1771337739
+M67 invalid user from 10.0.0.152 ts=1771337832
+M68 invalid user from 10.0.0.128 ts=1771338528
+M68 invalid user from 10.0.0.113 ts=1771338693
+M68 invalid user from 10.0.0.21 ts=1771338781
+M68 invalid user from 10.0.0.30 ts=1771338790
+M68 invalid user from 10.0.0.39 ts=1771338799
+M68 invalid user from 10.0.0.48 ts=1771338808
+M68 invalid user from 10.0.0.57 ts=1771338817
+M69 invalid user from 10.0.0.122 ts=1771339602
+M69 invalid user from 10.0.0.50 ts=1771339710
+M69 invalid user from 10.0.0.111 ts=1771339771
+M69 invalid user from 10.0.0.116 ts=1771339776
+M69 invalid user from 10.0.0.121 ts=1771339781
+M69 invalid user from 10.0.0.126 ts=1771339786
+M69 invalid user from 10.0.0.132 ts=1771339792
+DEMO invalid user from 10.0.0.61 ts=1771342781
+FAILED login user=khotso src=10.0.0.8 ts=1771343919
+FAILED login user=khotso src=10.0.0.8 ts=1771343950
+FAILED login user=khotso src=10.0.0.8 ts=1771343975
+FAILED login user=khotso src=10.0.0.8 ts=1771343993
+FAILED login user=khotso src=10.0.0.8 ts=1771344044
+FAILED login user=khotso src=10.0.0.8 ts=1771344109
+FAILED login user=khotso src=10.0.0.8 ts=1771344534
+FAILED login user=khotso src=10.0.0.133 ts=1771345013
+FAILED login user=khotso src=10.0.0.47 ts=1771345107
+FAILED login user=khotso src=10.0.0.108 ts=1771345168
+FAILED login user=khotso src=10.0.0.179 ts=1771345239
+FAILED login user=khotso src=10.0.0.89 ts=1771345329
+FAILED login user=khotso src=10.0.0.90 ts=1771345330
+FAILED login user=khotso src=10.0.0.23 ts=1771345443
+FAILED login user=khotso src=10.0.0.123 ts=1771345543
+FAILED login user=khotso src=10.0.0.126 ts=1771345546
+FAILED login user=khotso src=10.0.0.129 ts=1771345549
+M63 invalid user from 10.0.0.129 ts=1771346449
+M63 invalid user from 10.0.0.197 ts=1771346517
+M63 invalid user from 10.0.0.196 ts=1771346696
+M63 invalid user from 10.0.0.164 ts=1771346844
+M63 invalid user from 10.0.0.56 ts=1771346916
+M63 invalid user from 10.0.0.93 ts=1771347133
+M66 invalid user from 10.0.0.130 ts=1771347170
+M63 invalid user from 10.0.0.152 ts=1771347192
+M63 invalid user from 10.0.0.36 ts=1771347256
+M63 invalid user from 10.0.0.89 ts=1771347489
+M66 invalid user from 10.0.0.105 ts=1771347505
+M63 invalid user from 10.0.0.159 ts=1771347739
+M66 invalid user from 10.0.0.189 ts=1771347769
+M63 invalid user from 10.0.0.93 ts=1771347853
+M63 invalid user from 10.0.0.106 ts=1771394846
+M63 invalid user from 10.0.0.89 ts=1771395189
+M63 invalid user from 10.0.0.71 ts=1771395351
+M66 invalid user from 10.0.0.84 ts=1771395364
+M68 invalid user from 10.0.0.95 ts=1771395375
+M63 invalid user from 10.0.0.137 ts=1771396317
+M66 invalid user from 10.0.0.148 ts=1771396328
+M68 invalid user from 10.0.0.160 ts=1771396340

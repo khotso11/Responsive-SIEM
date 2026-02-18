@@ -327,14 +327,18 @@ run_milestone() {
       set +e
       "$script" < "$tmp_in" \
         | tee "$tmp_out" \
-        | sed -E 's/^ACTION: start .*worker now in another terminal:.*/INFO: worker auto-start handled by suite/'
+        | sed -E \
+            -e 's/^ACTION: start .*worker now in another terminal:.*/INFO: worker auto-start handled by suite/' \
+            -e 's#^cd ~/projects/r-siem-agent && mkdir -p logs && go run -mod=vendor ./cmd/master-roe-worker.*#INFO: (worker start command suppressed)#'
       rc="${PIPESTATUS[0]}"
       set -e
     else
       set +e
       bash "$script" < "$tmp_in" \
         | tee "$tmp_out" \
-        | sed -E 's/^ACTION: start .*worker now in another terminal:.*/INFO: worker auto-start handled by suite/'
+        | sed -E \
+            -e 's/^ACTION: start .*worker now in another terminal:.*/INFO: worker auto-start handled by suite/' \
+            -e 's#^cd ~/projects/r-siem-agent && mkdir -p logs && go run -mod=vendor ./cmd/master-roe-worker.*#INFO: (worker start command suppressed)#'
       rc="${PIPESTATUS[0]}"
       set -e
     fi

@@ -556,3 +556,6 @@ FAILED login user=khotso src=10.0.9.65 ts=1771498845
 FAILED login user=khotso src=10.0.0.90 ts=1771510570
 FAILED login user=khotso src=10.0.0.98 ts=1771510578
 FAILED login user=khotso src=10.0.9.142 ts=1771510622
+FAILED login user=khotso src=10.0.0.64 ts=1771513784
+FAILED login user=khotso src=10.0.0.71 ts=1771513791
+FAILED login user=khotso src=10.0.9.102 ts=1771513822

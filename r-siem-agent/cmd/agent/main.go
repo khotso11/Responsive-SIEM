@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"r-siem-agent/internal/config"
@@ -53,6 +54,7 @@ func main() {
 		"transport_tls_ca", cfg.TransportTLSCA(),
 		"transport_tls_cert", cfg.TransportTLSCert(),
 		"transport_tls_server_name", cfg.TransportTLSServerName(),
+		"transport_tls_server_cert_pin_sha256", cfg.TransportTLSServerCertPinSHA256(),
 		"quarantine_root", cfg.AgentQuarantineRoot(),
 		"quarantine_allowed_source_roots", cfg.AgentQuarantineAllowedSourceRoots(),
 	)
@@ -62,20 +64,24 @@ func main() {
 	ctx, cancel := context.WithCancel(baseCtx)
 	defer cancel()
 
-	listenerErrs := make(chan error, 1)
-	policy := quarantinePolicy{
-		QuarantineRoot:     cfg.AgentQuarantineRoot(),
-		AllowedSourceRoots: cfg.AgentQuarantineAllowedSourceRoots(),
-	}
-	go func() {
-		listenerErrs <- runCommandListener(ctx, logger, commandNatsURL(), policy)
-	}()
-	go func() {
-		if err := <-listenerErrs; err != nil {
-			logger.Error("agent_command_listener_failed", "error", err)
-			cancel()
+	if !strings.EqualFold(strings.TrimSpace(os.Getenv("RSIEM_AGENT_DISABLE_COMMAND_LISTENER")), "1") {
+		listenerErrs := make(chan error, 1)
+		policy := quarantinePolicy{
+			QuarantineRoot:     cfg.AgentQuarantineRoot(),
+			AllowedSourceRoots: cfg.AgentQuarantineAllowedSourceRoots(),
 		}
-	}()
+		go func() {
+			listenerErrs <- runCommandListener(ctx, logger, commandNatsURL(), policy)
+		}()
+		go func() {
+			if err := <-listenerErrs; err != nil {
+				logger.Error("agent_command_listener_failed", "error", err)
+				cancel()
+			}
+		}()
+	} else {
+		logger.Info("agent_command_listener_disabled", "source", "RSIEM_AGENT_DISABLE_COMMAND_LISTENER")
+	}
 
 	sup := supervisor.New(cfg, logger)
 	if err := sup.Run(ctx); err != nil {

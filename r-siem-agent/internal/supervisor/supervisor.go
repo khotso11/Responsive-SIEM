@@ -97,6 +97,8 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			s.cfg.TransportTLSCert(),
 			s.cfg.TransportTLSKey(),
 			s.cfg.TransportTLSServerName(),
+			s.cfg.TransportTLSServerCertPinSHA256(),
+			s.cfg.AgentInstanceID(),
 		)
 	default:
 		return fmt.Errorf("unsupported transport mode: %s", s.cfg.TransportMode())

@@ -1,0 +1,35 @@
+log:
+  level: INFO
+heartbeat:
+  interval_seconds: 2
+mock:
+  interval_seconds: 1
+agent:
+  name: r-siem-agent
+  instance_id: dev-instance
+  quarantine_root: tmp/quarantine
+  quarantine_allowed_source_roots:
+    - tmp
+lanes:
+  fast_buffer: 100
+  standard_buffer: 100
+wal:
+  path: ./data/agent.fr02.wal
+  fsync: false
+batch:
+  fast:
+    max_size: 2
+    max_latency_ms: 200
+  standard:
+    max_size: 2
+    max_latency_ms: 200
+transport:
+  mode: grpc_mtls
+  addr: 127.0.0.1:27877
+  ack_delay_ms: 10
+  ack_drop_rate: 0.0
+  tls:
+    ca: configs/certs/ca.pem
+    cert: configs/certs/agent.pem
+    key: configs/certs/agent-key.pem
+    server_name: master.local

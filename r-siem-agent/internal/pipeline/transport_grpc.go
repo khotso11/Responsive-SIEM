@@ -2,13 +2,16 @@ package pipeline
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,26 +19,29 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/metadata"
 )
 
 // GRPCMTLSTransportSession implements a gRPC-based transport with mTLS.
 type GRPCMTLSTransportSession struct {
-	logger *slog.Logger
-	addr   string
-	creds  credentials.TransportCredentials
+	logger  *slog.Logger
+	addr    string
+	creds   credentials.TransportCredentials
+	agentID string
 }
 
 // NewGRPCMTLSTransportSession wires a gRPC transport session.
-func NewGRPCMTLSTransportSession(logger *slog.Logger, addr, caPath, certPath, keyPath, serverName string) (*GRPCMTLSTransportSession, error) {
-	creds, err := loadClientCredentials(caPath, certPath, keyPath, serverName)
+func NewGRPCMTLSTransportSession(logger *slog.Logger, addr, caPath, certPath, keyPath, serverName, serverCertPin, agentID string) (*GRPCMTLSTransportSession, error) {
+	creds, err := loadClientCredentials(logger, caPath, certPath, keyPath, serverName, serverCertPin)
 	if err != nil {
 		return nil, err
 	}
 
 	return &GRPCMTLSTransportSession{
-		logger: logger,
-		addr:   addr,
-		creds:  creds,
+		logger:  logger,
+		addr:    addr,
+		creds:   creds,
+		agentID: strings.TrimSpace(agentID),
 	}, nil
 }
 
@@ -60,6 +66,11 @@ func (s *GRPCMTLSTransportSession) Run(ctx context.Context, batches <-chan Batch
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
+			s.logger.LogAttrs(context.Background(), slog.LevelWarn, "grpc_mtls_handshake_failed",
+				slog.String("reason", classifyClientDialError(err)),
+				slog.String("error", err.Error()),
+				slog.String("addr", s.addr),
+			)
 			s.logger.Warn("grpc transport dial failed", "error", err, "addr", s.addr)
 			select {
 			case <-ctx.Done():
@@ -103,7 +114,11 @@ func (s *GRPCMTLSTransportSession) Run(ctx context.Context, batches <-chan Batch
 
 func (s *GRPCMTLSTransportSession) handleStream(ctx context.Context, conn *grpc.ClientConn, batches <-chan Batch, acks chan<- Ack) error {
 	client := pb.NewAgentIngestClient(conn)
-	stream, err := client.Stream(ctx)
+	streamCtx := ctx
+	if s.agentID != "" {
+		streamCtx = metadata.AppendToOutgoingContext(ctx, "x-rsiem-agent-id", s.agentID)
+	}
+	stream, err := client.Stream(streamCtx)
 	if err != nil {
 		return err
 	}
@@ -204,7 +219,7 @@ func (s *GRPCMTLSTransportSession) readerLoop(ctx context.Context, stream pb.Age
 	}
 }
 
-func loadClientCredentials(caPath, certPath, keyPath, serverName string) (credentials.TransportCredentials, error) {
+func loadClientCredentials(logger *slog.Logger, caPath, certPath, keyPath, serverName, serverCertPin string) (credentials.TransportCredentials, error) {
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
 		return nil, fmt.Errorf("load client certs: %w", err)
@@ -220,12 +235,75 @@ func loadClientCredentials(caPath, certPath, keyPath, serverName string) (creden
 		return nil, fmt.Errorf("invalid ca certs at %s", caPath)
 	}
 
+	normalizedPin, err := normalizeFingerprint(serverCertPin)
+	if err != nil {
+		return nil, fmt.Errorf("invalid transport.tls.server_cert_pin_sha256: %w", err)
+	}
+
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		RootCAs:      pool,
 		MinVersion:   tls.VersionTLS12,
 		ServerName:   serverName,
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			if len(cs.PeerCertificates) == 0 {
+				return fmt.Errorf("server certificate missing")
+			}
+			serverFP := certFingerprintSHA256(cs.PeerCertificates[0])
+			if normalizedPin != "" && !strings.EqualFold(serverFP, normalizedPin) {
+				return fmt.Errorf("server fingerprint mismatch")
+			}
+			logger.LogAttrs(context.Background(), slog.LevelInfo, "grpc_mtls_client_connected",
+				slog.String("server_name", serverName),
+				slog.String("server_fingerprint_sha256", serverFP),
+				slog.Bool("pinning_enabled", normalizedPin != ""),
+			)
+			return nil
+		},
 	}
 
 	return credentials.NewTLS(tlsConfig), nil
+}
+
+func certFingerprintSHA256(cert *x509.Certificate) string {
+	sum := sha256.Sum256(cert.Raw)
+	return strings.ToLower(hex.EncodeToString(sum[:]))
+}
+
+func normalizeFingerprint(raw string) (string, error) {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	s = strings.ReplaceAll(s, ":", "")
+	if s == "" {
+		return "", nil
+	}
+	if len(s) != 64 {
+		return "", fmt.Errorf("must be 64 hex chars")
+	}
+	for _, ch := range s {
+		if !strings.ContainsRune("0123456789abcdef", ch) {
+			return "", fmt.Errorf("must be hexadecimal")
+		}
+	}
+	return s, nil
+}
+
+func classifyClientDialError(err error) string {
+	if err == nil {
+		return "unknown"
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "certificate required"), strings.Contains(msg, "no certificates"):
+		return "no_client_certificate"
+	case strings.Contains(msg, "unknown authority"), strings.Contains(msg, "unknown ca"):
+		return "unknown_ca"
+	case strings.Contains(msg, "identity mismatch"):
+		return "identity_mismatch"
+	case strings.Contains(msg, "fingerprint mismatch"):
+		return "fingerprint_mismatch"
+	case strings.Contains(msg, "expired"), strings.Contains(msg, "not yet valid"):
+		return "certificate_validity"
+	default:
+		return "handshake_error"
+	}
 }

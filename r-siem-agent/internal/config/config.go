@@ -39,6 +39,7 @@ const (
 	defaultMasterDurableFast          = "master-fast"
 	defaultMasterDurableStandard      = "master-standard"
 	defaultMasterServerName           = "master.local"
+	defaultMasterClientIdentitySource = "cert_prefer"
 	defaultConsumerFastWorkers        = 1
 	defaultConsumerStandardWorkers    = 1
 	defaultConsumerPullBatch          = 10
@@ -115,10 +116,11 @@ type TransportConfig struct {
 
 // TransportTLSConfig carries TLS certificate settings.
 type TransportTLSConfig struct {
-	CA         string `yaml:"ca"`
-	Cert       string `yaml:"cert"`
-	Key        string `yaml:"key"`
-	ServerName string `yaml:"server_name"`
+	CA                  string `yaml:"ca"`
+	Cert                string `yaml:"cert"`
+	Key                 string `yaml:"key"`
+	ServerName          string `yaml:"server_name"`
+	ServerCertPinSHA256 string `yaml:"server_cert_pin_sha256"`
 }
 
 // Load reads and validates the configuration from disk.
@@ -430,6 +432,11 @@ func (c *Config) TransportTLSServerName() string {
 	return c.Transport.TLS.ServerName
 }
 
+// TransportTLSServerCertPinSHA256 returns optional server leaf certificate pin.
+func (c *Config) TransportTLSServerCertPinSHA256() string {
+	return c.Transport.TLS.ServerCertPinSHA256
+}
+
 // BatchFastMaxSize returns the FAST lane batch max size.
 func (c *Config) BatchFastMaxSize() int {
 	return c.Batch.Fast.MaxSize
@@ -480,9 +487,13 @@ type MasterTransportConfig struct {
 
 // MasterTLSConfig captures TLS cert paths for the master transport.
 type MasterTLSConfig struct {
-	CA   string `yaml:"ca"`
-	Cert string `yaml:"cert"`
-	Key  string `yaml:"key"`
+	CA                             string   `yaml:"ca"`
+	Cert                           string   `yaml:"cert"`
+	Key                            string   `yaml:"key"`
+	ClientIdentity                 string   `yaml:"client_identity"`
+	ClientIdentitySource           string   `yaml:"client_identity_source"`
+	ClientFingerprintAllowlist     []string `yaml:"client_fingerprint_allowlist"`
+	ClientFingerprintAllowlistPath string   `yaml:"client_fingerprint_allowlist_path"`
 }
 
 // JetStreamConfig configures the JetStream publisher boundary.
@@ -540,6 +551,10 @@ func (c *MasterConfig) applyDefaults() {
 	if strings.TrimSpace(c.Transport.ServerName) == "" {
 		c.Transport.ServerName = defaultMasterServerName
 	}
+	if strings.TrimSpace(c.Transport.TLS.ClientIdentitySource) == "" {
+		c.Transport.TLS.ClientIdentitySource = defaultMasterClientIdentitySource
+	}
+	c.Transport.TLS.ClientIdentitySource = strings.ToLower(strings.TrimSpace(c.Transport.TLS.ClientIdentitySource))
 
 	if c.Consumer.FastWorkers <= 0 {
 		c.Consumer.FastWorkers = defaultConsumerFastWorkers
@@ -609,6 +624,11 @@ func (c *MasterConfig) validate() error {
 	if strings.ToLower(c.Transport.Mode) != "grpc_mtls" {
 		return fmt.Errorf("unsupported transport mode: %s", c.Transport.Mode)
 	}
+	switch strings.ToLower(strings.TrimSpace(c.Transport.TLS.ClientIdentitySource)) {
+	case "cert_only", "cert_prefer", "metadata_only":
+	default:
+		return fmt.Errorf("transport.tls.client_identity_source must be one of cert_only, cert_prefer, metadata_only")
+	}
 
 	if err := requireFile(c.Transport.TLS.CA, "transport.tls.ca"); err != nil {
 		return err
@@ -618,6 +638,11 @@ func (c *MasterConfig) validate() error {
 	}
 	if err := requireFile(c.Transport.TLS.Key, "transport.tls.key"); err != nil {
 		return err
+	}
+	if strings.TrimSpace(c.Transport.TLS.ClientFingerprintAllowlistPath) != "" {
+		if err := requireFile(c.Transport.TLS.ClientFingerprintAllowlistPath, "transport.tls.client_fingerprint_allowlist_path"); err != nil {
+			return err
+		}
 	}
 
 	if strings.TrimSpace(c.JetStream.URL) == "" {
@@ -674,10 +699,14 @@ func (c *MasterConfig) Summary() map[string]any {
 		"listen_addr": c.ListenAddr,
 		"transport": map[string]any{
 			"mode": c.Transport.Mode,
-			"tls": map[string]string{
-				"ca":   c.Transport.TLS.CA,
-				"cert": c.Transport.TLS.Cert,
-				"key":  c.Transport.TLS.Key,
+			"tls": map[string]any{
+				"ca":                                c.Transport.TLS.CA,
+				"cert":                              c.Transport.TLS.Cert,
+				"key":                               c.Transport.TLS.Key,
+				"client_identity":                   c.Transport.TLS.ClientIdentity,
+				"client_identity_source":            c.Transport.TLS.ClientIdentitySource,
+				"client_fingerprint_allowlist_len":  len(c.Transport.TLS.ClientFingerprintAllowlist),
+				"client_fingerprint_allowlist_path": c.Transport.TLS.ClientFingerprintAllowlistPath,
 			},
 			"server_name": c.Transport.ServerName,
 		},

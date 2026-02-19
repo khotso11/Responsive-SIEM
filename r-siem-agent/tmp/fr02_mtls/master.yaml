@@ -1,0 +1,26 @@
+log_level: INFO
+listen_addr: 127.0.0.1:27877
+transport:
+  mode: grpc_mtls
+  tls:
+    ca: configs/certs/ca.pem
+    cert: configs/certs/master.pem
+    key: configs/certs/master-key.pem
+    client_identity: "agent.local"
+    client_identity_source: "cert_only"
+    client_fingerprint_allowlist_path: "tmp/fr02_mtls/allowlist.bad.txt"
+  server_name: master.local
+jetstream:
+  url: nats://127.0.0.1:4222
+  stream: RSIEM
+  subject_fast: rsiem.fast
+  subject_standard: rsiem.standard
+  durable_name_fast: master-fast
+  durable_name_standard: master-standard
+consumer:
+  fast_workers: 1
+  standard_workers: 1
+  pull_batch: 10
+  pull_timeout_ms: 500
+ack_delay_ms: 0
+ack_drop_rate: 0.0

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -31,6 +32,7 @@ var (
 	hostPattern     = regexp.MustCompile(`(?i)\bhost[=: ]+([a-z0-9._-]+)\b`)
 	authFailedA     = regexp.MustCompile(`(?i)^FAILED login user=([a-z0-9._-]+)\s+src=(\d{1,3}(?:\.\d{1,3}){3})\s+ts=([0-9]{9,13})$`)
 	sshdFailed      = regexp.MustCompile(`(?i)Failed password for(?: invalid user)? ([a-z0-9._-]+) from (\d{1,3}(?:\.\d{1,3}){3})`)
+	explicitTSPat   = regexp.MustCompile(`\bts=([0-9]{9,13})\b`)
 )
 
 type Collector struct {
@@ -97,6 +99,11 @@ func (c *Collector) run(ctx context.Context) {
 	}
 	offset := state.Offset
 	c.lastOffset.Store(offset)
+	c.logger.LogAttrs(context.Background(), slog.LevelInfo, "collector_tail_checkpoint_state",
+		slog.String("checkpoint_path", c.cfg.CheckpointPath),
+		slog.Uint64("offset", offset),
+		slog.Bool("resumed_from_checkpoint", offset > 0),
+	)
 
 	c.logger.LogAttrs(context.Background(), slog.LevelInfo, "collector_started",
 		slog.String("path", c.cfg.Path),
@@ -115,6 +122,10 @@ func (c *Collector) run(ctx context.Context) {
 
 	pending := bytes.Buffer{}
 	pendingOffset := offset
+	processedCount := uint64(0)
+	skippedCount := uint64(0)
+	lastProgressLogAt := time.Now()
+	lastProgressProcessed := uint64(0)
 
 	for {
 		if ctx.Err() != nil {
@@ -179,11 +190,15 @@ func (c *Collector) run(ctx context.Context) {
 				line := strings.TrimRight(string(lineBytes), "\r\n")
 				bytesRead := len(lineBytes)
 				pending.Reset()
-				eventID, publishErr := c.publishLine(ctx, line, pendingOffset)
+				processedCount++
+				eventID, published, publishErr := c.publishLine(ctx, line, pendingOffset)
 				if publishErr != nil {
 					offset = pendingOffset
 					pending.Reset()
 					break
+				}
+				if !published {
+					skippedCount++
 				}
 				c.lastOffset.Store(offset)
 				if err := writeCheckpoint(c.cfg.CheckpointPath, checkpointState{Offset: offset}); err != nil {
@@ -194,11 +209,13 @@ func (c *Collector) run(ctx context.Context) {
 						slog.Uint64("offset", offset),
 					)
 				}
-				c.logger.LogAttrs(context.Background(), slog.LevelInfo, "event_published",
-					slog.String("event_idem_key", eventID),
-					slog.Uint64("offset", pendingOffset),
-					slog.Int("bytes", bytesRead),
-				)
+				if published {
+					c.logger.LogAttrs(context.Background(), slog.LevelInfo, "event_published",
+						slog.String("event_idem_key", eventID),
+						slog.Uint64("offset", pendingOffset),
+						slog.Int("bytes", bytesRead),
+					)
+				}
 			}
 			if errors.Is(err, io.EOF) {
 				break
@@ -208,57 +225,61 @@ func (c *Collector) run(ctx context.Context) {
 			}
 		}
 
+		if processedCount > 0 && (processedCount-lastProgressProcessed >= 100 || time.Since(lastProgressLogAt) >= 15*time.Second) {
+			c.logger.LogAttrs(context.Background(), slog.LevelInfo, "collector_tail_progress",
+				slog.Uint64("processed_count", processedCount),
+				slog.Uint64("published_count", c.published.Load()),
+				slog.Uint64("skipped_count", skippedCount),
+				slog.Uint64("offset", offset),
+			)
+			lastProgressLogAt = time.Now()
+			lastProgressProcessed = processedCount
+		}
+
 		time.Sleep(c.cfg.PollInterval)
 	}
 
 	c.logger.LogAttrs(context.Background(), slog.LevelInfo, "collector_tail_stopped")
 }
 
-func (c *Collector) publishLine(ctx context.Context, line string, offset uint64) (string, error) {
+func (c *Collector) publishLine(ctx context.Context, line string, offset uint64) (string, bool, error) {
+	eventType, srcIP, user, tsUnix := extractAuthMetadata(line)
+	if eventType != "auth_failed" {
+		return "", false, nil
+	}
 	source := fmt.Sprintf("tail:%s", c.cfg.Path)
 	eventID := eventIdemKey(source, offset, line)
 	host := extractHost(line)
 	if host == "" {
 		host = resolveHost()
 	}
-	eventType, srcIP, user, tsUnix := extractAuthMetadata(line)
 
 	groupKey := host
 	if srcIP != "" {
 		groupKey = srcIP
-	} else if ip := extractIPv4(line); ip != "" {
-		groupKey = ip
-		srcIP = ip
 	}
 	if user == "" {
-		user = extractUser(line)
+		user = "unknown"
 	}
 	payload := map[string]any{
-		"event_idem_key":       eventID,
-		"observed_at_unix_ms":  time.Now().UnixMilli(),
-		"message":              line,
-		"host":                 host,
-		"group_key":            groupKey,
-		"source":               source,
-	}
-	if user != "" {
-		payload["user"] = user
-	}
-	if srcIP != "" {
-		payload["src_ip"] = srcIP
-	}
-	if eventType != "" {
-		payload["event_type"] = eventType
-	}
-	if tsUnix > 0 {
-		payload["ts"] = tsUnix
+		"event_idem_key":      eventID,
+		"observed_at_unix_ms": time.Now().UnixMilli(),
+		"message":             line,
+		"raw_line":            line,
+		"host":                host,
+		"group_key":           groupKey,
+		"source":              source,
+		"user":                user,
+		"src_ip":              srcIP,
+		"event_type":          eventType,
+		"ts":                  tsUnix,
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
 		c.setError(err)
 		c.errors.Add(1)
 		c.logger.Error("collector_tail_event_encode_failed", slog.String("error", err.Error()))
-		return "", err
+		return "", false, err
 	}
 
 	if _, err := c.js.Publish(c.cfg.Subject, data, nats.MsgId(eventID)); err != nil {
@@ -266,7 +287,7 @@ func (c *Collector) publishLine(ctx context.Context, line string, offset uint64)
 		c.errors.Add(1)
 		c.logger.Error("collector_tail_publish_failed", slog.String("error", err.Error()))
 		time.Sleep(c.cfg.PollInterval)
-		return "", err
+		return "", false, err
 	}
 	c.published.Add(1)
 	c.logger.LogAttrs(context.Background(), slog.LevelInfo, "collector_event_published",
@@ -276,7 +297,7 @@ func (c *Collector) publishLine(ctx context.Context, line string, offset uint64)
 		slog.String("user", user),
 		slog.Int64("ts", tsUnix),
 	)
-	return eventID, nil
+	return eventID, true, nil
 }
 
 func (c *Collector) setError(err error) {
@@ -338,7 +359,7 @@ func extractAuthMetadata(line string) (eventType, srcIP, user string, tsUnix int
 			tsUnix = parsedTs
 		}
 		if tsUnix == 0 {
-			tsUnix = time.Now().Unix()
+			tsUnix = deriveDeterministicTS(line)
 		}
 		return
 	}
@@ -347,17 +368,43 @@ func extractAuthMetadata(line string) (eventType, srcIP, user string, tsUnix int
 		eventType = "auth_failed"
 		user = m[1]
 		srcIP = m[2]
-		tsUnix = time.Now().Unix()
+		tsUnix = deriveTimestamp(line)
 		return
 	}
 
 	if strings.Contains(strings.ToLower(line), "invalid user") {
-		eventType = "invalid_user"
-		tsUnix = time.Now().Unix()
+		srcIP = extractIPv4(line)
+		if srcIP == "" {
+			return "", "", "", 0
+		}
+		eventType = "auth_failed"
+		user = extractUser(line)
+		if user == "" {
+			user = "unknown"
+		}
+		tsUnix = deriveTimestamp(line)
 		return
 	}
 
 	return "", "", "", 0
+}
+
+func deriveTimestamp(line string) int64 {
+	if m := explicitTSPat.FindStringSubmatch(line); len(m) == 2 {
+		if parsed, err := parseUnix(m[1]); err == nil && parsed > 0 {
+			return parsed
+		}
+	}
+	return deriveDeterministicTS(line)
+}
+
+func deriveDeterministicTS(line string) int64 {
+	const baseUnix = int64(1700000000)
+	const spanSeconds = uint64(365 * 24 * 60 * 60)
+
+	sum := sha256.Sum256([]byte(line))
+	value := binary.BigEndian.Uint64(sum[:8])
+	return baseUnix + int64(value%spanSeconds)
 }
 
 func parseUnix(raw string) (int64, error) {

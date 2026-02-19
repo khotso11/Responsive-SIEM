@@ -176,6 +176,40 @@ playbooks:
         backoff_ms: 0
         target_from: "group_key"
 
+  - id: "PB-QUARANTINE-ROLLBACK-DEMO"
+    version: 1
+    enabled: true
+    selectors:
+      rule_ids: ["R-COLLECT-INVALID-USER"]
+    policy_requirements:
+      approval: "required_for_high"
+      max_blast_radius: 1
+    steps:
+      - name: "quarantine_move"
+        action_type: "agent_command"
+        timeout_ms: 5000
+        retries: 0
+        backoff_ms: 0
+        target_from: "group_key"
+        params:
+          command: "quarantine_move"
+          src_path: "tmp/demo_quarantine/file_{target_octet}.txt"
+          quarantine_dir: "tmp/quarantine/{run_id}"
+          dest_path: "tmp/demo_quarantine/file_{target_octet}.txt"
+
+      - name: "quarantine_restore"
+        action_type: "agent_command"
+        timeout_ms: 7000
+        retries: 0
+        backoff_ms: 0
+        target_from: "group_key"
+        params:
+          command: "quarantine_restore"
+          src_path: "tmp/demo_quarantine/file_{target_octet}.txt"
+          quarantine_dir: "tmp/quarantine/{run_id}"
+          dest_path: "tmp/demo_quarantine/file_{target_octet}.txt"
+          delay_ms: 1200
+
   - id: "PB-AGENT-PING-LOCALHOST"
     version: 1
     enabled: true

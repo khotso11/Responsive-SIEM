@@ -153,15 +153,15 @@ func (c *notifyConnector) Execute(ctx context.Context, step Step) (map[string]an
 func (c *notifyConnector) writeArtifact(step Step, message string) error {
 	safeMessage, truncated := truncateForArtifact(message, notifyMessageMaxBytes)
 	record := map[string]any{
-		"time":       time.Now().Format(time.RFC3339Nano),
-		"run_id":     step.RunID,
-		"step_id":    step.StepID,
-		"step_index": step.StepIndex,
-		"step_key":   fmt.Sprintf("step.%s.%s", step.RunID, step.StepID),
+		"time":        time.Now().Format(time.RFC3339Nano),
+		"run_id":      step.RunID,
+		"step_id":     step.StepID,
+		"step_index":  step.StepIndex,
+		"step_key":    fmt.Sprintf("step.%s.%s", step.RunID, step.StepID),
 		"action_type": "notify",
-		"lane":       step.Lane,
-		"message":    safeMessage,
-		"truncated":  truncated,
+		"lane":        step.Lane,
+		"message":     safeMessage,
+		"truncated":   truncated,
 	}
 	data, err := json.Marshal(record)
 	if err != nil {
@@ -227,7 +227,7 @@ func (c *agentCommandStubConnector) RequiredParams() []string {
 }
 
 func (c *agentCommandStubConnector) OptionalParams() []string {
-	return []string{"command", "name", "args", "target", "force"}
+	return []string{"command", "name", "args", "target", "force", "src_path", "quarantine_dir", "dest_path", "delay_ms"}
 }
 
 func (c *agentCommandStubConnector) Execute(ctx context.Context, step Step) (map[string]any, error) {

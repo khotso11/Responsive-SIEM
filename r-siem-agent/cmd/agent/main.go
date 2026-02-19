@@ -53,6 +53,8 @@ func main() {
 		"transport_tls_ca", cfg.TransportTLSCA(),
 		"transport_tls_cert", cfg.TransportTLSCert(),
 		"transport_tls_server_name", cfg.TransportTLSServerName(),
+		"quarantine_root", cfg.AgentQuarantineRoot(),
+		"quarantine_allowed_source_roots", cfg.AgentQuarantineAllowedSourceRoots(),
 	)
 
 	baseCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -61,8 +63,12 @@ func main() {
 	defer cancel()
 
 	listenerErrs := make(chan error, 1)
+	policy := quarantinePolicy{
+		QuarantineRoot:     cfg.AgentQuarantineRoot(),
+		AllowedSourceRoots: cfg.AgentQuarantineAllowedSourceRoots(),
+	}
 	go func() {
-		listenerErrs <- runCommandListener(ctx, logger, commandNatsURL())
+		listenerErrs <- runCommandListener(ctx, logger, commandNatsURL(), policy)
 	}()
 	go func() {
 		if err := <-listenerErrs; err != nil {

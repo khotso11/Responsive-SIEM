@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -50,8 +51,23 @@ func main() {
 		os.Exit(1)
 	}
 
+	tailPath := cfg.Tail.Path
+	pathSource := "config"
+	if strings.TrimSpace(cfg.Tail.Path) == "tmp/demo.log" {
+		pathSource = "default"
+	}
+	if overridePath := strings.TrimSpace(os.Getenv("RSIEM_COLLECTOR_TAIL_PATH")); overridePath != "" {
+		tailPath = overridePath
+		pathSource = "env_override"
+	}
+	logger.LogAttrs(context.Background(), slog.LevelInfo, "collector_tail_input_path_resolved",
+		slog.String("path", tailPath),
+		slog.String("source", pathSource),
+		slog.Bool("override_enabled", pathSource == "env_override"),
+	)
+
 	collector := tail.New(tail.Config{
-		Path:           cfg.Tail.Path,
+		Path:           tailPath,
 		CheckpointPath: cfg.Tail.CheckpointPath,
 		PollInterval:   time.Duration(cfg.Tail.PollMs) * time.Millisecond,
 		Stream:         cfg.JetStream.Stream,

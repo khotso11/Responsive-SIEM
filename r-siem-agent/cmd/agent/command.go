@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -22,6 +23,7 @@ const (
 	defaultAgentNatsURL    = "nats://127.0.0.1:4222"
 	defaultCmdTimeoutMs    = 3000
 	defaultOutputLimitByte = 4096
+	safeDeniedClass        = "SAFE_DENIED"
 )
 
 type commandRequest struct {
@@ -105,9 +107,41 @@ type commandExecutor struct {
 	runner      execRunner
 	allowlist   map[string]execSpec
 	outputLimit int
+	policy      quarantinePolicy
 }
 
-func newCommandExecutor(logger *slog.Logger) *commandExecutor {
+type quarantinePolicy struct {
+	QuarantineRoot     string
+	AllowedSourceRoots []string
+}
+
+type quarantineRecord struct {
+	Version         int    `json:"version"`
+	RunID           string `json:"run_id"`
+	SourcePath      string `json:"source_path"`
+	QuarantinePath  string `json:"quarantine_path"`
+	OriginalDest    string `json:"original_dest_path"`
+	CreatedAtUnixMs int64  `json:"created_at_unix_ms"`
+}
+
+type safeDeniedError struct {
+	reason string
+}
+
+func (e safeDeniedError) Error() string {
+	return "safe_denied:" + e.reason
+}
+
+func denySafe(reason string) error {
+	return safeDeniedError{reason: strings.TrimSpace(reason)}
+}
+
+func isSafeDenied(err error) bool {
+	var denied safeDeniedError
+	return errors.As(err, &denied)
+}
+
+func newCommandExecutor(logger *slog.Logger, policy quarantinePolicy) *commandExecutor {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -128,8 +162,11 @@ func newCommandExecutor(logger *slog.Logger) *commandExecutor {
 		allowlist: map[string]execSpec{
 			"ping":               {Command: "ping", Args: pingBaseArgs, RequiresTarget: true},
 			"uname":              {Command: "uname", Args: []string{"-a"}},
+			"quarantine_move":    {},
+			"quarantine_restore": {},
 		},
 		outputLimit: outputLimit,
+		policy:      normalizeQuarantinePolicy(policy),
 	}
 }
 
@@ -200,11 +237,29 @@ func (e *commandExecutor) handle(ctx context.Context, req commandRequest) comman
 		return commandReply{Status: "error", ExitCode: -1, ErrorClass: "allowlist_denied"}
 	}
 
-	e.logger.LogAttrs(context.Background(), slog.LevelInfo, "agent_command_exec_start",
+	startAttrs := []slog.Attr{
 		slog.String("run_id", runID),
 		slog.String("step_id", stepID),
 		slog.String("command_id", actionKey),
-	)
+	}
+	startAttrs = append(startAttrs, quarantineLogAttrs(actionKey, req.Params)...)
+	e.logger.LogAttrs(context.Background(), slog.LevelInfo, "agent_command_exec_start", startAttrs...)
+
+	if actionKey == "quarantine_move" || actionKey == "quarantine_restore" {
+		reply := e.executeQuarantineCommand(req, actionKey)
+		doneAttrs := []slog.Attr{
+			slog.String("run_id", runID),
+			slog.String("step_id", stepID),
+			slog.String("command_id", actionKey),
+			slog.Int("exit_code", reply.ExitCode),
+			slog.Int64("duration_ms", reply.DurationMs),
+			slog.Bool("stdout_truncated", reply.TruncatedStdout),
+			slog.Bool("stderr_truncated", reply.TruncatedStderr),
+		}
+		doneAttrs = append(doneAttrs, quarantineLogAttrs(actionKey, req.Params)...)
+		e.logger.LogAttrs(context.Background(), slog.LevelInfo, "agent_command_exec_done", doneAttrs...)
+		return reply
+	}
 
 	if spec.RequiresTarget {
 		target := strings.TrimSpace(req.Target)
@@ -287,14 +342,14 @@ func (e *commandExecutor) handle(ctx context.Context, req commandRequest) comman
 	}
 }
 
-func runCommandListener(ctx context.Context, logger *slog.Logger, natsURL string) error {
+func runCommandListener(ctx context.Context, logger *slog.Logger, natsURL string, policy quarantinePolicy) error {
 	nc, err := nats.Connect(natsURL, nats.Name("r-siem-agent"))
 	if err != nil {
 		return err
 	}
 	defer nc.Close()
 
-	executor := newCommandExecutor(logger)
+	executor := newCommandExecutor(logger, policy)
 	sub, err := nc.Subscribe(agentCommandSubject, func(msg *nats.Msg) {
 		if msg.Reply == "" {
 			return
@@ -344,6 +399,627 @@ func commandIdentifier(params map[string]any) string {
 		}
 	}
 	return ""
+}
+
+func (e *commandExecutor) executeQuarantineCommand(req commandRequest, commandID string) commandReply {
+	start := time.Now()
+	paths, delayMs, err := e.resolveQuarantinePaths(req.RunID, req.Target, req.Params, commandID)
+	if err != nil {
+		class := "invalid_input"
+		if isSafeDenied(err) {
+			class = safeDeniedClass
+		}
+		return commandReply{
+			Status:     "error",
+			ExitCode:   3,
+			DurationMs: time.Since(start).Milliseconds(),
+			Stderr:     err.Error(),
+			ErrorClass: class,
+		}
+	}
+
+	switch commandID {
+	case "quarantine_move":
+		dest := filepath.Join(paths.QuarantineDir, filepath.Base(paths.SourcePath))
+		recordPath := quarantineRecordPath(paths.QuarantineDir, filepath.Base(paths.SourcePath))
+		srcExists, srcErr := pathExists(paths.SourcePath)
+		destExists, destErr := pathExists(dest)
+		if srcErr != nil || destErr != nil {
+			return commandReply{
+				Status:     "error",
+				ExitCode:   1,
+				DurationMs: time.Since(start).Milliseconds(),
+				Stderr:     "stat_failed",
+				ErrorClass: "exec_failed",
+			}
+		}
+		if paths.SourcePath == dest || (!srcExists && destExists) {
+			if err := ensureQuarantineRecord(recordPath, quarantineRecord{
+				Version:         1,
+				RunID:           req.RunID,
+				SourcePath:      paths.SourcePath,
+				QuarantinePath:  dest,
+				OriginalDest:    paths.DestPath,
+				CreatedAtUnixMs: time.Now().UnixMilli(),
+			}); err != nil {
+				return commandReply{
+					Status:     "error",
+					ExitCode:   3,
+					DurationMs: time.Since(start).Milliseconds(),
+					Stderr:     err.Error(),
+					ErrorClass: safeDeniedClass,
+				}
+			}
+			return commandReply{
+				Status:     "ok",
+				ExitCode:   0,
+				DurationMs: time.Since(start).Milliseconds(),
+				Stdout:     "already_quarantined",
+			}
+		}
+		if !srcExists {
+			return commandReply{
+				Status:     "error",
+				ExitCode:   1,
+				DurationMs: time.Since(start).Milliseconds(),
+				Stderr:     "source_not_found",
+				ErrorClass: "not_found",
+			}
+		}
+		srcInfo, err := os.Stat(paths.SourcePath)
+		if err != nil {
+			return commandReply{
+				Status:     "error",
+				ExitCode:   1,
+				DurationMs: time.Since(start).Milliseconds(),
+				Stderr:     "stat_failed",
+				ErrorClass: "exec_failed",
+			}
+		}
+		if !srcInfo.Mode().IsRegular() {
+			return commandReply{
+				Status:     "error",
+				ExitCode:   3,
+				DurationMs: time.Since(start).Milliseconds(),
+				Stderr:     "safe_denied:source_not_regular_file",
+				ErrorClass: safeDeniedClass,
+			}
+		}
+		if err := os.MkdirAll(paths.QuarantineDir, 0o700); err != nil {
+			return commandReply{
+				Status:     "error",
+				ExitCode:   1,
+				DurationMs: time.Since(start).Milliseconds(),
+				Stderr:     err.Error(),
+				ErrorClass: "exec_failed",
+			}
+		}
+		if destExists {
+			return commandReply{
+				Status:     "error",
+				ExitCode:   3,
+				DurationMs: time.Since(start).Milliseconds(),
+				Stderr:     "safe_denied:quarantine_destination_exists",
+				ErrorClass: safeDeniedClass,
+			}
+		}
+		if err := os.Rename(paths.SourcePath, dest); err != nil {
+			return commandReply{
+				Status:     "error",
+				ExitCode:   1,
+				DurationMs: time.Since(start).Milliseconds(),
+				Stderr:     err.Error(),
+				ErrorClass: "exec_failed",
+			}
+		}
+		if err := ensureQuarantineRecord(recordPath, quarantineRecord{
+			Version:         1,
+			RunID:           req.RunID,
+			SourcePath:      paths.SourcePath,
+			QuarantinePath:  dest,
+			OriginalDest:    paths.DestPath,
+			CreatedAtUnixMs: time.Now().UnixMilli(),
+		}); err != nil {
+			return commandReply{
+				Status:     "error",
+				ExitCode:   3,
+				DurationMs: time.Since(start).Milliseconds(),
+				Stderr:     err.Error(),
+				ErrorClass: safeDeniedClass,
+			}
+		}
+		return commandReply{
+			Status:     "ok",
+			ExitCode:   0,
+			DurationMs: time.Since(start).Milliseconds(),
+			Stdout:     "moved_to_quarantine",
+		}
+	case "quarantine_restore":
+		if delayMs > 0 {
+			time.Sleep(time.Duration(delayMs) * time.Millisecond)
+		}
+		quarantinePath := filepath.Join(paths.QuarantineDir, filepath.Base(paths.DestPath))
+		recordPath := quarantineRecordPath(paths.QuarantineDir, filepath.Base(paths.DestPath))
+		rec, recErr := loadQuarantineRecord(recordPath)
+		if recErr != nil {
+			return commandReply{
+				Status:     "error",
+				ExitCode:   3,
+				DurationMs: time.Since(start).Milliseconds(),
+				Stderr:     recErr.Error(),
+				ErrorClass: safeDeniedClass,
+			}
+		}
+		if strings.TrimSpace(rec.RunID) != strings.TrimSpace(req.RunID) {
+			return commandReply{
+				Status:     "error",
+				ExitCode:   3,
+				DurationMs: time.Since(start).Milliseconds(),
+				Stderr:     "safe_denied:run_id_record_mismatch",
+				ErrorClass: safeDeniedClass,
+			}
+		}
+		if rec.OriginalDest != paths.DestPath {
+			return commandReply{
+				Status:     "error",
+				ExitCode:   3,
+				DurationMs: time.Since(start).Milliseconds(),
+				Stderr:     "safe_denied:restore_target_mismatch",
+				ErrorClass: safeDeniedClass,
+			}
+		}
+		if rec.QuarantinePath != quarantinePath {
+			return commandReply{
+				Status:     "error",
+				ExitCode:   3,
+				DurationMs: time.Since(start).Milliseconds(),
+				Stderr:     "safe_denied:quarantine_record_mismatch",
+				ErrorClass: safeDeniedClass,
+			}
+		}
+		destExists, destErr := pathExists(paths.DestPath)
+		quarantineExists, quarantineErr := pathExists(quarantinePath)
+		if destErr != nil || quarantineErr != nil {
+			return commandReply{
+				Status:     "error",
+				ExitCode:   1,
+				DurationMs: time.Since(start).Milliseconds(),
+				Stderr:     "stat_failed",
+				ErrorClass: "exec_failed",
+			}
+		}
+		if quarantinePath == paths.DestPath || (destExists && !quarantineExists) {
+			return commandReply{
+				Status:     "ok",
+				ExitCode:   0,
+				DurationMs: time.Since(start).Milliseconds(),
+				Stdout:     "already_restored",
+			}
+		}
+		if !quarantineExists {
+			return commandReply{
+				Status:     "error",
+				ExitCode:   3,
+				DurationMs: time.Since(start).Milliseconds(),
+				Stderr:     "safe_denied:quarantine_file_not_found",
+				ErrorClass: safeDeniedClass,
+			}
+		}
+		qInfo, err := os.Stat(quarantinePath)
+		if err != nil || !qInfo.Mode().IsRegular() {
+			return commandReply{
+				Status:     "error",
+				ExitCode:   3,
+				DurationMs: time.Since(start).Milliseconds(),
+				Stderr:     "safe_denied:quarantine_file_not_regular",
+				ErrorClass: safeDeniedClass,
+			}
+		}
+		if err := os.MkdirAll(filepath.Dir(paths.DestPath), 0o755); err != nil {
+			return commandReply{
+				Status:     "error",
+				ExitCode:   1,
+				DurationMs: time.Since(start).Milliseconds(),
+				Stderr:     err.Error(),
+				ErrorClass: "exec_failed",
+			}
+		}
+		if err := os.Rename(quarantinePath, paths.DestPath); err != nil {
+			return commandReply{
+				Status:     "error",
+				ExitCode:   1,
+				DurationMs: time.Since(start).Milliseconds(),
+				Stderr:     err.Error(),
+				ErrorClass: "exec_failed",
+			}
+		}
+		_ = os.Remove(recordPath)
+		return commandReply{
+			Status:     "ok",
+			ExitCode:   0,
+			DurationMs: time.Since(start).Milliseconds(),
+			Stdout:     "restored_from_quarantine",
+		}
+	default:
+		return commandReply{
+			Status:     "error",
+			ExitCode:   2,
+			DurationMs: time.Since(start).Milliseconds(),
+			Stderr:     "unknown_command",
+			ErrorClass: "allowlist_denied",
+		}
+	}
+}
+
+type quarantinePaths struct {
+	SourcePath    string
+	QuarantineDir string
+	DestPath      string
+}
+
+func quarantineLogAttrs(commandID string, params map[string]any) []slog.Attr {
+	if commandID != "quarantine_move" && commandID != "quarantine_restore" {
+		return nil
+	}
+	return []slog.Attr{
+		slog.String("src_path", strings.TrimSpace(stringParam(params, "src_path"))),
+		slog.String("quarantine_dir", strings.TrimSpace(stringParam(params, "quarantine_dir"))),
+		slog.String("dest_path", strings.TrimSpace(stringParam(params, "dest_path"))),
+	}
+}
+
+func normalizeQuarantinePolicy(policy quarantinePolicy) quarantinePolicy {
+	policy.QuarantineRoot = strings.TrimSpace(policy.QuarantineRoot)
+	if policy.QuarantineRoot == "" {
+		policy.QuarantineRoot = "tmp/quarantine"
+	}
+	cleanRoots := make([]string, 0, len(policy.AllowedSourceRoots))
+	for _, root := range policy.AllowedSourceRoots {
+		root = strings.TrimSpace(root)
+		if root != "" {
+			cleanRoots = append(cleanRoots, root)
+		}
+	}
+	if len(cleanRoots) == 0 {
+		cleanRoots = []string{"tmp"}
+	}
+	policy.AllowedSourceRoots = cleanRoots
+	return policy
+}
+
+func (e *commandExecutor) resolveQuarantinePaths(runID, target string, params map[string]any, commandID string) (quarantinePaths, int64, error) {
+	wd, err := os.Getwd()
+	if err != nil {
+		return quarantinePaths{}, 0, err
+	}
+	runID = strings.TrimSpace(runID)
+	if runID == "" || runID != filepath.Base(runID) || strings.Contains(runID, string(filepath.Separator)) {
+		return quarantinePaths{}, 0, denySafe("invalid_run_id")
+	}
+	srcRaw := expandTemplateVars(stringParam(params, "src_path"), runID, target)
+	quarantineRaw := expandTemplateVars(stringParam(params, "quarantine_dir"), runID, target)
+	destRaw := expandTemplateVars(stringParam(params, "dest_path"), runID, target)
+	if strings.TrimSpace(srcRaw) == "" {
+		return quarantinePaths{}, 0, fmt.Errorf("missing src_path")
+	}
+	if strings.TrimSpace(quarantineRaw) == "" {
+		return quarantinePaths{}, 0, fmt.Errorf("missing quarantine_dir")
+	}
+	if commandID == "quarantine_restore" && strings.TrimSpace(destRaw) == "" {
+		destRaw = srcRaw
+	}
+	sourcePath, err := normalizeUserPath(srcRaw, wd, false)
+	if err != nil {
+		return quarantinePaths{}, 0, denySafe(err.Error())
+	}
+	quarantineDir, err := normalizeUserPath(quarantineRaw, wd, false)
+	if err != nil {
+		return quarantinePaths{}, 0, denySafe(err.Error())
+	}
+	destPath := sourcePath
+	if strings.TrimSpace(destRaw) != "" {
+		destPath, err = normalizeUserPath(destRaw, wd, false)
+		if err != nil {
+			return quarantinePaths{}, 0, denySafe(err.Error())
+		}
+	}
+	if filepath.Base(sourcePath) == "." || filepath.Base(sourcePath) == string(filepath.Separator) {
+		return quarantinePaths{}, 0, denySafe("invalid_src_path")
+	}
+	if filepath.Base(destPath) == "." || filepath.Base(destPath) == string(filepath.Separator) {
+		return quarantinePaths{}, 0, denySafe("invalid_dest_path")
+	}
+	resolvedRoot, err := ensureResolvedDirectory(e.policy.QuarantineRoot, wd)
+	if err != nil {
+		return quarantinePaths{}, 0, denySafe("invalid_quarantine_root")
+	}
+	expectedQuarantineDir := filepath.Join(resolvedRoot, runID)
+	if filepath.Clean(quarantineDir) != filepath.Clean(expectedQuarantineDir) {
+		return quarantinePaths{}, 0, denySafe("quarantine_dir_must_match_root_and_run_id")
+	}
+	resolvedAllowedRoots, err := resolveAllowedRoots(e.policy.AllowedSourceRoots, wd)
+	if err != nil {
+		return quarantinePaths{}, 0, denySafe("invalid_allowed_source_roots")
+	}
+	resolvedSource := sourcePath
+	if commandID == "quarantine_move" {
+		resolvedSource, err = resolveRegularFilePath(sourcePath)
+		if err != nil {
+			return quarantinePaths{}, 0, denySafe(err.Error())
+		}
+	} else {
+		if err := ensureNoSymlinkPath(sourcePath, true); err != nil {
+			return quarantinePaths{}, 0, denySafe(err.Error())
+		}
+	}
+	if !isWithinAny(resolvedAllowedRoots, resolvedSource) {
+		return quarantinePaths{}, 0, denySafe("source_outside_allowed_roots")
+	}
+	if err := ensureNoSymlinkParents(quarantineDir); err != nil {
+		return quarantinePaths{}, 0, denySafe(err.Error())
+	}
+	if !isSubpath(resolvedRoot, quarantineDir) {
+		return quarantinePaths{}, 0, denySafe("quarantine_dir_outside_root")
+	}
+	if err := ensureNoSymlinkPath(destPath, true); err != nil {
+		return quarantinePaths{}, 0, denySafe(err.Error())
+	}
+	if !isWithinAny(resolvedAllowedRoots, destPath) {
+		return quarantinePaths{}, 0, denySafe("dest_outside_allowed_roots")
+	}
+	for _, p := range []string{resolvedSource, quarantineDir, destPath} {
+		if strings.TrimSpace(p) == "" {
+			return quarantinePaths{}, 0, denySafe("empty_resolved_path")
+		}
+	}
+	delayMs, _, err := intParam(params, "delay_ms")
+	if err != nil {
+		return quarantinePaths{}, 0, err
+	}
+	if delayMs < 0 {
+		return quarantinePaths{}, 0, fmt.Errorf("invalid delay_ms")
+	}
+	if delayMs > 10000 {
+		delayMs = 10000
+	}
+	return quarantinePaths{
+		SourcePath:    resolvedSource,
+		QuarantineDir: quarantineDir,
+		DestPath:      destPath,
+	}, delayMs, nil
+}
+
+func normalizeUserPath(raw, wd string, allowAbs bool) (string, error) {
+	// User-supplied src/dest/quarantine paths are normalized and (by default)
+	// must remain repo-relative to prevent absolute-path escape.
+	cleaned := filepath.Clean(strings.TrimSpace(raw))
+	if cleaned == "" || cleaned == "." || cleaned == ".." {
+		return "", fmt.Errorf("invalid_path_syntax")
+	}
+	if strings.Contains(cleaned, ".."+string(filepath.Separator)) || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("path_traversal_detected")
+	}
+	if filepath.IsAbs(cleaned) {
+		if allowAbs {
+			return cleaned, nil
+		}
+		return "", fmt.Errorf("absolute_path_not_allowed")
+	}
+	if wd == "" {
+		return "", fmt.Errorf("missing_workdir")
+	}
+	return filepath.Clean(filepath.Join(wd, cleaned)), nil
+}
+
+func isSubpath(base, path string) bool {
+	rel, err := filepath.Rel(base, path)
+	if err != nil {
+		return false
+	}
+	if rel == "." {
+		return true
+	}
+	return !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != ".."
+}
+
+func resolveRegularFilePath(path string) (string, error) {
+	if err := ensureNoSymlinkPath(path, false); err != nil {
+		return "", err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("source_not_found")
+		}
+		return "", fmt.Errorf("source_stat_failed")
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("source_not_regular_file")
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", fmt.Errorf("source_eval_symlink_failed")
+	}
+	return filepath.Clean(resolved), nil
+}
+
+func ensureResolvedDirectory(raw, wd string) (string, error) {
+	path, err := normalizeUserPath(raw, wd, true)
+	if err != nil {
+		return "", err
+	}
+	if err := ensureNoSymlinkParents(path); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(resolved), nil
+}
+
+func resolveAllowedRoots(rawRoots []string, wd string) ([]string, error) {
+	roots := make([]string, 0, len(rawRoots))
+	for _, raw := range rawRoots {
+		resolved, err := ensureResolvedDirectory(raw, wd)
+		if err != nil {
+			return nil, err
+		}
+		roots = append(roots, resolved)
+	}
+	return roots, nil
+}
+
+func isWithinAny(roots []string, path string) bool {
+	for _, root := range roots {
+		if isSubpath(root, path) {
+			return true
+		}
+	}
+	return false
+}
+
+func ensureNoSymlinkParents(path string) error {
+	if path == "" {
+		return fmt.Errorf("empty_path")
+	}
+	dir := filepath.Clean(path)
+	return ensureNoSymlinkPath(dir, true)
+}
+
+func ensureNoSymlinkPath(path string, allowMissingLeaf bool) error {
+	clean := filepath.Clean(path)
+	vol := filepath.VolumeName(clean)
+	rest := strings.TrimPrefix(clean, vol)
+	if rest == "" {
+		rest = string(filepath.Separator)
+	}
+	cur := vol + string(filepath.Separator)
+	if !strings.HasPrefix(rest, string(filepath.Separator)) {
+		cur = "."
+	}
+	parts := strings.Split(strings.TrimPrefix(rest, string(filepath.Separator)), string(filepath.Separator))
+	for i, part := range parts {
+		if part == "" || part == "." {
+			continue
+		}
+		cur = filepath.Join(cur, part)
+		info, err := os.Lstat(cur)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				if allowMissingLeaf && i == len(parts)-1 {
+					return nil
+				}
+				return nil
+			}
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("symlink_not_allowed")
+		}
+	}
+	return nil
+}
+
+func quarantineRecordPath(quarantineDir, basename string) string {
+	return filepath.Join(quarantineDir, ".quarantine_record_"+basename+".json")
+}
+
+func ensureQuarantineRecord(path string, rec quarantineRecord) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return denySafe("record_dir_create_failed")
+	}
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return denySafe("record_symlink_not_allowed")
+		}
+	}
+	if existing, err := loadQuarantineRecord(path); err == nil {
+		if existing.SourcePath == rec.SourcePath && existing.OriginalDest == rec.OriginalDest && existing.QuarantinePath == rec.QuarantinePath {
+			return nil
+		}
+		return denySafe("record_immutable_mismatch")
+	}
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return denySafe("record_encode_failed")
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return denySafe("record_already_exists")
+		}
+		return denySafe("record_create_failed")
+	}
+	defer f.Close()
+	if _, err := f.Write(data); err != nil {
+		return denySafe("record_write_failed")
+	}
+	return nil
+}
+
+func loadQuarantineRecord(path string) (quarantineRecord, error) {
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return quarantineRecord{}, denySafe("record_symlink_not_allowed")
+		}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return quarantineRecord{}, denySafe("quarantine_record_missing")
+		}
+		return quarantineRecord{}, denySafe("quarantine_record_read_failed")
+	}
+	var rec quarantineRecord
+	if err := json.Unmarshal(data, &rec); err != nil {
+		return quarantineRecord{}, denySafe("quarantine_record_invalid")
+	}
+	return rec, nil
+}
+
+func expandTemplateVars(input, runID, target string) string {
+	value := strings.TrimSpace(input)
+	if value == "" {
+		return ""
+	}
+	target = strings.TrimSpace(target)
+	targetOctet := target
+	if host, _, err := net.SplitHostPort(target); err == nil {
+		target = host
+	}
+	if ip := net.ParseIP(target); ip != nil {
+		s := ip.To4()
+		if s != nil {
+			targetOctet = strconv.Itoa(int(s[3]))
+		}
+	}
+	repl := map[string]string{
+		"{run_id}":         runID,
+		"{{run_id}}":       runID,
+		"{target}":         target,
+		"{{target}}":       target,
+		"{target_octet}":   targetOctet,
+		"{{target_octet}}": targetOctet,
+	}
+	for token, replacement := range repl {
+		value = strings.ReplaceAll(value, token, replacement)
+	}
+	return value
+}
+
+func pathExists(path string) (bool, error) {
+	_, err := os.Stat(path)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return false, err
 }
 
 func buildOutputMessage(result execResult) string {

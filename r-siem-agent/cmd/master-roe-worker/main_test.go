@@ -85,6 +85,16 @@ func TestValidateStepParamsAllowlist(t *testing.T) {
 		t.Fatalf("agent_command allowlist rejected name: %s", reason)
 	}
 
+	if reason := validateStepParams(agentCmd.RequiredParams(), agentCmd.OptionalParams(), map[string]any{
+		"command":        "quarantine_move",
+		"src_path":       "tmp/demo_quarantine/file_42.txt",
+		"quarantine_dir": "tmp/quarantine/run-1",
+		"dest_path":      "tmp/demo_quarantine/file_42.txt",
+		"delay_ms":       10,
+	}); reason != "" {
+		t.Fatalf("agent_command allowlist rejected quarantine params: %s", reason)
+	}
+
 	if reason := validateStepParams(block.RequiredParams(), block.OptionalParams(), map[string]any{
 		"direction": "ingress",
 	}); reason != "" {

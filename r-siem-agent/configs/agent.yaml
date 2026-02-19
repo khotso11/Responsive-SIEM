@@ -7,6 +7,9 @@ mock:
 agent:
   name: r-siem-agent
   instance_id: dev-instance
+  quarantine_root: tmp/quarantine
+  quarantine_allowed_source_roots:
+    - tmp
 lanes:
   fast_buffer: 1000
   standard_buffer: 5000

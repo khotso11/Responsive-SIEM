@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -171,5 +173,69 @@ func TestLimitedBufferTruncates(t *testing.T) {
 	}
 	if !buf.Truncated() {
 		t.Fatalf("expected truncated=true")
+	}
+}
+
+func TestQuarantineMoveRestoreCommands(t *testing.T) {
+	base := t.TempDir()
+	prevWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	defer func() {
+		_ = os.Chdir(prevWD)
+	}()
+	if err := os.Chdir(base); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	if err := os.MkdirAll("srcroot", 0o755); err != nil {
+		t.Fatalf("mkdir srcroot: %v", err)
+	}
+	src := filepath.Join("srcroot", "src.txt")
+	quarantineRoot := filepath.Join("qroot")
+	quarantineDir := filepath.Join(quarantineRoot, "run-1")
+	if err := os.WriteFile(src, []byte("demo"), 0o644); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+
+	exec := newCommandExecutor(slog.Default(), quarantinePolicy{
+		QuarantineRoot:     quarantineRoot,
+		AllowedSourceRoots: []string{"srcroot"},
+	})
+	move := exec.handle(context.Background(), commandRequest{
+		RunID:      "run-1",
+		StepID:     "step-1",
+		ActionType: "agent_command",
+		Params: map[string]any{
+			"command":        "quarantine_move",
+			"src_path":       src,
+			"quarantine_dir": quarantineDir,
+			"dest_path":      src,
+		},
+	})
+	if move.Status != "ok" || move.ExitCode != 0 {
+		t.Fatalf("unexpected move reply: %#v", move)
+	}
+	qFile := filepath.Join(quarantineDir, filepath.Base(src))
+	if _, err := os.Stat(qFile); err != nil {
+		t.Fatalf("expected quarantined file: %v", err)
+	}
+
+	restore := exec.handle(context.Background(), commandRequest{
+		RunID:      "run-1",
+		StepID:     "step-2",
+		ActionType: "agent_command",
+		Params: map[string]any{
+			"command":        "quarantine_restore",
+			"src_path":       src,
+			"quarantine_dir": quarantineDir,
+			"dest_path":      src,
+		},
+	})
+	if restore.Status != "ok" || restore.ExitCode != 0 {
+		t.Fatalf("unexpected restore reply: %#v", restore)
+	}
+	if _, err := os.Stat(src); err != nil {
+		t.Fatalf("expected restored file: %v", err)
 	}
 }

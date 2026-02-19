@@ -491,12 +491,12 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		runFetchLoop(ctx, runtime, resultsFastSub, "FAST", resultsFastQueue, nil)
+		runResultFetchLoop(ctx, runtime, resultsFastSub, "FAST", resultsFastQueue, nil)
 	}()
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		runFetchLoop(ctx, runtime, resultsStandardSub, "STANDARD", resultsStandardQueue, runtime)
+		runResultFetchLoop(ctx, runtime, resultsStandardSub, "STANDARD", resultsStandardQueue, runtime)
 	}()
 	wg.Add(1)
 	go func() {
@@ -784,6 +784,61 @@ func runFetchLoop(ctx context.Context, runtime *roeRuntime, sub *nats.Subscripti
 	}
 }
 
+func runResultFetchLoop(ctx context.Context, runtime *roeRuntime, sub *nats.Subscription, lane string, queue chan *nats.Msg, backpressure *roeRuntime) {
+	timeout := time.Duration(runtime.cfg.Workers.PullTimeoutMs) * time.Millisecond
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		if backpressure != nil {
+			if backpressure.shouldDegrade(len(queue)) {
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+		}
+		msgs, err := sub.Fetch(runtime.cfg.Workers.PullBatch, nats.MaxWait(timeout))
+		if err != nil {
+			if err == nats.ErrTimeout {
+				continue
+			}
+			runtime.logger.Error("roe_fetch_failed", slog.String("lane", lane), slog.String("error", err.Error()))
+			continue
+		}
+		for _, msg := range msgs {
+			runID, stepID, jsSeq, decodeErr := decodeResultLogFields(msg)
+			if decodeErr != nil {
+				runtime.logger.LogAttrs(context.Background(), slog.LevelError, "result_apply_enqueue_failed",
+					slog.String("lane", lane),
+					slog.String("reason", fmt.Sprintf("decode_failed: %v", decodeErr)),
+				)
+				continue
+			}
+			select {
+			case queue <- msg:
+				runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "result_apply_enqueued",
+					slog.String("lane", lane),
+					slog.String("run_id", runID),
+					slog.String("step_id", stepID),
+					slog.Uint64("js_seq", jsSeq),
+				)
+			default:
+				runtime.logger.LogAttrs(context.Background(), slog.LevelError, "result_apply_enqueue_failed",
+					slog.String("lane", lane),
+					slog.String("run_id", runID),
+					slog.String("step_id", stepID),
+					slog.Uint64("js_seq", jsSeq),
+					slog.String("reason", "queue_full"),
+				)
+				if err := msg.NakWithDelay(250 * time.Millisecond); err != nil {
+					runtime.logger.Error("roe_result_nak_failed", slog.String("error", err.Error()))
+				}
+			}
+		}
+	}
+}
+
 func (r *roeRuntime) shouldDegrade(queueLen int) bool {
 	total := queueLen
 	threshold := r.dispatchHighPct * r.dispatchSize / 100
@@ -827,6 +882,21 @@ func runWorker(ctx context.Context, runtime *roeRuntime, queue chan *nats.Msg, l
 }
 
 func runResultWorker(ctx context.Context, runtime *roeRuntime, queue chan *nats.Msg, lane string) {
+	runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "result_apply_worker_started",
+		slog.String("lane", lane),
+	)
+	defer func() {
+		if rec := recover(); rec != nil {
+			runtime.logger.LogAttrs(context.Background(), slog.LevelError, "result_apply_worker_panicked",
+				slog.String("lane", lane),
+				slog.String("panic", fmt.Sprintf("%v", rec)),
+			)
+			return
+		}
+		runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "result_apply_worker_stopped",
+			slog.String("lane", lane),
+		)
+	}()
 	for {
 		select {
 		case <-ctx.Done():
@@ -835,16 +905,43 @@ func runResultWorker(ctx context.Context, runtime *roeRuntime, queue chan *nats.
 			if msg == nil {
 				continue
 			}
+			runID, stepID, jsSeq, _ := decodeResultLogFields(msg)
+			runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "result_apply_attempt",
+				slog.String("lane", lane),
+				slog.String("run_id", runID),
+				slog.String("step_id", stepID),
+				slog.Uint64("js_seq", jsSeq),
+			)
 			if err := processResult(runtime, msg, lane); err != nil {
+				runtime.logger.LogAttrs(context.Background(), slog.LevelError, "result_apply_error",
+					slog.String("lane", lane),
+					slog.String("run_id", runID),
+					slog.String("step_id", stepID),
+					slog.Uint64("js_seq", jsSeq),
+					slog.String("error", err.Error()),
+				)
 				if errors.Is(err, errResultNoAck) {
 					continue
 				}
 				runtime.logger.Error("roe_result_process_failed", slog.String("lane", lane), slog.String("error", err.Error()))
 				continue
 			}
+			runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "result_apply_success",
+				slog.String("lane", lane),
+				slog.String("run_id", runID),
+				slog.String("step_id", stepID),
+				slog.Uint64("js_seq", jsSeq),
+			)
 			if err := msg.Ack(); err != nil {
 				runtime.logger.Error("roe_result_ack_failed", slog.String("lane", lane), slog.String("error", err.Error()))
+				continue
 			}
+			runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "result_ack",
+				slog.String("lane", lane),
+				slog.String("run_id", runID),
+				slog.String("step_id", stepID),
+				slog.Uint64("js_seq", jsSeq),
+			)
 		}
 	}
 }
@@ -1087,13 +1184,42 @@ func processResult(runtime *roeRuntime, msg *nats.Msg, lane string) error {
 		slog.String("status", result.Status),
 		slog.Uint64("js_seq", jsSeq),
 	)
+	runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "result_consumer_after_received",
+		slog.String("run_id", result.RunID),
+		slog.String("step_id", result.StepID),
+		slog.Uint64("js_seq", jsSeq),
+	)
+	runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "result_apply_begin",
+		slog.String("lane", lane),
+		slog.String("run_id", result.RunID),
+		slog.String("step_id", result.StepID),
+		slog.Uint64("js_seq", jsSeq),
+	)
+	outcome := "applied"
+	defer func() {
+		runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "result_apply_done",
+			slog.String("lane", lane),
+			slog.String("run_id", result.RunID),
+			slog.String("step_id", result.StepID),
+			slog.Uint64("js_seq", jsSeq),
+			slog.String("outcome", outcome),
+		)
+	}()
 
 	lockKey := fmt.Sprintf("lock.run.%s", result.RunID)
+	runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "result_apply_lock_attempt",
+		slog.String("run_id", result.RunID),
+		slog.String("step_id", result.StepID),
+		slog.String("lock_key", lockKey),
+		slog.Uint64("js_seq", jsSeq),
+	)
 	locked, err := runtime.acquireResultLock(lockKey, result)
 	if err != nil {
+		outcome = "lock_error"
 		return err
 	}
 	if !locked {
+		outcome = "lock_contended_retry"
 		runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "roe_lock_contended_result",
 			slog.String("run_id", result.RunID),
 			slog.String("step_id", result.StepID),
@@ -1109,9 +1235,16 @@ func processResult(runtime *roeRuntime, msg *nats.Msg, lane string) error {
 		slog.String("step_id", result.StepID),
 		slog.String("lock_key", lockKey),
 	)
+	runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "result_apply_lock_acquired",
+		slog.String("run_id", result.RunID),
+		slog.String("step_id", result.StepID),
+		slog.String("lock_key", lockKey),
+		slog.Uint64("js_seq", jsSeq),
+	)
 	defer runtime.releaseResultLock(lockKey, result)
 
 	resultKey := fmt.Sprintf("result.%s.%s", result.RunID, result.StepID)
+	resultDuplicate := false
 	if entry, err := runtime.resultsKV.Get(resultKey); err == nil {
 		_ = entry
 		runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "response_result_duplicate",
@@ -1119,28 +1252,42 @@ func processResult(runtime *roeRuntime, msg *nats.Msg, lane string) error {
 			slog.String("step_id", result.StepID),
 			slog.String("result_key", resultKey),
 		)
-		return nil
+		resultDuplicate = true
+		outcome = "duplicate_reconciled"
 	} else if !errors.Is(err, nats.ErrKeyNotFound) {
+		outcome = "dedupe_get_error"
 		return err
 	}
-	if err := runtime.persistResultDedupe(resultKey, result, jsSeq); err != nil {
-		return err
+	if !resultDuplicate {
+		if err := runtime.persistResultDedupe(resultKey, result, jsSeq); err != nil {
+			outcome = "dedupe_put_error"
+			return err
+		}
 	}
 	applied := false
 	defer func() {
 		if applied {
 			return
 		}
-		_ = runtime.resultsKV.Delete(resultKey)
+		if !resultDuplicate {
+			_ = runtime.resultsKV.Delete(resultKey)
+		}
 	}()
 
 	runKey := fmt.Sprintf("run.%s", result.RunID)
 	run, err := runtime.getRun(runKey, result)
 	if err != nil {
+		outcome = "load_run_error"
 		return err
 	}
+	prevStatus := run.Status
 	updateRunWithResult(&run, result)
+	if err := runtime.reconcileRunProgress(&run); err != nil {
+		outcome = "reconcile_error"
+		return err
+	}
 	if err := runtime.persistRun(runKey, run); err != nil {
+		outcome = "persist_run_error"
 		return err
 	}
 	runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "response_result_applied",
@@ -1160,11 +1307,51 @@ func processResult(runtime *roeRuntime, msg *nats.Msg, lane string) error {
 		slog.Int("step_failed_safe_count", run.StepFailedSafeCount),
 		slog.Int("step_failed_transient_count", run.StepFailedTransientCount),
 	)
+	if (run.Status == "FAILED_SAFE" || run.Status == "FAILED_TRANSIENT") && prevStatus != run.Status {
+		runtime.logger.LogAttrs(context.Background(), slog.LevelWarn, "response_run_recovery_hint",
+			slog.String("run_id", run.RunID),
+			slog.String("status", run.Status),
+			slog.String("failed_step_id", result.StepID),
+			slog.String("hint", "If quarantine move succeeded and restore did not run, re-run PB-QUARANTINE-ROLLBACK-DEMO for run_id or execute restore using tmp/quarantine/<run_id>."),
+		)
+	}
+	if run.Status == "FAILED_SAFE" && run.StepSucceededCount > 0 && run.StepSucceededCount < run.StepTotal {
+		runtime.logger.LogAttrs(context.Background(), slog.LevelWarn, "response_run_partial_completion",
+			slog.String("run_id", run.RunID),
+			slog.String("status", run.Status),
+			slog.Int("step_succeeded_count", run.StepSucceededCount),
+			slog.Int("step_total", run.StepTotal),
+			slog.String("operator_action", "manual_restore_check_recommended"),
+		)
+	}
 	if err := runtime.exportRunUpdate(run); err != nil {
+		outcome = "export_run_error"
 		return err
+	}
+	if resultDuplicate {
+		outcome = "duplicate_finalized"
+	} else {
+		outcome = "applied"
 	}
 	applied = true
 	return nil
+}
+
+func decodeResultLogFields(msg *nats.Msg) (string, string, uint64, error) {
+	jsSeq := uint64(0)
+	if meta, _ := msg.Metadata(); meta != nil {
+		jsSeq = meta.Sequence.Stream
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(msg.Data, &raw); err != nil {
+		return "", "", jsSeq, err
+	}
+	runID := strings.TrimSpace(stringFieldRaw(raw, "run_id"))
+	stepID := strings.TrimSpace(stringFieldRaw(raw, "step_id"))
+	if runID == "" || stepID == "" {
+		return runID, stepID, jsSeq, fmt.Errorf("missing run_id/step_id")
+	}
+	return runID, stepID, jsSeq, nil
 }
 
 func processApproval(runtime *roeRuntime, msg *nats.Msg) error {
@@ -1457,6 +1644,47 @@ func updateRunWithResult(run *runRecord, result stepResult) {
 	run.StepStatuses[result.StepID] = result.Status
 	run.LastUpdatedAtUnixMs = now
 	recomputeRunCounts(run)
+}
+
+func (r *roeRuntime) reconcileRunProgress(run *runRecord) error {
+	if run == nil {
+		return nil
+	}
+	steps, err := r.loadPlannedSteps(run.RunID)
+	if err != nil {
+		return err
+	}
+	if len(steps) > 0 {
+		run.StepTotal = len(steps)
+	}
+	if run.StepStatuses == nil {
+		run.StepStatuses = make(map[string]string, len(steps))
+	}
+	for _, step := range steps {
+		if _, ok := run.StepStatuses[step.StepID]; ok {
+			continue
+		}
+		resultKey := fmt.Sprintf("result.%s.%s", run.RunID, step.StepID)
+		entry, err := r.resultsKV.Get(resultKey)
+		if err != nil {
+			if errors.Is(err, nats.ErrKeyNotFound) {
+				continue
+			}
+			return err
+		}
+		var rec map[string]any
+		if err := json.Unmarshal(entry.Value(), &rec); err != nil {
+			return err
+		}
+		status := strings.TrimSpace(stringFieldRaw(rec, "status"))
+		if status == "" {
+			continue
+		}
+		run.StepStatuses[step.StepID] = status
+	}
+	recomputeRunCounts(run)
+	run.LastUpdatedAtUnixMs = time.Now().UnixMilli()
+	return nil
 }
 
 func recomputeRunCounts(run *runRecord) {

@@ -74,8 +74,10 @@ type MockConfig struct {
 
 // AgentConfig contains metadata about the running agent instance.
 type AgentConfig struct {
-	Name       string `yaml:"name"`
-	InstanceID string `yaml:"instance_id"`
+	Name                         string   `yaml:"name"`
+	InstanceID                   string   `yaml:"instance_id"`
+	QuarantineRoot               string   `yaml:"quarantine_root"`
+	QuarantineAllowedSourceRoots []string `yaml:"quarantine_allowed_source_roots"`
 }
 
 // LanesConfig exposes buffer sizing knobs for lane queues.
@@ -160,6 +162,13 @@ func (c *Config) applyDefaults() {
 
 	if strings.TrimSpace(c.Agent.InstanceID) == "" {
 		c.Agent.InstanceID = defaultAgentInstanceID
+	}
+
+	if strings.TrimSpace(c.Agent.QuarantineRoot) == "" {
+		c.Agent.QuarantineRoot = "tmp/quarantine"
+	}
+	if len(c.Agent.QuarantineAllowedSourceRoots) == 0 {
+		c.Agent.QuarantineAllowedSourceRoots = []string{"tmp"}
 	}
 
 	if c.Lanes.FastBuffer <= 0 {
@@ -288,6 +297,13 @@ func (c *Config) validate() error {
 		return fmt.Errorf("standard batch max latency must be > 0")
 	}
 
+	if strings.TrimSpace(c.Agent.QuarantineRoot) == "" {
+		return fmt.Errorf("agent.quarantine_root must be set")
+	}
+	if len(c.Agent.QuarantineAllowedSourceRoots) == 0 {
+		return fmt.Errorf("agent.quarantine_allowed_source_roots must contain at least one entry")
+	}
+
 	return nil
 }
 
@@ -324,6 +340,26 @@ func (c *Config) AgentName() string {
 // AgentInstanceID returns the configured agent instance identifier.
 func (c *Config) AgentInstanceID() string {
 	return c.Agent.InstanceID
+}
+
+// AgentQuarantineRoot returns the configured quarantine root directory.
+func (c *Config) AgentQuarantineRoot() string {
+	return strings.TrimSpace(c.Agent.QuarantineRoot)
+}
+
+// AgentQuarantineAllowedSourceRoots returns allowed source root directories.
+func (c *Config) AgentQuarantineAllowedSourceRoots() []string {
+	if len(c.Agent.QuarantineAllowedSourceRoots) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(c.Agent.QuarantineAllowedSourceRoots))
+	for _, root := range c.Agent.QuarantineAllowedSourceRoots {
+		root = strings.TrimSpace(root)
+		if root != "" {
+			out = append(out, root)
+		}
+	}
+	return out
 }
 
 // LaneFastBuffer returns the configured FAST lane buffer size.

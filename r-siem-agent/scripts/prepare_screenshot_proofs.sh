@@ -44,6 +44,11 @@ if [[ -z "$FR02_MASTER_LOG" || ! -f "$FR02_MASTER_LOG" ]]; then
   exit 1
 fi
 
+FR02_T2_LINE="$(sed -n 's/^[[:space:]]*"t2_line":[[:space:]]*"\(.*\)",[[:space:]]*$/\1/p' "$FR02_PROOF_PATH" | head -n 1 | sed 's/\\"/"/g')"
+FR02_T3_LINE="$(sed -n 's/^[[:space:]]*"t3_line":[[:space:]]*"\(.*\)",[[:space:]]*$/\1/p' "$FR02_PROOF_PATH" | head -n 1 | sed 's/\\"/"/g')"
+FR02_T4_LINE="$(sed -n 's/^[[:space:]]*"t4_line":[[:space:]]*"\(.*\)",[[:space:]]*$/\1/p' "$FR02_PROOF_PATH" | head -n 1 | sed 's/\\"/"/g')"
+FR02_T7_LINE="$(sed -n 's/^[[:space:]]*"t7_line":[[:space:]]*"\(.*\)",[[:space:]]*$/\1/p' "$FR02_PROOF_PATH" | head -n 1 | sed 's/\\"/"/g')"
+
 FR05_FINAL_LINE="$(rg '^PASS: FR05 completed \(safety \+ rollback \+ audit\) run_id_ok=.* run_id_fail=.*$' "$FR01_OUT" | tail -n 1 || true)"
 if [[ -z "$FR05_FINAL_LINE" ]]; then
   echo "FAIL: unable to parse FR-05 run IDs from verify_fr01 output" >&2
@@ -79,16 +84,16 @@ awk '/^=== FR-02 mTLS SUMMARY ===/{f=1} f{print} /^proof_log=/{if(f) exit}' "$FR
   rg '^t3=' "${OUT_DIR}/04_FR02_mtls_summary.txt" || true
   rg '^t4=' "${OUT_DIR}/04_FR02_mtls_summary.txt" || true
   echo
-  rg '"msg":"grpc_mtls_handshake_failed".*"reason":"no_client_certificate"' "$FR02_MASTER_LOG" | tail -n 1
-  rg '"msg":"grpc_mtls_handshake_failed".*"reason":"unknown_ca"' "$FR02_MASTER_LOG" | tail -n 1
-  rg '"msg":"grpc_mtls_handshake_failed".*"reason":"identity_mismatch"' "$FR02_MASTER_LOG" | tail -n 1
+  [[ -n "$FR02_T2_LINE" ]] && printf '%s\n' "$FR02_T2_LINE"
+  [[ -n "$FR02_T3_LINE" ]] && printf '%s\n' "$FR02_T3_LINE"
+  [[ -n "$FR02_T4_LINE" ]] && printf '%s\n' "$FR02_T4_LINE"
 } > "${OUT_DIR}/05_FR02_mtls_negative_tests.txt"
 
 {
   rg '^t7=' "${OUT_DIR}/04_FR02_mtls_summary.txt" || true
   echo
-  rg '"msg":"grpc_mtls_client_rejected".*"reason":"fingerprint_not_allowlisted"' "$FR02_MASTER_LOG" | tail -n 1
-  rg '"msg":"grpc_mtls_handshake_failed".*"reason":"fingerprint_not_allowlisted"' "$FR02_MASTER_LOG" | tail -n 1
+  [[ -n "$FR02_T7_LINE" ]] && printf '%s\n' "$FR02_T7_LINE"
+  rg '"msg":"grpc_mtls_handshake_failed".*"reason":"fingerprint_not_allowlisted"' "$FR02_MASTER_LOG" | tail -n 1 || true
 } > "${OUT_DIR}/06_FR02_allowlist_reject.txt"
 
 {

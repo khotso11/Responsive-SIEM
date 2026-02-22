@@ -1,3 +1,8 @@
 .cache/
 data/
 certs/
+
+# ---- runtime logs / demo artifacts (DO NOT COMMIT) ----
+logs/
+demo_artifacts/
+**/*.log

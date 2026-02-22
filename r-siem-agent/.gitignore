@@ -6,3 +6,8 @@ certs/
 logs/
 demo_artifacts/
 **/*.log
+
+# ---- runtime logs / demo artifacts (DO NOT COMMIT) ----
+logs/
+demo_artifacts/
+**/*.log

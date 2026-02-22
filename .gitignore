@@ -1,0 +1,5 @@
+
+# safety net
+**/*.log
+**/logs/
+**/demo_artifacts/

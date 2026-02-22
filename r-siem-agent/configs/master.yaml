@@ -261,6 +261,180 @@ playbooks:
         backoff_ms: 500
         target_from: "group_key"   # src_ip
 
+  - id: "PB-BRUTEFORCE-IP-CONTAIN"
+    version: 1
+    enabled: true
+    selectors:
+      rule_ids: ["R-PB-BRUTEFORCE-IP-CONTAIN"]
+    policy_requirements:
+      approval: "required_for_high"
+      max_blast_radius: 1
+    steps:
+      - name: "contain_bruteforce_ip"
+        action_type: "agent_command"
+        timeout_ms: 3000
+        retries: 0
+        backoff_ms: 0
+        target_from: "global"
+        params:
+          command: "contain_bruteforce_ip"
+          marker_file: "block_ip.txt"
+
+  - id: "PB-PRIVESC-LOCKDOWN"
+    version: 1
+    enabled: true
+    selectors:
+      rule_ids: ["R-PB-PRIVESC-LOCKDOWN"]
+    policy_requirements:
+      approval: "required_for_high"
+      max_blast_radius: 1
+    steps:
+      - name: "lockdown_privesc"
+        action_type: "agent_command"
+        timeout_ms: 3000
+        retries: 0
+        backoff_ms: 0
+        target_from: "global"
+        params:
+          command: "lockdown_privesc"
+          marker_file: "lockdown_enabled.txt"
+
+  - id: "PB-LATERAL-MOVEMENT-HALT"
+    version: 1
+    enabled: true
+    selectors:
+      rule_ids: ["R-PB-LATERAL-MOVEMENT-HALT"]
+    policy_requirements:
+      approval: "required_for_high"
+      max_blast_radius: 1
+    steps:
+      - name: "halt_lateral_movement"
+        action_type: "agent_command"
+        timeout_ms: 3000
+        retries: 0
+        backoff_ms: 0
+        target_from: "global"
+        params:
+          command: "halt_lateral_movement"
+          marker_file: "halt.txt"
+
+  - id: "PB-C2-BEACON-BLOCK"
+    version: 1
+    enabled: true
+    selectors:
+      rule_ids: ["R-PB-C2-BEACON-BLOCK"]
+    policy_requirements:
+      approval: "required_for_high"
+      max_blast_radius: 1
+    steps:
+      - name: "block_c2_beacon"
+        action_type: "agent_command"
+        timeout_ms: 3000
+        retries: 0
+        backoff_ms: 0
+        target_from: "global"
+        params:
+          command: "block_c2_beacon"
+          marker_file: "block_domain_or_ip.txt"
+
+  - id: "PB-RANSOMWARE-KILL-CHAIN-STOP"
+    version: 1
+    enabled: true
+    selectors:
+      rule_ids: ["R-PB-RANSOMWARE-KILL-CHAIN-STOP"]
+    policy_requirements:
+      approval: "required_for_high"
+      max_blast_radius: 1
+    steps:
+      - name: "kill_chain_stage"
+        action_type: "agent_command"
+        timeout_ms: 3000
+        retries: 0
+        backoff_ms: 0
+        target_from: "global"
+        params:
+          command: "kill_chain_stage"
+          marker_file: "kill_chain_stage.txt"
+
+      - name: "kill_chain_stop"
+        action_type: "agent_command"
+        timeout_ms: 3000
+        retries: 0
+        backoff_ms: 0
+        target_from: "global"
+        params:
+          command: "kill_chain_stop"
+          marker_file: "kill_chain_stop.txt"
+          simulate_safe_denied: true
+
+  - id: "PB-DATA-EXFIL-THROTTLE"
+    version: 1
+    enabled: true
+    selectors:
+      rule_ids: ["R-PB-DATA-EXFIL-THROTTLE"]
+    policy_requirements:
+      approval: "required_for_high"
+      max_blast_radius: 1
+    steps:
+      - name: "throttle_exfil"
+        action_type: "agent_command"
+        timeout_ms: 3000
+        retries: 0
+        backoff_ms: 0
+        target_from: "global"
+        params:
+          command: "throttle_exfil"
+          marker_file: "throttle.txt"
+
+  - id: "PB-CRITICAL-SERVICE-ABUSE-RESPONSE"
+    version: 1
+    enabled: true
+    selectors:
+      rule_ids: ["R-PB-CRITICAL-SERVICE-ABUSE-RESPONSE"]
+    policy_requirements:
+      approval: "required_for_high"
+      max_blast_radius: 1
+    steps:
+      - name: "protect_critical_service_stage"
+        action_type: "agent_command"
+        timeout_ms: 3000
+        retries: 0
+        backoff_ms: 0
+        target_from: "global"
+        params:
+          command: "protect_critical_service_stage"
+          marker_file: "protect_stage.txt"
+
+      - name: "protect_critical_service"
+        action_type: "agent_command"
+        timeout_ms: 3000
+        retries: 0
+        backoff_ms: 0
+        target_from: "global"
+        params:
+          command: "protect_critical_service"
+          marker_file: "protect.txt"
+          simulate_safe_denied: true
+
+  - id: "PB-DETECTOR-HEALTH-SELF-PROTECT"
+    version: 1
+    enabled: true
+    selectors:
+      rule_ids: ["R-PB-DETECTOR-HEALTH-SELF-PROTECT"]
+    policy_requirements:
+      approval: "required_for_high"
+      max_blast_radius: 1
+    steps:
+      - name: "detector_self_protect"
+        action_type: "agent_command"
+        timeout_ms: 3000
+        retries: 0
+        backoff_ms: 0
+        target_from: "global"
+        params:
+          command: "detector_self_protect"
+          marker_file: "self_protect.txt"
+
 policies:
   safe_mode:
     enabled: true

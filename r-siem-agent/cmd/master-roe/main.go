@@ -204,6 +204,7 @@ type runRecord struct {
 	StepSucceededCount        int               `json:"step_succeeded_count"`
 	StepFailedSafeCount       int               `json:"step_failed_safe_count"`
 	StepFailedTransientCount  int               `json:"step_failed_transient_count"`
+	FailedSafeReason          string            `json:"failed_safe_reason,omitempty"`
 	LastUpdatedAtUnixMs       int64             `json:"last_updated_at_unix_ms"`
 	ApprovalRequired          bool              `json:"approval_required,omitempty"`
 	ApprovalRequestedAtUnixMs int64             `json:"approval_requested_at_unix_ms,omitempty"`
@@ -1064,6 +1065,7 @@ func processTrigger(runtime *roeRuntime, msg *nats.Msg, lane string, runJournal 
 
 	if err := runtime.applyAllowlist(playbook); err != nil {
 		run.Status = "FAILED_SAFE"
+		run.FailedSafeReason = "policy_rejected"
 		if err := runtime.persistRun(runKey, run); err != nil {
 			return err
 		}
@@ -1077,6 +1079,7 @@ func processTrigger(runtime *roeRuntime, msg *nats.Msg, lane string, runJournal 
 	steps, err := compileSteps(runID, trigger, playbook)
 	if err != nil {
 		run.Status = "FAILED_SAFE"
+		run.FailedSafeReason = "plan_compile_failed"
 		if err := runtime.persistRun(runKey, run); err != nil {
 			return err
 		}
@@ -1306,6 +1309,7 @@ func processResult(runtime *roeRuntime, msg *nats.Msg, lane string) error {
 		slog.Int("step_succeeded_count", run.StepSucceededCount),
 		slog.Int("step_failed_safe_count", run.StepFailedSafeCount),
 		slog.Int("step_failed_transient_count", run.StepFailedTransientCount),
+		slog.String("failed_safe_reason", run.FailedSafeReason),
 	)
 	if (run.Status == "FAILED_SAFE" || run.Status == "FAILED_TRANSIENT") && prevStatus != run.Status {
 		runtime.logger.LogAttrs(context.Background(), slog.LevelWarn, "response_run_recovery_hint",
@@ -1321,6 +1325,7 @@ func processResult(runtime *roeRuntime, msg *nats.Msg, lane string) error {
 			slog.String("status", run.Status),
 			slog.Int("step_succeeded_count", run.StepSucceededCount),
 			slog.Int("step_total", run.StepTotal),
+			slog.String("failed_safe_reason", run.FailedSafeReason),
 			slog.String("operator_action", "manual_restore_check_recommended"),
 		)
 	}
@@ -1435,6 +1440,7 @@ func processApproval(runtime *roeRuntime, msg *nats.Msg) error {
 	run.LastUpdatedAtUnixMs = now
 	if approval.Decision == "deny" {
 		run.Status = "FAILED_SAFE"
+		run.FailedSafeReason = "approval_denied"
 		if err := runtime.persistRun(runKey, run); err != nil {
 			return err
 		}
@@ -1642,8 +1648,23 @@ func updateRunWithResult(run *runRecord, result stepResult) {
 		run.StepStatuses = make(map[string]string)
 	}
 	run.StepStatuses[result.StepID] = result.Status
+	if result.Status == "FAILED_SAFE" {
+		run.FailedSafeReason = classifyFailedSafeReason(result)
+	}
 	run.LastUpdatedAtUnixMs = now
 	recomputeRunCounts(run)
+}
+
+func classifyFailedSafeReason(result stepResult) string {
+	switch result.Status {
+	case "FAILED_SAFE":
+		if result.StepIndex > 0 {
+			return "rollback_step_failed"
+		}
+		return "step_failed_safe"
+	default:
+		return ""
+	}
 }
 
 func (r *roeRuntime) reconcileRunProgress(run *runRecord) error {
@@ -1706,8 +1727,12 @@ func recomputeRunCounts(run *runRecord) {
 	run.StepFailedTransientCount = failedTransient
 	if failedSafe > 0 {
 		run.Status = "FAILED_SAFE"
+		if strings.TrimSpace(run.FailedSafeReason) == "" {
+			run.FailedSafeReason = "step_failed_safe"
+		}
 		return
 	}
+	run.FailedSafeReason = ""
 	if run.StepTotal > 0 && succeeded >= run.StepTotal {
 		run.Status = "SUCCEEDED"
 		return
@@ -2190,6 +2215,9 @@ func (r *roeRuntime) exportRunUpdate(run runRecord) error {
 		"step_failed_transient_count": run.StepFailedTransientCount,
 		"last_updated_at_unix_ms":     run.LastUpdatedAtUnixMs,
 	}
+	if strings.TrimSpace(run.FailedSafeReason) != "" {
+		obj["failed_safe_reason"] = run.FailedSafeReason
+	}
 	return r.resultsExport.WriteJSON(obj)
 }
 
@@ -2233,6 +2261,7 @@ func scanForApprovalTimeouts(runtime *roeRuntime, limit int) error {
 			continue
 		}
 		run.Status = "FAILED_SAFE"
+		run.FailedSafeReason = "approval_timeout"
 		run.ApprovalDecision = "timeout"
 		run.ApprovalDecidedAtUnixMs = now
 		run.LastUpdatedAtUnixMs = now

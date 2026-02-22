@@ -30,6 +30,18 @@ need_cmd() {
   }
 }
 
+cert_fp_or_empty() {
+  local cert_path="$1"
+  if [[ ! -f "$cert_path" ]]; then
+    echo ""
+    return 0
+  fi
+  openssl x509 -in "$cert_path" -noout -fingerprint -sha256 \
+    | sed 's/^.*=//' \
+    | tr -d ':' \
+    | tr 'A-F' 'a-f'
+}
+
 line_count() {
   local file="$1"
   [[ -f "$file" ]] || { echo 0; return; }
@@ -130,6 +142,7 @@ peer_fingerprint_sha256=""
 
 allowlist_enabled="false"
 allowlist_path=""
+allowlist_reason=""
 
 master_pid=""
 agent_pid=""
@@ -322,6 +335,9 @@ if ! command -v openssl >/dev/null 2>&1; then
   exit 1
 fi
 
+server_fingerprint_sha256="$(cert_fp_or_empty "configs/certs/master.pem")"
+client_fingerprint_sha256="$(cert_fp_or_empty "configs/certs/agent.pem")"
+
 if command -v ss >/dev/null 2>&1; then
   if ! ss -ltn 2>/dev/null | rg -q '(^|[[:space:]])\*:4222([[:space:]]|$)|127\.0\.0\.1:4222'; then
     echo "FAIL: NATS not reachable on 127.0.0.1:4222" >&2
@@ -457,6 +473,7 @@ openssl s_client -connect "127.0.0.1:${PORT}" -servername master.local \
 t7_line="$(wait_new_log "$MASTER_LOG" "$t7_base" '"msg":"grpc_mtls_client_rejected".*"reason":"fingerprint_not_allowlisted"' 10 || true)"
 if [[ -n "$t7_line" ]]; then
   t7="PASS"
+  allowlist_reason="$(extract_json_field "$t7_line" "reason")"
 else
   t7="FAIL"
 fi
@@ -471,12 +488,18 @@ fi
 
 generated_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 hostname_val="$(hostname)"
+if [[ -z "$allowlist_reason" ]]; then
+  allowlist_reason="fingerprint_not_allowlisted"
+fi
 
 cat > "$proof_json" <<EOF_JSON
 {
   "generated_at": "${generated_at}",
   "hostname": "${hostname_val}",
   "port": ${PORT},
+  "mtls_required": true,
+  "server_fingerprint_sha256": $(json_line_or_null "$server_fingerprint_sha256"),
+  "client_fingerprint_sha256": $(json_line_or_null "$client_fingerprint_sha256"),
   "results": {
     "server_started": "${server_started}",
     "t1": "${t1}",
@@ -487,6 +510,31 @@ cat > "$proof_json" <<EOF_JSON
     "t6": "${t6}",
     "t7": "${t7}",
     "fr02_status": "${fr02_status}"
+  },
+  "negative_tests": [
+    {
+      "name": "no_client_cert",
+      "status": "${t2}",
+      "reason": "no_client_certificate",
+      "evidence_line": $(json_line_or_null "$t2_line")
+    },
+    {
+      "name": "unknown_ca",
+      "status": "${t3}",
+      "reason": "unknown_ca",
+      "evidence_line": $(json_line_or_null "$t3_line")
+    },
+    {
+      "name": "identity_mismatch",
+      "status": "${t4}",
+      "reason": "identity_mismatch",
+      "evidence_line": $(json_line_or_null "$t4_line")
+    }
+  ],
+  "allowlist_test": {
+    "status": "${t7}",
+    "observed": "$(printf '%s' "$allowlist_reason" | sed 's/"/\\"/g')",
+    "evidence_line": $(json_line_or_null "$t7_line")
   },
   "evidence": {
     "master_log": "${MASTER_LOG}",
@@ -524,6 +572,16 @@ echo "fr02_status=${fr02_status}"
 echo "agent_instance_id=${agent_instance_id}"
 echo "agent_id_source=${agent_id_source}"
 echo "proof_log=${proof_json}"
+if [[ "${fr02_status}" == "PASS" ]]; then
+  echo "PASS: FR-02 mTLS"
+else
+  echo "FAIL: FR-02 mTLS"
+fi
+echo "NEG:no_client_cert=${t2}"
+echo "NEG:unknown_ca=${t3}"
+echo "NEG:identity_mismatch=${t4}"
+echo "ALLOWLIST_REJECT=${t7} reason=${allowlist_reason}"
+echo "FR02_PROOF_JSON=${proof_json}"
 
 if [[ "${fr02_status}" != "PASS" ]]; then
   exit 1

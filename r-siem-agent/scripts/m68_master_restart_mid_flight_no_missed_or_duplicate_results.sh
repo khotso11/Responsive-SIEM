@@ -5,6 +5,7 @@ MASTER_LOG="logs/master-roe.m68.log"
 AGENT_LOG="logs/agent.log"
 DEMO_LOG="tmp/demo.log"
 MASTER_PID_FILE=".cache/m68.master.pid"
+MASTER_CONFIG="${MASTER_CONFIG:-configs/master.yaml}"
 
 mkdir -p logs tmp .cache .cache/go-build
 
@@ -80,7 +81,7 @@ find_agent_pids() {
 }
 
 start_master() {
-  env GOCACHE="$(pwd)/.cache/go-build" go run -mod=vendor ./cmd/master-roe --config configs/master.yaml >> "$MASTER_LOG" 2>&1 &
+  env GOCACHE="$(pwd)/.cache/go-build" go run -mod=vendor ./cmd/master-roe --config "$MASTER_CONFIG" >> "$MASTER_LOG" 2>&1 &
   local pid="$!"
   echo "$pid" > "$MASTER_PID_FILE"
   sleep 1
@@ -167,7 +168,7 @@ ext_master_pids="$(find_master_pids | tr '\n' ' ' | xargs || true)"
 
 if [[ -z "$(find_worker_pids | tr '\n' ' ' | xargs || true)" ]]; then
   echo "ACTION: start worker now:"
-  echo "cd ~/projects/r-siem-agent && mkdir -p logs && go run -mod=vendor ./cmd/master-roe-worker --config configs/master.yaml | tee -a logs/worker-f.log"
+  echo "cd ~/projects/r-siem-agent && mkdir -p logs && go run -mod=vendor ./cmd/master-roe-worker --config ${MASTER_CONFIG} | tee -a logs/worker-f.log"
   read -r -p "Press Enter after worker is running..." _
 fi
 
@@ -196,7 +197,7 @@ NOW="$(date +%s)"
 OCT=$(( (NOW % 180) + 20 ))
 echo "M68 invalid user from 10.0.0.${OCT} ts=${NOW}" >> "$DEMO_LOG"
 
-waiting_line="$(wait_match "$MASTER_LOG" "$base_master" "\"msg\":\"response_run_waiting_approval\".*\"rule_id\":\"R-COLLECT-INVALID-USER\".*\"playbook_id\":\"PB-AGENT-PING-LOCALHOST\"" 60 || true)"
+waiting_line="$(wait_match "$MASTER_LOG" "$base_master" "\"msg\":\"response_run_waiting_approval\".*\"rule_id\":\"R-COLLECT-INVALID-USER\".*\"playbook_id\":\"(PB-AGENT-PING-LOCALHOST|PB-QUARANTINE-ROLLBACK-DEMO)\"" 60 || true)"
 [[ -n "$waiting_line" ]] || die "timeout waiting for response_run_waiting_approval"
 RUN_ID="$(printf "%s\n" "$waiting_line" | sed -n 's/.*"run_id":"\([^"]*\)".*/\1/p')"
 [[ -n "$RUN_ID" ]] || die "unable to parse run_id from waiting_approval line"

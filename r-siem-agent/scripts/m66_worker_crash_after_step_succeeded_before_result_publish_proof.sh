@@ -6,6 +6,7 @@ LOG_AGENT="logs/agent.log"
 LOG_WORKER="logs/worker.m66.log"
 DEMO_LOG="tmp/demo.log"
 PID_FILE=".cache/m66.worker.pid"
+MASTER_CONFIG="${MASTER_CONFIG:-configs/master.yaml}"
 
 mkdir -p logs tmp .cache .cache/go-build
 
@@ -71,10 +72,10 @@ start_worker() {
 
   if [[ "$delay_ms" =~ ^[1-9][0-9]*$ ]]; then
     env GOCACHE="$(pwd)/.cache/go-build" RSIEM_TEST_DELAY_RESULT_PUBLISH_MS="$delay_ms" \
-      go run -mod=vendor ./cmd/master-roe-worker --config configs/master.yaml -lane "$lane" >> "$LOG_WORKER" 2>&1 &
+      go run -mod=vendor ./cmd/master-roe-worker --config "$MASTER_CONFIG" -lane "$lane" >> "$LOG_WORKER" 2>&1 &
   else
     env GOCACHE="$(pwd)/.cache/go-build" \
-      go run -mod=vendor ./cmd/master-roe-worker --config configs/master.yaml -lane "$lane" >> "$LOG_WORKER" 2>&1 &
+      go run -mod=vendor ./cmd/master-roe-worker --config "$MASTER_CONFIG" -lane "$lane" >> "$LOG_WORKER" 2>&1 &
   fi
   pid="$!"
   echo "$pid" > "$PID_FILE"
@@ -149,7 +150,7 @@ NOW="$(date +%s)"
 OCT=$(( (NOW % 180) + 20 ))
 echo "M66 invalid user from 10.0.0.${OCT} ts=${NOW}" >> "$DEMO_LOG"
 
-run_line="$(wait_match "$LOG_MASTER" "$base_master" "\"msg\":\"response_run_created\".*\"rule_id\":\"R-COLLECT-INVALID-USER\".*\"playbook_id\":\"PB-AGENT-PING-LOCALHOST\"" 60 || true)"
+run_line="$(wait_match "$LOG_MASTER" "$base_master" "\"msg\":\"response_run_created\".*\"rule_id\":\"R-COLLECT-INVALID-USER\".*\"playbook_id\":\"(PB-AGENT-PING-LOCALHOST|PB-QUARANTINE-ROLLBACK-DEMO)\"" 60 || true)"
 [[ -n "$run_line" ]] || die "timeout waiting for invalid-user run_created"
 RUN_ID="$(printf "%s\n" "$run_line" | sed -n 's/.*"run_id":"\([^"]*\)".*/\1/p')"
 [[ -n "$RUN_ID" ]] || die "unable to parse run_id"

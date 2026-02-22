@@ -160,10 +160,20 @@ func newCommandExecutor(logger *slog.Logger, policy quarantinePolicy) *commandEx
 		timeout: time.Duration(timeoutMs) * time.Millisecond,
 		runner:  osExecRunner{outputLimit: outputLimit},
 		allowlist: map[string]execSpec{
-			"ping":               {Command: "ping", Args: pingBaseArgs, RequiresTarget: true},
-			"uname":              {Command: "uname", Args: []string{"-a"}},
-			"quarantine_move":    {},
-			"quarantine_restore": {},
+			"ping":                           {Command: "ping", Args: pingBaseArgs, RequiresTarget: true},
+			"uname":                          {Command: "uname", Args: []string{"-a"}},
+			"quarantine_move":                {},
+			"quarantine_restore":             {},
+			"contain_bruteforce_ip":          {},
+			"lockdown_privesc":               {},
+			"halt_lateral_movement":          {},
+			"block_c2_beacon":                {},
+			"kill_chain_stage":               {},
+			"kill_chain_stop":                {},
+			"throttle_exfil":                 {},
+			"protect_critical_service_stage": {},
+			"protect_critical_service":       {},
+			"detector_self_protect":          {},
 		},
 		outputLimit: outputLimit,
 		policy:      normalizeQuarantinePolicy(policy),
@@ -258,6 +268,20 @@ func (e *commandExecutor) handle(ctx context.Context, req commandRequest) comman
 		}
 		doneAttrs = append(doneAttrs, quarantineLogAttrs(actionKey, req.Params)...)
 		e.logger.LogAttrs(context.Background(), slog.LevelInfo, "agent_command_exec_done", doneAttrs...)
+		return reply
+	}
+
+	if category, ok := markerCommandCategory(actionKey); ok {
+		reply := e.executeMarkerCommand(req, actionKey, category)
+		e.logger.LogAttrs(context.Background(), slog.LevelInfo, "agent_command_exec_done",
+			slog.String("run_id", runID),
+			slog.String("step_id", stepID),
+			slog.String("command_id", actionKey),
+			slog.Int("exit_code", reply.ExitCode),
+			slog.Int64("duration_ms", reply.DurationMs),
+			slog.Bool("stdout_truncated", reply.TruncatedStdout),
+			slog.Bool("stderr_truncated", reply.TruncatedStderr),
+		)
 		return reply
 	}
 
@@ -648,6 +672,107 @@ func (e *commandExecutor) executeQuarantineCommand(req commandRequest, commandID
 			Stderr:     "unknown_command",
 			ErrorClass: "allowlist_denied",
 		}
+	}
+}
+
+func markerCommandCategory(commandID string) (string, bool) {
+	switch commandID {
+	case "contain_bruteforce_ip":
+		return "containment", true
+	case "lockdown_privesc":
+		return "lockdown", true
+	case "halt_lateral_movement":
+		return "lateral", true
+	case "block_c2_beacon":
+		return "c2", true
+	case "kill_chain_stage", "kill_chain_stop":
+		return "ransomware", true
+	case "throttle_exfil":
+		return "exfil", true
+	case "protect_critical_service_stage", "protect_critical_service":
+		return "service_abuse", true
+	case "detector_self_protect":
+		return "detector", true
+	default:
+		return "", false
+	}
+}
+
+func (e *commandExecutor) executeMarkerCommand(req commandRequest, commandID, category string) commandReply {
+	start := time.Now()
+	runID := strings.TrimSpace(req.RunID)
+	stepID := strings.TrimSpace(req.StepID)
+	if runID == "" || runID != filepath.Base(runID) || strings.Contains(runID, string(filepath.Separator)) {
+		return commandReply{
+			Status:     "error",
+			ExitCode:   3,
+			DurationMs: time.Since(start).Milliseconds(),
+			Stderr:     "safe_denied:invalid_run_id",
+			ErrorClass: safeDeniedClass,
+		}
+	}
+	if denied, set, err := boolParam(req.Params, "simulate_safe_denied"); err != nil {
+		return commandReply{
+			Status:     "error",
+			ExitCode:   3,
+			DurationMs: time.Since(start).Milliseconds(),
+			Stderr:     err.Error(),
+			ErrorClass: safeDeniedClass,
+		}
+	} else if set && denied {
+		return commandReply{
+			Status:     "error",
+			ExitCode:   3,
+			DurationMs: time.Since(start).Milliseconds(),
+			Stderr:     "safe_denied:simulated_" + commandID,
+			ErrorClass: safeDeniedClass,
+		}
+	}
+	markerFile := strings.TrimSpace(stringParam(req.Params, "marker_file"))
+	if markerFile == "" {
+		markerFile = commandID + ".txt"
+	}
+	if markerFile != filepath.Base(markerFile) || markerFile == "." || markerFile == ".." {
+		return commandReply{
+			Status:     "error",
+			ExitCode:   3,
+			DurationMs: time.Since(start).Milliseconds(),
+			Stderr:     "safe_denied:invalid_marker_file",
+			ErrorClass: safeDeniedClass,
+		}
+	}
+	markerDir := filepath.Join("tmp", "response_actions", category, runID)
+	if err := os.MkdirAll(markerDir, 0o755); err != nil {
+		return commandReply{
+			Status:     "error",
+			ExitCode:   1,
+			DurationMs: time.Since(start).Milliseconds(),
+			Stderr:     err.Error(),
+			ErrorClass: "exec_failed",
+		}
+	}
+	markerPath := filepath.Join(markerDir, markerFile)
+	content := fmt.Sprintf("command_id=%s\nrun_id=%s\nstep_id=%s\ntarget=%s\nwritten_at_unix_ms=%d\n",
+		commandID,
+		runID,
+		stepID,
+		strings.TrimSpace(req.Target),
+		time.Now().UnixMilli(),
+	)
+	if err := os.WriteFile(markerPath, []byte(content), 0o644); err != nil {
+		return commandReply{
+			Status:     "error",
+			ExitCode:   1,
+			DurationMs: time.Since(start).Milliseconds(),
+			Stderr:     err.Error(),
+			ErrorClass: "exec_failed",
+		}
+	}
+	return commandReply{
+		Status:     "ok",
+		ExitCode:   0,
+		DurationMs: time.Since(start).Milliseconds(),
+		Stdout:     markerPath,
 	}
 }
 
@@ -1205,6 +1330,38 @@ func intParam(params map[string]any, key string) (int64, bool, error) {
 		return parsed, true, nil
 	default:
 		return 0, true, fmt.Errorf("invalid_%s", key)
+	}
+}
+
+func boolParam(params map[string]any, key string) (bool, bool, error) {
+	if params == nil {
+		return false, false, nil
+	}
+	val, ok := params[key]
+	if !ok {
+		return false, false, nil
+	}
+	switch typed := val.(type) {
+	case bool:
+		return typed, true, nil
+	case string:
+		trimmed := strings.ToLower(strings.TrimSpace(typed))
+		switch trimmed {
+		case "true", "1", "yes", "on":
+			return true, true, nil
+		case "false", "0", "no", "off":
+			return false, true, nil
+		default:
+			return false, true, fmt.Errorf("safe_denied:invalid_%s", key)
+		}
+	case int:
+		return typed != 0, true, nil
+	case int64:
+		return typed != 0, true, nil
+	case float64:
+		return typed != 0, true, nil
+	default:
+		return false, true, fmt.Errorf("safe_denied:invalid_%s", key)
 	}
 }
 

@@ -1,52 +1,59 @@
 # Supervisor Presentation Pack (2026-02-19)
 
-This pack contains the supervisor-facing narrative and strict evidence mapping for today’s proven demo scope.
+This pack contains the supervisor-facing narrative, evidence index, and screenshot mapping for the currently proven R-SIEM scope.
 
 ## Contents
 
-- `NARRATIVE_REPORT.md` - requirement-by-requirement status and implementation narrative
-- `EVIDENCE_INDEX.md` - strict E01..E08 map from screenshot to proof claim
-- `screenshots/` - copied screenshot files (PNG), when present in repo scan
+- `NARRATIVE_REPORT.md` - FR-by-FR narrative and current implementation status
+- `EVIDENCE_INDEX.md` - strict E01..E08 screenshot-to-claim map
+- `screenshots/` - copied screenshot files used in presentation proofs
 
-## Scripts Used Today
+## Current Proof Commands
 
-- `./scripts/demo_up.sh`
 - `./scripts/verify_fr01.sh`
-- `./scripts/verify_fr02_mtls.sh`
-- Optional manual approval command:
-  - `nats pub rsiem.response.approvals '{"run_id":"<RUN_ID>","decision":"approve","actor":"khotso"}'`
+- `./scripts/verify_fr02_full.sh`
+- `./scripts/verify_fr05_full.sh`
+- `./scripts/verify_new_playbooks.sh`
+- `./scripts/verify_full_demo_suite.sh`
+- `./scripts/verify_fr08_retention.sh`
+
+Optional manual approval command (when running focused/manual slices):
+
+- `nats pub rsiem.response.approvals '{"run_id":"<RUN_ID>","decision":"approve","actor":"khotso"}'`
 
 ## JSON Artifacts To Show
 
-- `demo_artifacts/<latest>/demo_summary.json` (FR-01 / FR-08)
-- `demo_artifacts/<latest>/fr02_mtls_proof.json` (FR-02)
+- `demo_artifacts/<latest>/demo_summary.json` (FR-01 summary artifact)
+- `demo_artifacts/<latest>/fr02_mtls_proof.json` (FR-02 mTLS + negatives + allowlist checks)
+- `demo_artifacts/<latest>/fr02_rotation_proof.json` (FR-02 cert rotation rehearsal)
+- `demo_artifacts/<latest>/fr02_revocation_proof.json` (FR-02 allowlist-based revoke/re-allow proof)
+- `demo_artifacts/<latest>/fr05_success_proof.json` (FR-05 rollback success)
+- `demo_artifacts/<latest>/fr05_failed_safe_proof.json` (FR-05 safe partial failure)
+- `demo_artifacts/<latest>/new_playbooks_proof.json` (new playbooks batch proof)
+- `demo_artifacts/<latest>/fr08_retention_proof.json` (FR-08 retention/query/export proof)
 
 ## Screenshot Folder
 
 - Target folder: `docs/presentations/2026-02-19-supervisor/screenshots/`
-- Auto-copy rule: search by exact filename from repo root and copy if found.
-
-Expected screenshot filenames:
-
-- `01_FR01_verify_summary.png`
-- `02_FR01_checkpoint_authlog.png`
-- `03_FR08_demo_summary_json.png`
-- `04_FR02_mtls_summary.png`
-- `05_FR02_mtls_negative_tests.png`
-- `06_FR02_allowlist_reject.png`
-- `07_FR05_rollback_success.png`
-- `08_FR05_partial_failure_safe.png`
+- Expected files:
+`01_FR01_verify_summary.png`, `02_FR01_checkpoint_authlog.png`, `03_FR08_demo_summary_json.png`, `04_FR02_mtls_summary.png`, `05_FR02_mtls_negative_tests.png`, `06_FR02_allowlist_reject.png`, `07_FR05_rollback_success.png`, `08_FR05_partial_failure_safe.png`
 
 ## Live Demo Checklist
 
-- Confirm NATS is up (`127.0.0.1:4222`).
-- Run `./scripts/demo_up.sh`.
-- Run `./scripts/verify_fr01.sh` and show:
-  - FR-01 summary PASS
-  - PROOF_CHECKPOINT and PROOF_AUTHLOG_OVERRIDE
-  - `DEMO_SUMMARY_JSON` path
-- Run `./scripts/verify_fr02_mtls.sh` and show:
-  - t1..t7 PASS
-  - cert-derived identity source (`cert_cn` or `cert_san`)
-  - fingerprint allowlist rejection evidence
-- Open `EVIDENCE_INDEX.md` and map each screenshot to its FR claim.
+- Ensure NATS is up on `127.0.0.1:4222`.
+- Run `./scripts/verify_full_demo_suite.sh`.
+- Confirm final line: `PASS: full demo suite completed`.
+- Run `./scripts/verify_fr08_retention.sh`.
+- Confirm final lines:
+`PASS: FR-08 retention+query+export completed` and `FR08_PROOF_JSON=...`
+- Open `EVIDENCE_INDEX.md` and map each screenshot to the claim shown in terminal output.
+
+## Minimal 5-Minute Path
+
+```bash
+cd ~/projects/r-siem-agent
+./scripts/verify_fr01.sh
+./scripts/verify_fr02_full.sh
+./scripts/verify_fr05_full.sh
+./scripts/verify_fr08_retention.sh
+```

@@ -141,7 +141,7 @@ NOW="$(date +%s)"
 OCT=$(( (NOW % 180) + 20 ))
 echo "M63 invalid user from 10.0.0.${OCT} ts=${NOW}" >> "$DEMO_LOG"
 
-run_line="$(wait_match "$LOG_MASTER" "$base_master" "\"msg\":\"response_run_created\".*\"rule_id\":\"R-COLLECT-INVALID-USER\".*\"playbook_id\":\"PB-AGENT-PING-LOCALHOST\"" 60 || true)"
+run_line="$(wait_match "$LOG_MASTER" "$base_master" "\"msg\":\"response_run_created\".*\"rule_id\":\"R-COLLECT-INVALID-USER\".*\"playbook_id\":\"(PB-AGENT-PING-LOCALHOST|PB-QUARANTINE-ROLLBACK-DEMO)\"" 60 || true)"
 [[ -n "$run_line" ]] || die "timeout waiting for invalid-user run_created"
 RUN_ID="$(printf "%s\n" "$run_line" | sed -n 's/.*"run_id":"\([^"]*\)".*/\1/p')"
 [[ -n "$RUN_ID" ]] || die "unable to parse run_id"

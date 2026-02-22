@@ -33,14 +33,16 @@ for tool in rg nats ps awk sed pkill kill go tee; do
 done
 
 AGENT_RE='((go[[:space:]]+run[^[:cntrl:]]*\./cmd/agent)|((cmd/agent|/agent)([^[:alnum:]_]|$))).*(-{1,2}config([=[:space:]])?configs/agent(2)?\.yaml)'
-WORKER_RE='((go[[:space:]]+run[^[:cntrl:]]*\./cmd/master-roe-worker)|((cmd/master-roe-worker|/master-roe-worker)([^[:alnum:]_]|$))).*(-{1,2}config([=[:space:]])?configs/master\.yaml)'
-MASTER_RE='((go[[:space:]]+run[^[:cntrl:]]*\./cmd/master-roe([^[:alnum:]_-]|$))|((cmd/master-roe|/master-roe)([^[:alnum:]_-]|$))).*(-{1,2}config([=[:space:]])?configs/master\.yaml)'
+WORKER_RE='((go[[:space:]]+run[^[:cntrl:]]*\./cmd/master-roe-worker)|((cmd/master-roe-worker|/master-roe-worker)([^[:alnum:]_]|$))).*(-{1,2}config([=[:space:]])?[^[:space:]]*master\.yaml)'
+MASTER_RE='((go[[:space:]]+run[^[:cntrl:]]*\./cmd/master-roe([^[:alnum:]_-]|$))|((cmd/master-roe|/master-roe)([^[:alnum:]_-]|$))).*(-{1,2}config([=[:space:]])?[^[:space:]]*master\.yaml)'
 DETECTOR_RE='(go[[:space:]]+run[^[:cntrl:]]*\./cmd/detector-v0|(cmd/detector-v0|/detector-v0)([^[:alnum:]_]|$))'
 COLLECTOR_RE='(go[[:space:]]+run[^[:cntrl:]]*\./cmd/collector-tail|(cmd/collector-tail|/collector-tail)([^[:alnum:]_]|$))'
 TEE_RE='(^|[[:space:]])tee[[:space:]].*logs/(agent|worker|master-roe|detector|collector)([^[:alnum:]_]|$)'
+SUITE_MASTER_CONFIG="tmp/reliability_master.yaml"
 
 SUITE_STARTED_AGENT=0
 SUITE_STARTED_WORKER=0
+SUITE_STARTED_MASTER=0
 
 declare -a TMP_FILES=()
 
@@ -214,10 +216,36 @@ start_worker_if_needed() {
     return 0
   fi
   mkdir -p logs
-  nohup go run -mod=vendor ./cmd/master-roe-worker --config configs/master.yaml --lane BOTH >> logs/worker.log 2>&1 &
+  nohup go run -mod=vendor ./cmd/master-roe-worker --config "$SUITE_MASTER_CONFIG" --lane BOTH >> logs/worker.log 2>&1 &
   SUITE_STARTED_WORKER=1
   if ! wait_up "$WORKER_RE" 30; then
     echo "FAIL: failed to start master-roe-worker for suite"
+    exit 1
+  fi
+}
+
+prepare_suite_master_config() {
+  mkdir -p tmp
+  awk '
+    /^[[:space:]]*- id: "PB-QUARANTINE-ROLLBACK-DEMO"/ { in_q = 1; print; next }
+    in_q && /^[[:space:]]*- id: "/ { in_q = 0 }
+    in_q && /^[[:space:]]*enabled:[[:space:]]*(true|false)[[:space:]]*$/ {
+      sub(/(true|false)/, "false")
+      print
+      next
+    }
+    { print }
+  ' configs/master.yaml > "$SUITE_MASTER_CONFIG"
+}
+
+start_master_for_suite() {
+  stop_master_processes
+  prepare_suite_master_config
+  mkdir -p logs
+  nohup go run -mod=vendor ./cmd/master-roe --config "$SUITE_MASTER_CONFIG" >> logs/master-roe.log 2>&1 &
+  SUITE_STARTED_MASTER=1
+  if ! wait_up "$MASTER_RE" 30; then
+    echo "FAIL: failed to start master-roe for suite"
     exit 1
   fi
 }
@@ -236,7 +264,7 @@ auto_start_worker_for_m63() {
         fi
         if [[ "$(count_procs "$WORKER_RE")" == "0" ]]; then
           mkdir -p logs
-          nohup go run -mod=vendor ./cmd/master-roe-worker --config configs/master.yaml -lane "$lane" >> "logs/worker-${lane,,}.log" 2>&1 &
+          nohup go run -mod=vendor ./cmd/master-roe-worker --config "$SUITE_MASTER_CONFIG" -lane "$lane" >> "logs/worker.log" 2>&1 &
           SUITE_STARTED_WORKER=1
         fi
         exit 0
@@ -260,9 +288,10 @@ barrier_after_m66() {
 
 precheck_m63() {
   echo "Precheck M63: master/detector/collector up, worker down, agent down"
-  require_up "master-roe" "$MASTER_RE"
   require_up "detector-v0" "$DETECTOR_RE"
   require_up "collector-tail" "$COLLECTOR_RE"
+  start_master_for_suite
+  require_up "master-roe" "$MASTER_RE"
   stop_worker_processes
   stop_agent_processes
   require_down "master-roe-worker" "$WORKER_RE"
@@ -300,6 +329,9 @@ cleanup() {
   done
   stop_worker_processes || true
   stop_agent_processes || true
+  if (( SUITE_STARTED_MASTER == 1 )); then
+    stop_master_processes || true
+  fi
 }
 trap cleanup EXIT
 
@@ -325,7 +357,7 @@ run_milestone() {
 
     if [[ -x "$script" ]]; then
       set +e
-      "$script" < "$tmp_in" \
+      MASTER_CONFIG="$SUITE_MASTER_CONFIG" "$script" < "$tmp_in" \
         | tee "$tmp_out" \
         | sed -E \
             -e 's/^ACTION: start .*worker now in another terminal:.*/INFO: worker auto-start handled by suite/' \
@@ -334,7 +366,7 @@ run_milestone() {
       set -e
     else
       set +e
-      bash "$script" < "$tmp_in" \
+      MASTER_CONFIG="$SUITE_MASTER_CONFIG" bash "$script" < "$tmp_in" \
         | tee "$tmp_out" \
         | sed -E \
             -e 's/^ACTION: start .*worker now in another terminal:.*/INFO: worker auto-start handled by suite/' \
@@ -345,12 +377,12 @@ run_milestone() {
   else
     if [[ -x "$script" ]]; then
       set +e
-      "$script" | tee "$tmp_out"
+      MASTER_CONFIG="$SUITE_MASTER_CONFIG" "$script" | tee "$tmp_out"
       rc=$?
       set -e
     else
       set +e
-      bash "$script" | tee "$tmp_out"
+      MASTER_CONFIG="$SUITE_MASTER_CONFIG" bash "$script" | tee "$tmp_out"
       rc=$?
       set -e
     fi

@@ -4,13 +4,12 @@ This README is the current operator guide for running and proving the local R-SI
 
 ## What You Can Prove Right Now
 
-- **FR-01 (Minimal telemetry slice)**: collector tail + detector + response path with checkpoint/resume and auth.log override proof.
-- **FR-02 (mTLS hardening)**: agent↔master mTLS enforcement, cert identity source, and fingerprint allowlist acceptance/rejection proofs.
-- **FR-05 (quarantine rollback demos)**: successful rollback and partial-failure audit path.
+- **FR-01**: minimal telemetry slice with checkpoint/resume and auth.log override proof.
+- **FR-02**: mTLS hardening, cert-derived identity, allowlist accept/reject, rotation rehearsal, and revocation workflow proofs.
+- **FR-05**: rollback success + safe partial-failure operator guidance proofs.
+- **FR-08**: bounded retention + query + export proof over retained local records.
 
 ## Repository Root
-
-Always run from:
 
 ```bash
 cd ~/projects/r-siem-agent
@@ -21,123 +20,94 @@ cd ~/projects/r-siem-agent
 - Go (project uses `go run` / `go build` with vendored deps)
 - `rg` (ripgrep)
 - `nats` CLI (required by `scripts/demo_up.sh` precheck)
-- `openssl` (required by `scripts/verify_fr02_mtls.sh`)
-- A running NATS JetStream server on `127.0.0.1:4222`
+- `openssl` (required by FR-02 verification scripts)
+- NATS JetStream reachable on `127.0.0.1:4222`
 
 ## Start NATS (Local)
 
-If not already running:
-
 ```bash
-docker run --rm --name nats --network host nats:2 -js
+docker rm -f nats >/dev/null 2>&1 || true
+docker run -d --name nats --network host nats:2 -js
 ```
 
-If container name conflicts:
+## Current Proof Flow
+
+### Fast full suite
 
 ```bash
-docker rm -f nats
+./scripts/verify_full_demo_suite.sh
 ```
 
-## Fastest End-to-End Path
-
-### 1) Start full demo stack (master-roe + worker + agent + detector + collector)
-
-```bash
-./scripts/demo_up.sh
-```
-
-### 2) Run FR-05 supervisor demo
-
-```bash
-./scripts/demo_fr05.sh
-```
-
-Expected ending line:
+Expected final line:
 
 ```text
-PASS: FR05 completed (safety + rollback + audit) run_id_ok=... run_id_fail=...
+PASS: full demo suite completed
 ```
 
-### 3) Run FR-01 verification artifact
+### FR-08 proof (retention + query + export)
+
+```bash
+./scripts/verify_fr08_retention.sh
+```
+
+Expected final lines:
+
+```text
+PASS: FR-08 retention+query+export completed
+FR08_PROOF_JSON=demo_artifacts/.../fr08_retention_proof.json
+```
+
+### Focused sequence (5 minutes)
 
 ```bash
 ./scripts/verify_fr01.sh
-```
-
-Expected ending lines include:
-
-```text
-PASS: FR-01 local verification completed
-PROOF_CHECKPOINT: ...
-PROOF_AUTHLOG_OVERRIDE: ...
-DEMO_SUMMARY_JSON: demo_artifacts/.../demo_summary.json
-```
-
-### 4) Run FR-02 mTLS verification artifact
-
-```bash
-./scripts/verify_fr02_mtls.sh
-```
-
-Expected summary:
-
-```text
-=== FR-02 mTLS SUMMARY ===
-server_started=PASS
-t1=PASS
-t2=PASS
-t3=PASS
-t4=PASS
-t5=PASS
-t6=PASS
-t7=PASS
-fr02_status=PASS
-agent_instance_id=...
-agent_id_source=cert_san|cert_cn
-proof_log=demo_artifacts/.../fr02_mtls_proof.json
-```
-
-### 5) Stop stack started by `demo_up.sh`
-
-```bash
-./scripts/demo_down.sh
+./scripts/verify_fr02_full.sh
+./scripts/verify_fr05_full.sh
+./scripts/verify_fr08_retention.sh
 ```
 
 ## Key Scripts (Current)
 
 - `scripts/demo_up.sh`: start core services and print live demo guide
 - `scripts/demo_down.sh`: stop services started by `demo_up.sh`
-- `scripts/demo_fr05.sh`: FR-05 success + partial-failure proof flow
-- `scripts/verify_fr01.sh`: FR-01 verification + JSON summary artifact
-- `scripts/verify_fr02_mtls.sh`: FR-02 mTLS hardening verification + JSON proof
-- `scripts/mf05_quarantine_rollback_proof.sh`: FR-05 success proof only
-- `scripts/mf05_quarantine_partial_failure_proof.sh`: FR-05 partial-failure proof only
+- `scripts/verify_fr01.sh`: FR-01 verification + `demo_summary.json`
+- `scripts/verify_fr02_mtls.sh`: FR-02 mTLS checks (t1..t7)
+- `scripts/verify_fr02_rotation.sh`: FR-02 cert rotation rehearsal proof
+- `scripts/verify_fr02_revocation.sh`: FR-02 allowlist revocation proof
+- `scripts/verify_fr02_full.sh`: FR-02 wrapper
+- `scripts/verify_fr05_full.sh`: FR-05 wrapper
+- `scripts/verify_new_playbooks.sh`: additional playbook proof batch
+- `scripts/verify_full_demo_suite.sh`: one-command combined suite
+- `scripts/verify_fr08_retention.sh`: FR-08 retention/query/export proof
 
-## Proof Artifacts and Logs
+## Proof Artifacts To Present
 
-### Artifacts
+- `demo_artifacts/<timestamp>/demo_summary.json`
+- `demo_artifacts/<timestamp>/fr02_mtls_proof.json`
+- `demo_artifacts/<timestamp>/fr02_rotation_proof.json`
+- `demo_artifacts/<timestamp>/fr02_revocation_proof.json`
+- `demo_artifacts/<timestamp>/fr05_success_proof.json`
+- `demo_artifacts/<timestamp>/fr05_failed_safe_proof.json`
+- `demo_artifacts/<timestamp>/new_playbooks_proof.json`
+- `demo_artifacts/<timestamp>/fr08_retention_proof.json`
 
-- `demo_artifacts/<timestamp>/demo_summary.json` (FR-01)
-- `demo_artifacts/<timestamp>/fr02_mtls_proof.json` (FR-02)
+## Runtime Evidence Sources
 
-### Runtime logs
-
-- `logs/master-roe.log`
-- `logs/worker.log`
-- `logs/agent.log`
-- `logs/detector.log`
-- `logs/collector.log`
-
-### Export evidence
-
-- `exports/roe_steps.jsonl`
-- `exports/roe_runs.jsonl`
+- Logs: `logs/master-roe.log`, `logs/worker.log`, `logs/agent.log`, `logs/detector.log`, `logs/collector.log`
+- Exports: `exports/roe_steps.jsonl`, `exports/roe_runs.jsonl`
+- Retained local store: `retained/*.jsonl`
 
 ## Troubleshooting
 
-### 1) `FAIL: master did not start with mTLS`
+### NATS precheck fails in `demo_up.sh`
 
-Usually port/process conflict from previous FR-02 runs. Clean and retry:
+Ensure NATS is reachable:
+
+```bash
+nats pub rsiem.demo.precheck "{\"ts\":$(date +%s)}"
+```
+
+### FR-02 process/port conflicts
 
 ```bash
 pkill -f 'tmp/fr02_mtls/master' || true
@@ -145,23 +115,15 @@ pkill -f 'tmp/fr02_mtls/agent' || true
 ./scripts/verify_fr02_mtls.sh
 ```
 
-### 2) NATS precheck failure in `demo_up.sh`
-
-You need NATS on `127.0.0.1:4222` and working `nats` CLI.
-
-### 3) Confirm FR-02 cleanup state
+### Verify only script-level outcome quickly
 
 ```bash
-pgrep -fa 'tmp/fr02_mtls/(master|agent)\.ya?ml|tmp/fr02_mtls/(master|agent)\.ok\.yaml' || true
-ss -ltnp | rg '127.0.0.1:(2787[7-9]|2788[0-9])' || true
+LATEST_DIR="$(ls -1dt /tmp/rsiem-proof-* 2>/dev/null | head -n1)"
+rg -n '^FAIL:|^PASS:' "$LATEST_DIR"/*.log
 ```
 
-No output means clean.
+## Related Docs
 
-## mTLS Lifecycle Note
-
-See:
-
-- `docs/fr02_mtls_lifecycle.md`
-
-This includes CA signing model, rotation strategy, and compromise response steps.
+- `docs/fr02_mtls_runbook.md`
+- `docs/presentations/2026-02-19-supervisor/README.md`
+- `docs/presentations/2026-02-19-supervisor/NARRATIVE_REPORT.md`

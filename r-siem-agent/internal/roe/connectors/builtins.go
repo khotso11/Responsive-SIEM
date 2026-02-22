@@ -227,7 +227,19 @@ func (c *agentCommandStubConnector) RequiredParams() []string {
 }
 
 func (c *agentCommandStubConnector) OptionalParams() []string {
-	return []string{"command", "name", "args", "target", "force", "src_path", "quarantine_dir", "dest_path", "delay_ms"}
+	return []string{
+		"command",
+		"name",
+		"args",
+		"target",
+		"force",
+		"src_path",
+		"quarantine_dir",
+		"dest_path",
+		"delay_ms",
+		"marker_file",
+		"simulate_safe_denied",
+	}
 }
 
 func (c *agentCommandStubConnector) Execute(ctx context.Context, step Step) (map[string]any, error) {

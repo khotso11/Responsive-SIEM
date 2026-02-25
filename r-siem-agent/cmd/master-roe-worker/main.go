@@ -98,6 +98,7 @@ type stepMessage struct {
 	StepIdemKey     string         `json:"step_idem_key"`
 	Attempt         int            `json:"attempt"`
 	Target          string         `json:"target"`
+	Actor           string         `json:"actor,omitempty"`
 	Params          map[string]any `json:"params,omitempty"`
 	PlannedAtUnixMs int64          `json:"planned_at_unix_ms"`
 	EmittedAtUnixMs int64          `json:"emitted_at_unix_ms"`
@@ -1121,6 +1122,8 @@ func decodeStep(data []byte) (stepMessage, error) {
 	step.ActionType = strings.TrimSpace(step.ActionType)
 	step.Lane = strings.TrimSpace(step.Lane)
 	step.StepIdemKey = strings.TrimSpace(step.StepIdemKey)
+	step.Target = strings.TrimSpace(step.Target)
+	step.Actor = strings.TrimSpace(step.Actor)
 	if step.RunID == "" || step.ActionType == "" || step.Lane == "" {
 		return stepMessage{}, fmt.Errorf("missing required fields")
 	}
@@ -1395,6 +1398,12 @@ func buildResultPayload(step stepMessage, final stepState) ([]byte, error) {
 		"attempt":             final.Attempt,
 		"finished_at_unix_ms": final.FinishedAtUnixMs,
 		"step_key":            fmt.Sprintf("step.%s.%s", step.RunID, step.StepID),
+	}
+	if step.Target != "" {
+		result["target"] = step.Target
+	}
+	if step.Actor != "" {
+		result["actor"] = step.Actor
 	}
 	if final.Receipt != nil {
 		result["receipt"] = final.Receipt

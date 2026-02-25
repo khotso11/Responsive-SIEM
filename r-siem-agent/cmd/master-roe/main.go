@@ -195,6 +195,7 @@ type runRecord struct {
 	Lane                      string            `json:"lane"`
 	GroupBy                   string            `json:"group_by,omitempty"`
 	GroupKey                  string            `json:"group_key,omitempty"`
+	Target                    string            `json:"target,omitempty"`
 	PlaybookID                string            `json:"playbook_id"`
 	PlaybookVersion           string            `json:"playbook_version"`
 	Status                    string            `json:"status"`
@@ -211,6 +212,7 @@ type runRecord struct {
 	ApprovalTimeoutMs         int64             `json:"approval_timeout_ms,omitempty"`
 	ApprovalDecision          string            `json:"approval_decision,omitempty"`
 	ApprovalDecidedAtUnixMs   int64             `json:"approval_decided_at_unix_ms,omitempty"`
+	ApprovalActor             string            `json:"approval_actor,omitempty"`
 	StepStatuses              map[string]string `json:"step_statuses,omitempty"`
 }
 
@@ -221,6 +223,7 @@ type stepRecord struct {
 	StepIndex   int            `json:"step_index"`
 	ActionType  string         `json:"action_type"`
 	Target      string         `json:"target,omitempty"`
+	Actor       string         `json:"actor,omitempty"`
 	Params      map[string]any `json:"params"`
 	Status      string         `json:"status"`
 	Attempt     int            `json:"attempt"`
@@ -233,6 +236,8 @@ type stepResult struct {
 	StepIndex        int            `json:"step_index"`
 	ActionType       string         `json:"action_type"`
 	Lane             string         `json:"lane"`
+	Target           string         `json:"target,omitempty"`
+	Actor            string         `json:"actor,omitempty"`
 	Status           string         `json:"status"`
 	Attempt          int            `json:"attempt"`
 	FinishedAtUnixMs int64          `json:"finished_at_unix_ms"`
@@ -1033,10 +1038,12 @@ func processTrigger(runtime *roeRuntime, msg *nats.Msg, lane string, runJournal 
 		Lane:            trigger.Lane,
 		GroupBy:         trigger.GroupBy,
 		GroupKey:        trigger.GroupKey,
+		Target:          deriveRunTarget(trigger),
 		PlaybookID:      playbook.ID,
 		PlaybookVersion: playbook.Version.Value,
 		Status:          "CREATED",
 		CreatedAtUnixMs: trigger.ObservedAtUnixMs,
+		ApprovalActor:   auditActor(""),
 	}
 
 	if ok, err := runtime.tryAcquireGroupLock(trigger, runID); err != nil {
@@ -1146,6 +1153,7 @@ func processTrigger(runtime *roeRuntime, msg *nats.Msg, lane string, runJournal 
 	}
 
 	for _, step := range steps {
+		step.Actor = auditActor(run.ApprovalActor)
 		subject, err := runtime.publishStep(trigger.Lane, step)
 		if err != nil {
 			return err
@@ -1319,14 +1327,15 @@ func processResult(runtime *roeRuntime, msg *nats.Msg, lane string) error {
 			slog.String("hint", "If quarantine move succeeded and restore did not run, re-run PB-QUARANTINE-ROLLBACK-DEMO for run_id or execute restore using tmp/quarantine/<run_id>."),
 		)
 	}
-	if run.Status == "FAILED_SAFE" && run.StepSucceededCount > 0 && run.StepSucceededCount < run.StepTotal {
+	operatorAction := operatorActionForRun(run)
+	if operatorAction != "" {
 		runtime.logger.LogAttrs(context.Background(), slog.LevelWarn, "response_run_partial_completion",
 			slog.String("run_id", run.RunID),
 			slog.String("status", run.Status),
 			slog.Int("step_succeeded_count", run.StepSucceededCount),
 			slog.Int("step_total", run.StepTotal),
 			slog.String("failed_safe_reason", run.FailedSafeReason),
-			slog.String("operator_action", "manual_restore_check_recommended"),
+			slog.String("operator_action", operatorAction),
 		)
 	}
 	if err := runtime.exportRunUpdate(run); err != nil {
@@ -1438,6 +1447,7 @@ func processApproval(runtime *roeRuntime, msg *nats.Msg) error {
 	run.ApprovalDecision = approval.Decision
 	run.ApprovalDecidedAtUnixMs = now
 	run.LastUpdatedAtUnixMs = now
+	run.ApprovalActor = auditActor(approval.Actor)
 	if approval.Decision == "deny" {
 		run.Status = "FAILED_SAFE"
 		run.FailedSafeReason = "approval_denied"
@@ -1485,6 +1495,7 @@ func processApproval(runtime *roeRuntime, msg *nats.Msg) error {
 		return err
 	}
 	for _, step := range steps {
+		step.Actor = auditActor(run.ApprovalActor)
 		subject, err := runtime.publishStep(step.Lane, step)
 		if err != nil {
 			return err
@@ -1558,6 +1569,8 @@ func decodeStepResult(data []byte) (stepResult, error) {
 	result.StepID = strings.TrimSpace(result.StepID)
 	result.ActionType = strings.TrimSpace(result.ActionType)
 	result.Lane = strings.TrimSpace(result.Lane)
+	result.Target = strings.TrimSpace(result.Target)
+	result.Actor = strings.TrimSpace(result.Actor)
 	result.Status = strings.TrimSpace(result.Status)
 	if result.RunID == "" || result.StepID == "" || result.Status == "" {
 		return stepResult{}, fmt.Errorf("missing required fields")
@@ -1646,6 +1659,12 @@ func updateRunWithResult(run *runRecord, result stepResult) {
 	now := time.Now().UnixMilli()
 	if run.StepStatuses == nil {
 		run.StepStatuses = make(map[string]string)
+	}
+	if strings.TrimSpace(run.ApprovalActor) == "" && strings.TrimSpace(result.Actor) != "" {
+		run.ApprovalActor = result.Actor
+	}
+	if strings.TrimSpace(run.Target) == "" && strings.TrimSpace(result.Target) != "" {
+		run.Target = result.Target
 	}
 	run.StepStatuses[result.StepID] = result.Status
 	if result.Status == "FAILED_SAFE" {
@@ -2036,6 +2055,31 @@ func compileSteps(runID string, trigger responseTrigger, playbook roePlaybook) (
 	return steps, nil
 }
 
+func deriveRunTarget(trigger responseTrigger) string {
+	if trimmed := strings.TrimSpace(trigger.GroupKey); trimmed != "" {
+		return trimmed
+	}
+	if trimmed := strings.TrimSpace(trigger.AgentID); trimmed != "" {
+		return "agent:" + trimmed
+	}
+	return ""
+}
+
+func auditActor(actor string) string {
+	trimmed := strings.TrimSpace(actor)
+	if trimmed == "" {
+		return "system:auto"
+	}
+	return trimmed
+}
+
+func operatorActionForRun(run runRecord) string {
+	if run.Status == "FAILED_SAFE" && run.StepSucceededCount > 0 && run.StepSucceededCount < run.StepTotal {
+		return "manual_restore_check_recommended"
+	}
+	return ""
+}
+
 func extractRunID(data []byte) string {
 	var raw map[string]any
 	if err := json.Unmarshal(data, &raw); err != nil {
@@ -2214,9 +2258,16 @@ func (r *roeRuntime) exportRunUpdate(run runRecord) error {
 		"step_failed_safe_count":      run.StepFailedSafeCount,
 		"step_failed_transient_count": run.StepFailedTransientCount,
 		"last_updated_at_unix_ms":     run.LastUpdatedAtUnixMs,
+		"actor":                       auditActor(run.ApprovalActor),
+	}
+	if strings.TrimSpace(run.Target) != "" {
+		obj["target"] = strings.TrimSpace(run.Target)
 	}
 	if strings.TrimSpace(run.FailedSafeReason) != "" {
 		obj["failed_safe_reason"] = run.FailedSafeReason
+	}
+	if action := operatorActionForRun(run); action != "" {
+		obj["operator_action"] = action
 	}
 	return r.resultsExport.WriteJSON(obj)
 }

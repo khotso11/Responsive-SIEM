@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -25,18 +26,30 @@ import (
 const (
 	invalidUserRuleID        = "R-COLLECT-INVALID-USER"
 	processCountRuleID       = "R-COUNT-PROCESS-HOST"
+	fr03HostRuleID           = "R-FR03-HOST-BRUTEFORCE-BURST"
+	fr03NetworkRuleID        = "R-FR03-NETWORK-C2-BEACON"
+	fr03DeceptionRuleID      = "R-FR03-DECEPTION-TRIPWIRE"
 	invalidUserLane          = "FAST"
 	processCountLane         = "STANDARD"
+	fr03Lane                 = "FAST"
 	detectorSeverityHigh     = "high"
+	detectorSeverityCritical = "critical"
 	processCountThreshold    = 3
+	fr03HostBurstThreshold   = 3
+	fr03HostBurstWindowMs    = 5000
 	defaultPullBatch         = 10
 	defaultPullTimeout       = 500 * time.Millisecond
 )
 
 var (
-	invalidUserPattern = "invalid user"
-	ipv4FromPattern    = regexp.MustCompile(`(?i)\bfrom\s+(\d{1,3}(?:\.\d{1,3}){3})\b`)
-	processCountPattern = regexp.MustCompile(`(?i)\bprocess_count=(\d+)\b`)
+	invalidUserPattern       = "invalid user"
+	ipv4FromPattern          = regexp.MustCompile(`(?i)\bfrom\s+(\d{1,3}(?:\.\d{1,3}){3})\b`)
+	processCountPattern      = regexp.MustCompile(`(?i)\bprocess_count=(\d+)\b`)
+	explicitTSPattern        = regexp.MustCompile(`\bts=([0-9]{9,13})\b`)
+	fr03HostMarkerPattern    = regexp.MustCompile(`(?i)\battack=host_bruteforce\b`)
+	fr03NetworkMarkerPattern = regexp.MustCompile(`(?i)\battack=(network_scan|c2_beacon)\b`)
+	fr03DeceptionPattern     = regexp.MustCompile(`(?i)\battack=deception_tripwire\b`)
+	fr03HostBurstTracker     = newBurstTracker(fr03HostBurstWindowMs, fr03HostBurstThreshold)
 )
 
 type rawEvent struct {
@@ -179,17 +192,22 @@ func handleMessage(ctx context.Context, logger *slog.Logger, kv nats.KeyValue, c
 		slog.String("rule_id", match.RuleID),
 		slog.String("group_key", match.GroupKey),
 	)
-	ts := evt.Ts
-	if ts == 0 && evt.ObservedAtUnixMs > 0 {
-		ts = evt.ObservedAtUnixMs / 1000
+	eventTsUnixMs := extractEventTSUnixMs(evt, message)
+	alertTsUnixMs := time.Now().UnixMilli()
+	latencyMs := alertTsUnixMs - eventTsUnixMs
+	if latencyMs < 0 {
+		latencyMs = 0
 	}
 	logger.Info("detector_rule_matched",
 		slog.String("rule_id", match.RuleID),
+		slog.String("severity", match.Severity),
 		slog.String("event_idem_key", evt.EventIdemKey),
 		slog.String("event_type", evt.EventType),
 		slog.String("src_ip", evt.SrcIP),
 		slog.String("user", evt.User),
-		slog.Int64("ts", ts),
+		slog.Int64("event_ts_unix_ms", eventTsUnixMs),
+		slog.Int64("alert_ts_unix_ms", alertTsUnixMs),
+		slog.Int64("latency_ms", latencyMs),
 	)
 
 	entry, err := kv.Get(evt.EventIdemKey)
@@ -237,7 +255,10 @@ func handleMessage(ctx context.Context, logger *slog.Logger, kv nats.KeyValue, c
 		Severity:         match.Severity,
 		Lane:             match.Lane,
 		GroupKey:         match.GroupKey,
-		ObservedAtUnixMs: time.Now().UnixMilli(),
+		ObservedAtUnixMs: alertTsUnixMs,
+		EventTsUnixMs:    eventTsUnixMs,
+		AlertTsUnixMs:    alertTsUnixMs,
+		LatencyMs:        latencyMs,
 	}
 	_, triggerID, err := publisher.PublishAlert(alert)
 	if err != nil {
@@ -249,6 +270,14 @@ func handleMessage(ctx context.Context, logger *slog.Logger, kv nats.KeyValue, c
 	logger.Info("trigger_published",
 		slog.String("alert_key", alertKey),
 		slog.String("trigger_idem_key", triggerID),
+	)
+	logger.Info("detector_alert_published",
+		slog.String("rule_id", match.RuleID),
+		slog.String("severity", match.Severity),
+		slog.String("event_idem_key", evt.EventIdemKey),
+		slog.Int64("event_ts_unix_ms", eventTsUnixMs),
+		slog.Int64("alert_ts_unix_ms", alertTsUnixMs),
+		slog.Int64("latency_ms", latencyMs),
 	)
 
 	_ = msg.Ack()
@@ -270,6 +299,52 @@ func eventMessage(evt rawEvent) string {
 }
 
 func matchRule(message string, evt rawEvent) (ruleMatch, bool) {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	if fr03DeceptionPattern.MatchString(lower) {
+		groupKey := strings.TrimSpace(evt.SrcIP)
+		if groupKey == "" {
+			groupKey = extractIPv4(message)
+		}
+		return ruleMatch{
+			RuleID:   fr03DeceptionRuleID,
+			Lane:     fr03Lane,
+			Severity: detectorSeverityCritical,
+			GroupKey: groupKey,
+		}, true
+	}
+
+	if fr03NetworkMarkerPattern.MatchString(lower) {
+		groupKey := strings.TrimSpace(evt.SrcIP)
+		if groupKey == "" {
+			groupKey = extractIPv4(message)
+		}
+		return ruleMatch{
+			RuleID:   fr03NetworkRuleID,
+			Lane:     fr03Lane,
+			Severity: detectorSeverityHigh,
+			GroupKey: groupKey,
+		}, true
+	}
+
+	if fr03HostMarkerPattern.MatchString(lower) {
+		groupKey := strings.TrimSpace(evt.SrcIP)
+		if groupKey == "" {
+			groupKey = extractIPv4(message)
+		}
+		if groupKey == "" {
+			return ruleMatch{}, false
+		}
+		if !fr03HostBurstTracker.Observe(groupKey, evt.ObservedAtUnixMs) {
+			return ruleMatch{}, false
+		}
+		return ruleMatch{
+			RuleID:   fr03HostRuleID,
+			Lane:     fr03Lane,
+			Severity: detectorSeverityHigh,
+			GroupKey: groupKey,
+		}, true
+	}
+
 	if strings.EqualFold(strings.TrimSpace(evt.EventType), "auth_failed") {
 		groupKey := strings.TrimSpace(evt.SrcIP)
 		if groupKey == "" {
@@ -333,9 +408,86 @@ func alertKeyForRule(ruleID, eventID string) string {
 		return "A-COLLECT-INVALID-USER-" + eventID
 	case processCountRuleID:
 		return "A-COUNT-PROCESS-HOST-" + eventID
+	case fr03HostRuleID:
+		return "A-FR03-HOST-BRUTEFORCE-BURST-" + eventID
+	case fr03NetworkRuleID:
+		return "A-FR03-NETWORK-C2-BEACON-" + eventID
+	case fr03DeceptionRuleID:
+		return "A-FR03-DECEPTION-TRIPWIRE-" + eventID
 	default:
 		return "A-UNKNOWN-" + eventID
 	}
+}
+
+func extractEventTSUnixMs(evt rawEvent, message string) int64 {
+	if m := explicitTSPattern.FindStringSubmatch(message); len(m) == 2 {
+		if parsed, ok := parseUnixTSMillis(m[1]); ok && parsed > 0 {
+			return parsed
+		}
+	}
+	if evt.Ts > 0 {
+		if evt.Ts >= 1_000_000_000_000 {
+			return evt.Ts
+		}
+		return evt.Ts * 1000
+	}
+	if evt.ObservedAtUnixMs > 0 {
+		return evt.ObservedAtUnixMs
+	}
+	return time.Now().UnixMilli()
+}
+
+func parseUnixTSMillis(raw string) (int64, bool) {
+	ts, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	if ts <= 0 {
+		return 0, false
+	}
+	if ts >= 1_000_000_000_000 {
+		return ts, true
+	}
+	return ts * 1000, true
+}
+
+type burstTracker struct {
+	mu        sync.Mutex
+	windowMs  int64
+	threshold int
+	hitsByKey map[string][]int64
+}
+
+func newBurstTracker(windowMs int64, threshold int) *burstTracker {
+	return &burstTracker{
+		windowMs:  windowMs,
+		threshold: threshold,
+		hitsByKey: make(map[string][]int64, 64),
+	}
+}
+
+func (b *burstTracker) Observe(key string, observedAtUnixMs int64) bool {
+	if strings.TrimSpace(key) == "" {
+		return false
+	}
+	if observedAtUnixMs <= 0 {
+		observedAtUnixMs = time.Now().UnixMilli()
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	raw := b.hitsByKey[key]
+	kept := raw[:0]
+	cutoff := observedAtUnixMs - b.windowMs
+	for _, ts := range raw {
+		if ts >= cutoff {
+			kept = append(kept, ts)
+		}
+	}
+	kept = append(kept, observedAtUnixMs)
+	b.hitsByKey[key] = kept
+	return len(kept) == b.threshold
 }
 
 func checkCooldown(kv nats.KeyValue, key string, cooldownMs int) (int64, bool, error) {

@@ -239,3 +239,53 @@ func TestQuarantineMoveRestoreCommands(t *testing.T) {
 		t.Fatalf("expected restored file: %v", err)
 	}
 }
+
+func TestMarkerCommandIdempotent(t *testing.T) {
+	base := t.TempDir()
+	prevWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	defer func() {
+		_ = os.Chdir(prevWD)
+	}()
+	if err := os.Chdir(base); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	exec := newCommandExecutor(slog.Default(), quarantinePolicy{})
+
+	first := exec.handle(context.Background(), commandRequest{
+		RunID:      "run-1",
+		StepID:     "step-1",
+		ActionType: "agent_command",
+		Target:     "10.0.0.1",
+		Params: map[string]any{
+			"command": "contain_bruteforce_ip",
+		},
+	})
+	if first.Status != "ok" || first.ExitCode != 0 {
+		t.Fatalf("unexpected first marker reply: %#v", first)
+	}
+
+	second := exec.handle(context.Background(), commandRequest{
+		RunID:      "run-1",
+		StepID:     "step-2",
+		ActionType: "agent_command",
+		Target:     "10.0.0.1",
+		Params: map[string]any{
+			"command": "contain_bruteforce_ip",
+		},
+	})
+	if second.Status != "ok" || second.ExitCode != 0 {
+		t.Fatalf("unexpected idempotent marker reply: %#v", second)
+	}
+	if first.Stdout == "" || second.Stdout == "" {
+		t.Fatalf("expected marker output paths, got first=%q second=%q", first.Stdout, second.Stdout)
+	}
+	if first.Stdout != second.Stdout {
+		t.Fatalf("expected stable marker path, got first=%q second=%q", first.Stdout, second.Stdout)
+	}
+	if _, err := os.Stat(first.Stdout); err != nil {
+		t.Fatalf("expected marker file %q: %v", first.Stdout, err)
+	}
+}

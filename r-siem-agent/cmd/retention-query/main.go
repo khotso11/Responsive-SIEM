@@ -1,8 +1,14 @@
 package main
 
 import (
+	"bufio"
+	"crypto/sha256"
+	"encoding/csv"
+	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -99,8 +105,16 @@ func runQuery(args []string) error {
 	contains := fs.String("contains", "", "Substring filter")
 	outPath := fs.String("out", "", "Output JSONL path (default stdout)")
 	summaryOut := fs.String("summary_out", "", "Summary JSON output path")
+	format := fs.String("format", "jsonl", "Output format: jsonl|csv")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	outputFormat := strings.ToLower(strings.TrimSpace(*format))
+	if outputFormat == "" {
+		outputFormat = "jsonl"
+	}
+	if outputFormat != "jsonl" && outputFormat != "csv" {
+		return fmt.Errorf("unsupported --format: %s", *format)
 	}
 
 	sinceMs, err := parseTimeArg(*sinceRaw)
@@ -129,7 +143,7 @@ func runQuery(args []string) error {
 		defer closeFn()
 	}
 
-	result, err := retain.Query(retain.QueryOptions{
+	queryOpts := retain.QueryOptions{
 		RetainedDir: *retainedDir,
 		Type:        *recordType,
 		SinceUnixMs: sinceMs,
@@ -138,10 +152,36 @@ func runQuery(args []string) error {
 		PlaybookID:  strings.TrimSpace(*playbookID),
 		Status:      strings.TrimSpace(*status),
 		Contains:    *contains,
-	}, out)
-	if err != nil {
-		return err
 	}
+
+	var result retain.QueryResult
+	if outputFormat == "jsonl" {
+		var err error
+		result, err = retain.Query(queryOpts, out)
+		if err != nil {
+			return err
+		}
+	} else {
+		tmp, err := os.CreateTemp("", "retention-query-*.jsonl")
+		if err != nil {
+			return err
+		}
+		tmpPath := tmp.Name()
+		defer os.Remove(tmpPath)
+
+		result, err = retain.Query(queryOpts, tmp)
+		closeErr := tmp.Close()
+		if err != nil {
+			return err
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if err := writeCSVFromJSONL(tmpPath, out); err != nil {
+			return err
+		}
+	}
+
 	if strings.TrimSpace(*summaryOut) != "" {
 		if err := os.MkdirAll(filepath.Dir(*summaryOut), 0o755); err != nil {
 			return err
@@ -152,6 +192,92 @@ func runQuery(args []string) error {
 	}
 	fmt.Printf("QUERY_COUNT=%d\n", result.Count)
 	return nil
+}
+
+var csvColumns = []string{
+	"type",
+	"status",
+	"run_id",
+	"playbook_id",
+	"ts_unix_ms",
+	"source",
+	"rule_id",
+	"severity",
+	"event",
+	"step_id",
+	"operator_action",
+	"failed_safe_reason",
+	"line_sha256",
+}
+
+func writeCSVFromJSONL(path string, out io.Writer) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	cw := csv.NewWriter(out)
+	if err := cw.Write(csvColumns); err != nil {
+		return err
+	}
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var raw map[string]any
+		if err := json.Unmarshal([]byte(line), &raw); err != nil {
+			continue
+		}
+		record := make([]string, 0, len(csvColumns))
+		lineSHA := sha256Hex(asString(raw["line"]))
+		for _, col := range csvColumns {
+			switch col {
+			case "line_sha256":
+				record = append(record, lineSHA)
+			default:
+				record = append(record, asString(raw[col]))
+			}
+		}
+		if err := cw.Write(record); err != nil {
+			return err
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	cw.Flush()
+	return cw.Error()
+}
+
+func sha256Hex(v string) string {
+	h := sha256.Sum256([]byte(v))
+	return hex.EncodeToString(h[:])
+}
+
+func asString(v any) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case json.Number:
+		return t.String()
+	case float64:
+		return strconv.FormatInt(int64(t), 10)
+	case int64:
+		return strconv.FormatInt(t, 10)
+	case int:
+		return strconv.Itoa(t)
+	case bool:
+		if t {
+			return "true"
+		}
+		return "false"
+	default:
+		return ""
+	}
 }
 
 func runPrune(args []string) error {

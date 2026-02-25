@@ -29,6 +29,9 @@ type Alert struct {
 	GroupBy          string
 	GroupKey         string
 	ObservedAtUnixMs int64
+	EventTsUnixMs    int64
+	AlertTsUnixMs    int64
+	LatencyMs        int64
 }
 
 // Publisher publishes ROE triggers using the pubtrigger schema.
@@ -60,6 +63,21 @@ func (p *Publisher) PublishAlert(alert Alert) (string, string, error) {
 	if observedAt == 0 {
 		observedAt = time.Now().UnixMilli()
 	}
+	eventTs := alert.EventTsUnixMs
+	if eventTs <= 0 {
+		eventTs = observedAt
+	}
+	alertTs := alert.AlertTsUnixMs
+	if alertTs <= 0 {
+		alertTs = observedAt
+	}
+	latencyMs := alert.LatencyMs
+	if latencyMs < 0 {
+		latencyMs = 0
+	}
+	if latencyMs == 0 && alertTs >= eventTs {
+		latencyMs = alertTs - eventTs
+	}
 	payload := map[string]any{
 		"msg":                 "response_trigger",
 		"trigger_kind":        "alert",
@@ -69,6 +87,9 @@ func (p *Publisher) PublishAlert(alert Alert) (string, string, error) {
 		"severity":            strings.TrimSpace(alert.Severity),
 		"lane":                lane,
 		"observed_at_unix_ms": observedAt,
+		"event_ts_unix_ms":    eventTs,
+		"alert_ts_unix_ms":    alertTs,
+		"latency_ms":          latencyMs,
 	}
 	if strings.TrimSpace(alert.GroupBy) != "" {
 		payload["group_by"] = strings.TrimSpace(alert.GroupBy)

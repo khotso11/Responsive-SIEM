@@ -571,3 +571,33 @@ rce:
           fields:
             severity: high
         - type: network
+
+    - id: R-FR03-HOST-BRUTEFORCE-BURST
+      enabled: true
+      kind: trigger
+      severity: high
+      group_by: src_ip
+      when:
+        type: auth
+        fields:
+          message_contains: "attack=host_bruteforce"
+
+    - id: R-FR03-NETWORK-C2-BEACON
+      enabled: true
+      kind: trigger
+      severity: high
+      group_by: src_ip
+      when:
+        type: auth
+        fields:
+          message_contains: "attack=network_scan"
+
+    - id: R-FR03-DECEPTION-TRIPWIRE
+      enabled: true
+      kind: trigger
+      severity: critical
+      group_by: src_ip
+      when:
+        type: auth
+        fields:
+          message_contains: "attack=deception_tripwire"

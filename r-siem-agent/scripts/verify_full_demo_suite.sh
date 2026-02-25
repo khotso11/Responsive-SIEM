@@ -36,12 +36,16 @@ run_script ./scripts/test_minimal_patch.sh
 run_script ./scripts/verify_fr02_full.sh
 run_script ./scripts/verify_fr05_full.sh
 run_script ./scripts/verify_new_playbooks.sh
+run_script ./scripts/verify_fr03.sh
+run_script ./scripts/verify_fr04.sh
 
 fr02_rotation_json="$(extract_artifact FR02_ROTATION_PROOF_JSON)"
 fr02_revocation_json="$(extract_artifact FR02_REVOCATION_PROOF_JSON)"
 fr05_success_json="$(extract_artifact FR05_SUCCESS_PROOF_JSON)"
 fr05_failed_safe_json="$(extract_artifact FR05_FAILED_SAFE_PROOF_JSON)"
 new_playbooks_json="$(extract_artifact NEW_PLAYBOOKS_PROOF_JSON)"
+fr03_json="$(extract_artifact FR03_PROOF_JSON)"
+fr04_json="$(extract_artifact FR04_PROOF_JSON)"
 
 check_artifact_exists() {
   local key="$1"
@@ -57,6 +61,20 @@ check_artifact_exists FR02_REVOCATION_PROOF_JSON "$fr02_revocation_json"
 check_artifact_exists FR05_SUCCESS_PROOF_JSON "$fr05_success_json"
 check_artifact_exists FR05_FAILED_SAFE_PROOF_JSON "$fr05_failed_safe_json"
 check_artifact_exists NEW_PLAYBOOKS_PROOF_JSON "$new_playbooks_json"
+check_artifact_exists FR03_PROOF_JSON "$fr03_json"
+check_artifact_exists FR04_PROOF_JSON "$fr04_json"
+
+if [[ -n "$fr04_json" ]]; then
+  fr04_dir="$(dirname "$fr04_json")"
+  if [[ ! -f "${fr04_dir}/capture.pcap" ]]; then
+    echo "FAIL: FR04 capture missing: ${fr04_dir}/capture.pcap" >&2
+    exit 1
+  fi
+  if [[ ! -f "${fr04_dir}/chain_of_custody.json" ]]; then
+    echo "FAIL: FR04 custody missing: ${fr04_dir}/chain_of_custody.json" >&2
+    exit 1
+  fi
+fi
 
 echo "PASS: full demo suite completed"
 echo "FULL_DEMO_SUITE_LOG=${LOG_PATH}"
@@ -65,3 +83,5 @@ echo "FULL_DEMO_SUITE_LOG=${LOG_PATH}"
 [[ -n "$fr05_success_json" ]] && echo "FR05_SUCCESS_PROOF_JSON=${fr05_success_json}"
 [[ -n "$fr05_failed_safe_json" ]] && echo "FR05_FAILED_SAFE_PROOF_JSON=${fr05_failed_safe_json}"
 [[ -n "$new_playbooks_json" ]] && echo "NEW_PLAYBOOKS_PROOF_JSON=${new_playbooks_json}"
+[[ -n "$fr03_json" ]] && echo "FR03_PROOF_JSON=${fr03_json}"
+[[ -n "$fr04_json" ]] && echo "FR04_PROOF_JSON=${fr04_json}"

@@ -1,0 +1,17 @@
+log_level: INFO
+
+jetstream:
+  url: nats://127.0.0.1:4222
+  stream: RSIEM_EVENTS
+  subject: rsiem.events.raw
+
+collector:
+  bind_addr: 127.0.0.1
+  port: 5140
+  max_packet_bytes: 8192
+  queue_size: 1024
+  rate_limit_pps: 500
+  raw_subject: rsiem.events.raw
+  node_id: collector-syslog
+  source_type: syslog
+  max_message_len: 2048

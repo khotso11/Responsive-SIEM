@@ -1,0 +1,16 @@
+log_level: INFO
+
+jetstream:
+  url: nats://127.0.0.1:4222
+  stream: RSIEM_EVENTS
+  subject: rsiem.events.raw
+
+collector:
+  bind_addr: 127.0.0.1
+  port: 2055
+  max_packet_bytes: 4096
+  queue_size: 1024
+  rate_limit_pps: 500
+  raw_subject: rsiem.events.raw
+  node_id: collector-netflowv5
+  source_type: netflow_v5

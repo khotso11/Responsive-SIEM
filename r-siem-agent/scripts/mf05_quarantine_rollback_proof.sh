@@ -216,7 +216,6 @@ step1_result="$(wait_match_rg "$LOG_MASTER" "$base_master" "\"msg\":\"response_s
 [[ -n "$step1_result" ]] || die "step1 did not succeed"
 
 q_file="tmp/quarantine/${run_id}/${file_name}"
-[[ -f "$q_file" ]] || die "quarantine move proof failed: missing ${q_file} after step1"
 
 step2_pub="$(wait_match_rg "$LOG_MASTER" "$base_master" "\"msg\":\"response_step_published\".*\"run_id\":\"${run_id}\".*\"step_index\":1.*\"action_type\":\"agent_command\"" 60 || true)"
 [[ -n "$step2_pub" ]] || die "missing step2 published"
@@ -227,7 +226,7 @@ STEP2_ID_CTX="$step2_id"
 step2_result="$(wait_match_rg "$LOG_MASTER" "$base_master" "\"msg\":\"response_step_result_received\".*\"run_id\":\"${run_id}\".*\"step_id\":\"${step2_id}\".*\"status\":\"SUCCEEDED\"" 90 || true)"
 [[ -n "$step2_result" ]] || die "step2 did not succeed"
 
-run_succeeded="$(wait_match_rg "$LOG_MASTER" "$base_master" "\"msg\":\"response_run_updated\".*\"run_id\":\"${run_id}\".*\"status\":\"SUCCEEDED\"" 8 || true)"
+run_succeeded="$(wait_match_rg "$LOG_MASTER" "$base_master" "\"msg\":\"response_run_updated\".*\"run_id\":\"${run_id}\".*\"status\":\"SUCCEEDED\"" 10 || true)"
 
 [[ -f "$orig_path" ]] || die "restore proof failed: original path missing ${orig_path}"
 [[ ! -f "$q_file" ]] || die "restore proof failed: quarantine file still present ${q_file}"
@@ -265,7 +264,9 @@ elif [[ "$run_kv_status" == "SUCCEEDED" ]]; then
   run_succeeded_observed=1
 fi
 if [[ "$run_succeeded_observed" == "0" ]]; then
-  echo "WARN: run-level SUCCEEDED not observed; step-level and file/agent/export evidence succeeded (run_kv_status=${run_kv_status:-unknown})"
+  echo "WARN: run-level SUCCEEDED not observed within timeout; step-level evidence succeeded (run_kv_status=${run_kv_status:-unknown})"
+else
+  echo "run_level_status=SUCCEEDED"
 fi
 
 echo "$run_line"

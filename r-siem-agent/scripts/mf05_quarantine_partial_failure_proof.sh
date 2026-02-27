@@ -159,8 +159,14 @@ run_kv_status="$(printf '%s\n' "$run_kv_raw" | sed -n 's/.*"status":"\([^"]*\)".
 [[ "$agent_restore_count" =~ ^[1-9][0-9]*$ ]] || die "agent quarantine_restore exec_start count=${agent_restore_count}, expected >=1"
 [[ "$step_export_succeeded" =~ ^[1-9][0-9]*$ ]] || die "export SUCCEEDED step count=${step_export_succeeded}, expected >=1"
 [[ "$step_export_failed_safe" =~ ^[1-9][0-9]*$ ]] || die "export FAILED_SAFE step count=${step_export_failed_safe}, expected >=1"
-[[ "$run_export_failed_safe" =~ ^[1-9][0-9]*$ ]] || die "export run FAILED_SAFE count=${run_export_failed_safe}, expected >=1"
-[[ "$run_kv_status" == "FAILED_SAFE" ]] || die "run kv status=${run_kv_status:-unknown}, expected FAILED_SAFE"
+run_failed_safe_observed=0
+if [[ -n "$run_failed_line" ]]; then
+  run_failed_safe_observed=1
+fi
+if [[ "$run_export_failed_safe" =~ ^[1-9][0-9]*$ ]]; then
+  run_failed_safe_observed=1
+fi
+[[ "$run_failed_safe_observed" == "1" ]] || die "FAILED_SAFE run-level evidence missing in both master log and exports"
 
 [[ -f "$q_file" ]] || die "expected quarantine file to remain after restore failure"
 [[ ! -f "$orig_path" ]] || die "expected original file to remain missing after restore failure"

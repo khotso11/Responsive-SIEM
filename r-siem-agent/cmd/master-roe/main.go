@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -20,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	_ "github.com/lib/pq"
 	"github.com/nats-io/nats.go"
 	"gopkg.in/yaml.v3"
 
@@ -173,10 +175,15 @@ type responseTrigger struct {
 	RuleID           string
 	RuleKind         string
 	Severity         string
+	EventType        string
+	SourceType       string
+	SrcIP            string
+	UserName         string
 	Lane             string
 	GroupBy          string
 	GroupKey         string
 	AgentID          string
+	EventTsUnixMs    int64
 	ObservedAtUnixMs int64
 	Stream           string
 	Consumer         string
@@ -276,7 +283,28 @@ type roeRuntime struct {
 	dispatchLowPct     int
 	resultsExport      *roeResultsExporter
 	approvalsExport    *roeJournal
+	dbSink             *roeDBSink
 	resultLockHolderID string
+}
+
+type roeDBRecord struct {
+	EventTsUnixMs int64
+	RecvTsUnixMs  int64
+	NodeID        string
+	SourceType    string
+	EventType     string
+	SrcIP         string
+	UserName      string
+	Severity      string
+	RuleID        string
+	EventIdemKey  string
+	RawLineSHA256 string
+}
+
+type roeDBSink struct {
+	logger *slog.Logger
+	cfg    config.MasterDBConfig
+	db     *sql.DB
 }
 
 var errResultNoAck = errors.New("result_nak")
@@ -425,6 +453,20 @@ func main() {
 		resultsExport:      resultsExporter,
 		approvalsExport:    approvalsJournal,
 		resultLockHolderID: newRuntimeID("master-roe-results"),
+	}
+
+	dbSink, err := newROEDBSink(logger, baseCfg.DB)
+	if err != nil {
+		logger.Error("db_sink_init_failed", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	if dbSink != nil {
+		runtime.dbSink = dbSink
+		defer dbSink.Close()
+		logger.LogAttrs(context.Background(), slog.LevelInfo, "db_sink_enabled",
+			slog.String("dsn", baseCfg.DB.DSN),
+			slog.Bool("fail_closed", baseCfg.DB.FailClosed),
+		)
 	}
 
 	ctx, cancel := signalContext()
@@ -1000,6 +1042,9 @@ func processTrigger(runtime *roeRuntime, msg *nats.Msg, lane string, runJournal 
 		slog.String("rule_id", trigger.RuleID),
 		slog.String("severity", trigger.Severity),
 	)
+	if err := runtime.persistNormalizedEvent(trigger, msg.Data); err != nil {
+		return err
+	}
 
 	if entry, err := runtime.idempKV.Get(trigger.TriggerIdemKey); err == nil {
 		runID := extractRunID(entry.Value())
@@ -1539,6 +1584,10 @@ func decodeTrigger(data []byte) (responseTrigger, error) {
 		RuleID:         stringFieldRaw(raw, "rule_id"),
 		RuleKind:       stringFieldRaw(raw, "rule_kind"),
 		Severity:       stringFieldRaw(raw, "severity"),
+		EventType:      stringFieldRaw(raw, "event_type"),
+		SourceType:     stringFieldRaw(raw, "source_type"),
+		SrcIP:          stringFieldRaw(raw, "src_ip"),
+		UserName:       stringFieldRaw(raw, "user"),
 		Lane:           stringFieldRaw(raw, "lane"),
 		GroupBy:        stringFieldRaw(raw, "group_by"),
 		GroupKey:       stringFieldRaw(raw, "group_key"),
@@ -1553,6 +1602,9 @@ func decodeTrigger(data []byte) (responseTrigger, error) {
 	}
 	if ts, ok := int64Field(raw, "observed_at_unix_ms"); ok {
 		trigger.ObservedAtUnixMs = ts
+	}
+	if ts, ok := int64Field(raw, "event_ts_unix_ms"); ok {
+		trigger.EventTsUnixMs = ts
 	}
 	if jsSeq, ok := uint64Field(raw, "js_seq"); ok {
 		trigger.JSSeq = &jsSeq
@@ -2506,6 +2558,193 @@ func (j *roeJournal) handleError(err error) error {
 		return err
 	}
 	return nil
+}
+
+func newROEDBSink(logger *slog.Logger, cfg config.MasterDBConfig) (*roeDBSink, error) {
+	if !cfg.Enabled {
+		return nil, nil
+	}
+	db, err := sql.Open("postgres", cfg.DSN)
+	if err != nil {
+		return nil, fmt.Errorf("open db: %w", err)
+	}
+	db.SetMaxOpenConns(8)
+	db.SetMaxIdleConns(4)
+	db.SetConnMaxLifetime(30 * time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("ping db: %w", err)
+	}
+	sink := &roeDBSink{
+		logger: logger,
+		cfg:    cfg,
+		db:     db,
+	}
+	if err := sink.ensureSchema(ctx); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("ensure db schema: %w", err)
+	}
+	return sink, nil
+}
+
+func (s *roeDBSink) Close() {
+	if s == nil || s.db == nil {
+		return
+	}
+	_ = s.db.Close()
+}
+
+func (s *roeDBSink) ensureSchema(ctx context.Context) error {
+	schemaSQL := `
+CREATE TABLE IF NOT EXISTS normalized_events (
+  id BIGSERIAL PRIMARY KEY,
+  ingest_ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+  event_ts_unix_ms BIGINT NOT NULL,
+  recv_ts_unix_ms BIGINT NOT NULL,
+  node_id TEXT NOT NULL,
+  source_type TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  src_ip INET NULL,
+  user_name TEXT NULL,
+  severity TEXT NULL,
+  rule_id TEXT NULL,
+  event_idem_key TEXT NOT NULL,
+  raw_line_sha256 TEXT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS normalized_events_event_idem_key_uidx ON normalized_events(event_idem_key);
+CREATE INDEX IF NOT EXISTS normalized_events_event_ts_idx ON normalized_events(event_ts_unix_ms);
+CREATE INDEX IF NOT EXISTS normalized_events_node_id_idx ON normalized_events(node_id);
+`
+	_, err := s.db.ExecContext(ctx, schemaSQL)
+	return err
+}
+
+func (s *roeDBSink) Insert(rec roeDBRecord) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	const q = `
+INSERT INTO normalized_events (
+  event_ts_unix_ms, recv_ts_unix_ms, node_id, source_type, event_type,
+  src_ip, user_name, severity, rule_id, event_idem_key, raw_line_sha256
+) VALUES ($1,$2,$3,$4,$5,NULLIF($6,'')::inet,NULLIF($7,''),$8,$9,$10,$11)
+ON CONFLICT (event_idem_key) DO NOTHING;
+`
+	_, err := s.db.ExecContext(ctx, q,
+		rec.EventTsUnixMs,
+		rec.RecvTsUnixMs,
+		rec.NodeID,
+		rec.SourceType,
+		rec.EventType,
+		rec.SrcIP,
+		rec.UserName,
+		rec.Severity,
+		rec.RuleID,
+		rec.EventIdemKey,
+		rec.RawLineSHA256,
+	)
+	if err == nil {
+		return nil
+	}
+	if s.cfg.FailClosed {
+		return err
+	}
+	s.logger.LogAttrs(context.Background(), slog.LevelWarn, "db_insert_failed",
+		slog.String("error", err.Error()),
+		slog.String("event_idem_key", rec.EventIdemKey),
+	)
+	return nil
+}
+
+func (r *roeRuntime) persistNormalizedEvent(trigger responseTrigger, raw []byte) error {
+	if r.dbSink == nil {
+		return nil
+	}
+	rec := buildROEDBRecord(trigger, raw)
+	if err := r.dbSink.Insert(rec); err != nil {
+		r.logger.LogAttrs(context.Background(), slog.LevelError, "db_insert_failed",
+			slog.String("error", err.Error()),
+			slog.String("event_idem_key", rec.EventIdemKey),
+		)
+		return err
+	}
+	return nil
+}
+
+func buildROEDBRecord(trigger responseTrigger, raw []byte) roeDBRecord {
+	nowMs := time.Now().UnixMilli()
+	eventTs := trigger.EventTsUnixMs
+	if eventTs <= 0 {
+		eventTs = trigger.ObservedAtUnixMs
+	}
+	if eventTs <= 0 {
+		eventTs = nowMs
+	}
+	recvTs := trigger.ObservedAtUnixMs
+	if recvTs <= 0 {
+		recvTs = nowMs
+	}
+	nodeID := strings.TrimSpace(trigger.AgentID)
+	if nodeID == "" {
+		nodeID = "unknown"
+	}
+	sourceType := strings.TrimSpace(trigger.SourceType)
+	if sourceType == "" {
+		sourceType = deriveSourceType(trigger.RuleID)
+	}
+	eventType := strings.TrimSpace(trigger.EventType)
+	if eventType == "" {
+		eventType = deriveEventType(sourceType, trigger.RuleID)
+	}
+	eventID := strings.TrimSpace(trigger.TriggerIdemKey)
+	if eventID == "" {
+		eventID = shortHash(fmt.Sprintf("%s|%s|%d", trigger.AlertKey, trigger.RuleID, recvTs))
+	}
+	rawHash := sha256.Sum256(raw)
+	return roeDBRecord{
+		EventTsUnixMs: eventTs,
+		RecvTsUnixMs:  recvTs,
+		NodeID:        nodeID,
+		SourceType:    sourceType,
+		EventType:     eventType,
+		SrcIP:         strings.TrimSpace(trigger.SrcIP),
+		UserName:      strings.TrimSpace(trigger.UserName),
+		Severity:      strings.TrimSpace(trigger.Severity),
+		RuleID:        strings.TrimSpace(trigger.RuleID),
+		EventIdemKey:  eventID,
+		RawLineSHA256: hex.EncodeToString(rawHash[:]),
+	}
+}
+
+func deriveSourceType(ruleID string) string {
+	id := strings.ToUpper(strings.TrimSpace(ruleID))
+	switch {
+	case strings.Contains(id, "DECEPTION"), strings.Contains(id, "HONEYPOT"):
+		return "deception"
+	case strings.Contains(id, "NETWORK"), strings.Contains(id, "C2"), strings.Contains(id, "EXFIL"):
+		return "network"
+	default:
+		return "host"
+	}
+}
+
+func deriveEventType(sourceType, ruleID string) string {
+	st := strings.ToLower(strings.TrimSpace(sourceType))
+	switch st {
+	case "deception":
+		return "deception_tripwire"
+	case "network":
+		return "network_alert"
+	}
+	id := strings.ToUpper(strings.TrimSpace(ruleID))
+	if strings.Contains(id, "FAILED-PW") || strings.Contains(id, "INVALID-USER") || strings.Contains(id, "BRUTEFORCE") {
+		return "auth_failed"
+	}
+	return "response_trigger"
 }
 
 func signalContext() (context.Context, context.CancelFunc) {

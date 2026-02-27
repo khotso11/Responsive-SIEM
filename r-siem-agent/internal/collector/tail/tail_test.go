@@ -40,3 +40,54 @@ func TestExtractAuthMetadata_AuthLogLine(t *testing.T) {
 		t.Fatalf("ts=%d, want deterministic %d", tsUnix, wantTS)
 	}
 }
+
+func TestExtractEventMetadata_ProcessExec(t *testing.T) {
+	line := `PROC exec="/usr/bin/curl" user=khotso src=10.1.1.1 ts=1700000000123 node=node-03`
+	meta := extractEventMetadata(line)
+
+	if meta.EventType != "process_exec" {
+		t.Fatalf("event_type=%q, want process_exec", meta.EventType)
+	}
+	if meta.ExecPath != "/usr/bin/curl" {
+		t.Fatalf("exec_path=%q, want /usr/bin/curl", meta.ExecPath)
+	}
+	if meta.User != "khotso" {
+		t.Fatalf("user=%q, want khotso", meta.User)
+	}
+	if meta.SrcIP != "10.1.1.1" {
+		t.Fatalf("src_ip=%q, want 10.1.1.1", meta.SrcIP)
+	}
+	if meta.NodeID != "node-03" {
+		t.Fatalf("node_id=%q, want node-03", meta.NodeID)
+	}
+	if meta.TSUnix != 1700000000 {
+		t.Fatalf("ts=%d, want 1700000000", meta.TSUnix)
+	}
+}
+
+func TestExtractEventMetadata_FileChange(t *testing.T) {
+	line := `FILE path="/tmp/secret.txt" action=modified user=khotso src=10.1.1.2 ts=1700000000456 node=node-04`
+	meta := extractEventMetadata(line)
+
+	if meta.EventType != "file_change" {
+		t.Fatalf("event_type=%q, want file_change", meta.EventType)
+	}
+	if meta.FilePath != "/tmp/secret.txt" {
+		t.Fatalf("file_path=%q, want /tmp/secret.txt", meta.FilePath)
+	}
+	if meta.FileAction != "modified" {
+		t.Fatalf("action=%q, want modified", meta.FileAction)
+	}
+	if meta.User != "khotso" {
+		t.Fatalf("user=%q, want khotso", meta.User)
+	}
+	if meta.SrcIP != "10.1.1.2" {
+		t.Fatalf("src_ip=%q, want 10.1.1.2", meta.SrcIP)
+	}
+	if meta.NodeID != "node-04" {
+		t.Fatalf("node_id=%q, want node-04", meta.NodeID)
+	}
+	if meta.TSUnix != 1700000000 {
+		t.Fatalf("ts=%d, want 1700000000", meta.TSUnix)
+	}
+}

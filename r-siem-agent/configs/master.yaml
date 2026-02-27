@@ -17,6 +17,13 @@ jetstream:
   durable_name_fast: master-fast
   durable_name_standard: master-standard
 
+db:
+  enabled: false
+  dsn: "postgres://rsiem:rsiem@127.0.0.1:5432/rsiem?sslmode=disable"
+  fail_closed: false
+  batch_size: 200
+  flush_interval_ms: 500
+
 collectors:
   tail:
     enabled: true

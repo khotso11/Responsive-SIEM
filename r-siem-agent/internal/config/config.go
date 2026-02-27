@@ -40,6 +40,11 @@ const (
 	defaultMasterDurableStandard      = "master-standard"
 	defaultMasterServerName           = "master.local"
 	defaultMasterClientIdentitySource = "cert_prefer"
+	defaultMasterDBEnabled            = false
+	defaultMasterDBDSN                = "postgres://rsiem:rsiem@127.0.0.1:5432/rsiem?sslmode=disable"
+	defaultMasterDBFailClosed         = false
+	defaultMasterDBBatchSize          = 200
+	defaultMasterDBFlushIntervalMs    = 500
 	defaultConsumerFastWorkers        = 1
 	defaultConsumerStandardWorkers    = 1
 	defaultConsumerPullBatch          = 10
@@ -474,6 +479,7 @@ type MasterConfig struct {
 	Transport   MasterTransportConfig `yaml:"transport"`
 	JetStream   JetStreamConfig       `yaml:"jetstream"`
 	Consumer    ConsumerConfig        `yaml:"consumer"`
+	DB          MasterDBConfig        `yaml:"db"`
 	AckDelayMs  int                   `yaml:"ack_delay_ms"`
 	AckDropRate float64               `yaml:"ack_drop_rate"`
 }
@@ -512,6 +518,15 @@ type ConsumerConfig struct {
 	StandardWorkers int `yaml:"standard_workers"`
 	PullBatch       int `yaml:"pull_batch"`
 	PullTimeoutMs   int `yaml:"pull_timeout_ms"`
+}
+
+// MasterDBConfig configures optional normalized-event persistence.
+type MasterDBConfig struct {
+	Enabled         bool   `yaml:"enabled"`
+	DSN             string `yaml:"dsn"`
+	FailClosed      bool   `yaml:"fail_closed"`
+	BatchSize       int    `yaml:"batch_size"`
+	FlushIntervalMs int    `yaml:"flush_interval_ms"`
 }
 
 // LoadMaster reads and validates the master configuration from disk.
@@ -567,6 +582,22 @@ func (c *MasterConfig) applyDefaults() {
 	}
 	if c.Consumer.PullTimeoutMs <= 0 {
 		c.Consumer.PullTimeoutMs = defaultConsumerPullTimeoutMillis
+	}
+
+	if strings.TrimSpace(c.DB.DSN) == "" {
+		c.DB.DSN = defaultMasterDBDSN
+	}
+	if c.DB.BatchSize <= 0 {
+		c.DB.BatchSize = defaultMasterDBBatchSize
+	}
+	if c.DB.FlushIntervalMs <= 0 {
+		c.DB.FlushIntervalMs = defaultMasterDBFlushIntervalMs
+	}
+	if !c.DB.Enabled {
+		c.DB.Enabled = defaultMasterDBEnabled
+	}
+	if !c.DB.FailClosed {
+		c.DB.FailClosed = defaultMasterDBFailClosed
 	}
 
 	if strings.TrimSpace(c.JetStream.URL) == "" {
@@ -677,6 +708,18 @@ func (c *MasterConfig) validate() error {
 		return fmt.Errorf("consumer.pull_timeout_ms must be > 0")
 	}
 
+	if c.DB.Enabled {
+		if strings.TrimSpace(c.DB.DSN) == "" {
+			return fmt.Errorf("db.dsn must be set when db.enabled=true")
+		}
+		if c.DB.BatchSize <= 0 {
+			return fmt.Errorf("db.batch_size must be > 0")
+		}
+		if c.DB.FlushIntervalMs <= 0 {
+			return fmt.Errorf("db.flush_interval_ms must be > 0")
+		}
+	}
+
 	return nil
 }
 
@@ -723,6 +766,13 @@ func (c *MasterConfig) Summary() map[string]any {
 			"standard_workers": c.Consumer.StandardWorkers,
 			"pull_batch":       c.Consumer.PullBatch,
 			"pull_timeout_ms":  c.Consumer.PullTimeoutMs,
+		},
+		"db": map[string]any{
+			"enabled":           c.DB.Enabled,
+			"dsn":               c.DB.DSN,
+			"fail_closed":       c.DB.FailClosed,
+			"batch_size":        c.DB.BatchSize,
+			"flush_interval_ms": c.DB.FlushIntervalMs,
 		},
 		"ack_delay_ms":  c.AckDelayMs,
 		"ack_drop_rate": c.AckDropRate,

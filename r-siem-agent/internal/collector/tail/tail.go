@@ -30,6 +30,9 @@ var (
 	ipv4SrcPattern  = regexp.MustCompile(`(?i)\bsrc[=: ]+(\d{1,3}(?:\.\d{1,3}){3})\b`)
 	userPattern     = regexp.MustCompile(`(?i)\buser(?:name)?[=: ]+([a-z0-9._-]+)\b`)
 	hostPattern     = regexp.MustCompile(`(?i)\bhost[=: ]+([a-z0-9._-]+)\b`)
+	nodePattern     = regexp.MustCompile(`(?i)\bnode[=: ]+([a-z0-9._-]+)\b`)
+	procExecPattern = regexp.MustCompile(`(?i)^PROC\s+exec="?([^"\s]+)"?\s+user=([a-z0-9._-]+)\s+src=(\d{1,3}(?:\.\d{1,3}){3})\s+ts=([0-9]{9,13})(?:\s+node=([a-z0-9._-]+))?$`)
+	fileChgPattern  = regexp.MustCompile(`(?i)^FILE\s+path="?([^"\s]+)"?\s+action=([a-z0-9._-]+)\s+user=([a-z0-9._-]+)\s+src=(\d{1,3}(?:\.\d{1,3}){3})\s+ts=([0-9]{9,13})(?:\s+node=([a-z0-9._-]+))?$`)
 	authFailedA     = regexp.MustCompile(`(?i)^FAILED login user=([a-z0-9._-]+)\s+src=(\d{1,3}(?:\.\d{1,3}){3})\s+ts=([0-9]{9,13})$`)
 	sshdFailed      = regexp.MustCompile(`(?i)Failed password for(?: invalid user)? ([a-z0-9._-]+) from (\d{1,3}(?:\.\d{1,3}){3})`)
 	explicitTSPat   = regexp.MustCompile(`\bts=([0-9]{9,13})\b`)
@@ -243,23 +246,26 @@ func (c *Collector) run(ctx context.Context) {
 }
 
 func (c *Collector) publishLine(ctx context.Context, line string, offset uint64) (string, bool, error) {
-	eventType, srcIP, user, tsUnix := extractAuthMetadata(line)
-	if eventType != "auth_failed" {
+	meta := extractEventMetadata(line)
+	if meta.EventType == "" {
 		return "", false, nil
 	}
 	source := fmt.Sprintf("tail:%s", c.cfg.Path)
 	eventID := eventIdemKey(source, offset, line)
-	host := extractHost(line)
+	host := meta.NodeID
+	if host == "" {
+		host = extractHost(line)
+	}
 	if host == "" {
 		host = resolveHost()
 	}
 
 	groupKey := host
-	if srcIP != "" {
-		groupKey = srcIP
+	if meta.SrcIP != "" {
+		groupKey = meta.SrcIP
 	}
-	if user == "" {
-		user = "unknown"
+	if meta.User == "" {
+		meta.User = "unknown"
 	}
 	payload := map[string]any{
 		"event_idem_key":      eventID,
@@ -269,10 +275,22 @@ func (c *Collector) publishLine(ctx context.Context, line string, offset uint64)
 		"host":                host,
 		"group_key":           groupKey,
 		"source":              source,
-		"user":                user,
-		"src_ip":              srcIP,
-		"event_type":          eventType,
-		"ts":                  tsUnix,
+		"user":                meta.User,
+		"src_ip":              meta.SrcIP,
+		"event_type":          meta.EventType,
+		"ts":                  meta.TSUnix,
+	}
+	if meta.ExecPath != "" {
+		payload["exec_path"] = meta.ExecPath
+	}
+	if meta.FilePath != "" {
+		payload["file_path"] = meta.FilePath
+	}
+	if meta.FileAction != "" {
+		payload["action"] = meta.FileAction
+	}
+	if meta.NodeID != "" {
+		payload["node"] = meta.NodeID
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -292,10 +310,10 @@ func (c *Collector) publishLine(ctx context.Context, line string, offset uint64)
 	c.published.Add(1)
 	c.logger.LogAttrs(context.Background(), slog.LevelInfo, "collector_event_published",
 		slog.String("event_idem_key", eventID),
-		slog.String("event_type", eventType),
-		slog.String("src_ip", srcIP),
-		slog.String("user", user),
-		slog.Int64("ts", tsUnix),
+		slog.String("event_type", meta.EventType),
+		slog.String("src_ip", meta.SrcIP),
+		slog.String("user", meta.User),
+		slog.Int64("ts", meta.TSUnix),
 	)
 	return eventID, true, nil
 }
@@ -343,10 +361,70 @@ func extractUser(line string) string {
 
 func extractHost(line string) string {
 	match := hostPattern.FindStringSubmatch(line)
-	if len(match) < 2 {
-		return ""
+	if len(match) >= 2 {
+		return match[1]
 	}
-	return match[1]
+	match = nodePattern.FindStringSubmatch(line)
+	if len(match) >= 2 {
+		return match[1]
+	}
+	return ""
+}
+
+type eventMetadata struct {
+	EventType  string
+	SrcIP      string
+	User       string
+	TSUnix     int64
+	ExecPath   string
+	FilePath   string
+	FileAction string
+	NodeID     string
+}
+
+func extractEventMetadata(line string) eventMetadata {
+	var out eventMetadata
+	line = strings.TrimSpace(line)
+
+	if m := procExecPattern.FindStringSubmatch(line); len(m) >= 5 {
+		out.EventType = "process_exec"
+		out.ExecPath = strings.TrimSpace(m[1])
+		out.User = strings.TrimSpace(m[2])
+		out.SrcIP = strings.TrimSpace(m[3])
+		out.TSUnix, _ = parseUnix(strings.TrimSpace(m[4]))
+		if len(m) >= 6 {
+			out.NodeID = strings.TrimSpace(m[5])
+		}
+		if out.TSUnix == 0 {
+			out.TSUnix = deriveTimestamp(line)
+		}
+		return out
+	}
+
+	if m := fileChgPattern.FindStringSubmatch(line); len(m) >= 6 {
+		out.EventType = "file_change"
+		out.FilePath = strings.TrimSpace(m[1])
+		out.FileAction = strings.TrimSpace(m[2])
+		out.User = strings.TrimSpace(m[3])
+		out.SrcIP = strings.TrimSpace(m[4])
+		out.TSUnix, _ = parseUnix(strings.TrimSpace(m[5]))
+		if len(m) >= 7 {
+			out.NodeID = strings.TrimSpace(m[6])
+		}
+		if out.TSUnix == 0 {
+			out.TSUnix = deriveTimestamp(line)
+		}
+		return out
+	}
+
+	eventType, srcIP, user, tsUnix := extractAuthMetadata(line)
+	if eventType != "" {
+		out.EventType = eventType
+		out.SrcIP = srcIP
+		out.User = user
+		out.TSUnix = tsUnix
+	}
+	return out
 }
 
 func extractAuthMetadata(line string) (eventType, srcIP, user string, tsUnix int64) {

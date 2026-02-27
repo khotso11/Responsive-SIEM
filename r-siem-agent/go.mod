@@ -5,6 +5,8 @@ go 1.24.0
 toolchain go1.24.11
 
 require (
+	github.com/lib/pq v1.10.9
+	github.com/nats-io/nats.go v1.37.0
 	google.golang.org/grpc v1.77.0
 	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v3 v3.0.1
@@ -12,7 +14,6 @@ require (
 
 require (
 	github.com/klauspost/compress v1.17.2 // indirect
-	github.com/nats-io/nats.go v1.37.0 // indirect
 	github.com/nats-io/nkeys v0.4.7 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect
 	golang.org/x/crypto v0.43.0 // indirect

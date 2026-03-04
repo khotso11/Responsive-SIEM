@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -27,12 +28,13 @@ const (
 )
 
 type commandRequest struct {
-	RunID      string         `json:"run_id"`
-	StepID     string         `json:"step_id"`
-	Lane       string         `json:"lane"`
-	ActionType string         `json:"action_type"`
-	Target     string         `json:"target"`
-	Params     map[string]any `json:"params"`
+	RunID         string         `json:"run_id"`
+	StepID        string         `json:"step_id"`
+	Lane          string         `json:"lane"`
+	ActionType    string         `json:"action_type"`
+	Target        string         `json:"target"`
+	TargetAgentID string         `json:"target_agent_id,omitempty"`
+	Params        map[string]any `json:"params"`
 }
 
 type commandReply struct {
@@ -44,6 +46,103 @@ type commandReply struct {
 	TruncatedStdout bool   `json:"truncated_stdout,omitempty"`
 	TruncatedStderr bool   `json:"truncated_stderr,omitempty"`
 	ErrorClass      string `json:"error_class,omitempty"`
+}
+
+type commandResultCache struct {
+	mu      sync.Mutex
+	ttl     time.Duration
+	entries map[string]*commandResultCacheEntry
+}
+
+type commandResultCacheEntry struct {
+	reply     []byte
+	ready     chan struct{}
+	createdAt time.Time
+}
+
+func newCommandResultCache(ttl time.Duration) *commandResultCache {
+	return &commandResultCache{
+		ttl:     ttl,
+		entries: make(map[string]*commandResultCacheEntry),
+	}
+}
+
+func (c *commandResultCache) begin(key string) (reply []byte, wait <-chan struct{}, execute bool) {
+	if c == nil || key == "" {
+		return nil, nil, true
+	}
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for k, entry := range c.entries {
+		if entry == nil {
+			delete(c.entries, k)
+			continue
+		}
+		if entry.reply != nil && now.Sub(entry.createdAt) > c.ttl {
+			delete(c.entries, k)
+		}
+	}
+	if entry, ok := c.entries[key]; ok && entry != nil {
+		if entry.reply != nil {
+			out := make([]byte, len(entry.reply))
+			copy(out, entry.reply)
+			return out, nil, false
+		}
+		return nil, entry.ready, false
+	}
+	c.entries[key] = &commandResultCacheEntry{
+		ready:     make(chan struct{}),
+		createdAt: now,
+	}
+	return nil, nil, true
+}
+
+func (c *commandResultCache) finish(key string, reply []byte) {
+	if c == nil || key == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[key]
+	if !ok || entry == nil {
+		return
+	}
+	if entry.reply == nil {
+		entry.reply = make([]byte, len(reply))
+		copy(entry.reply, reply)
+		close(entry.ready)
+	}
+	entry.createdAt = time.Now()
+}
+
+func (c *commandResultCache) lookup(key string) []byte {
+	if c == nil || key == "" {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[key]
+	if !ok || entry == nil || entry.reply == nil {
+		return nil
+	}
+	out := make([]byte, len(entry.reply))
+	copy(out, entry.reply)
+	return out
+}
+
+func (c *commandResultCache) abort(key string) {
+	if c == nil || key == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if entry, ok := c.entries[key]; ok {
+		if entry != nil && entry.reply == nil {
+			close(entry.ready)
+		}
+		delete(c.entries, key)
+	}
 }
 
 type execSpec struct {
@@ -366,7 +465,7 @@ func (e *commandExecutor) handle(ctx context.Context, req commandRequest) comman
 	}
 }
 
-func runCommandListener(ctx context.Context, logger *slog.Logger, natsURL string, policy quarantinePolicy) error {
+func runCommandListener(ctx context.Context, logger *slog.Logger, natsURL string, localAgentID string, policy quarantinePolicy) error {
 	nc, err := nats.Connect(natsURL, nats.Name("r-siem-agent"))
 	if err != nil {
 		return err
@@ -374,7 +473,13 @@ func runCommandListener(ctx context.Context, logger *slog.Logger, natsURL string
 	defer nc.Close()
 
 	executor := newCommandExecutor(logger, policy)
-	sub, err := nc.Subscribe(agentCommandSubject, func(msg *nats.Msg) {
+	cache := newCommandResultCache(2 * time.Minute)
+	localAgentID = strings.TrimSpace(localAgentID)
+	subjects := []string{agentCommandSubject}
+	if localAgentID != "" {
+		subjects = append(subjects, agentCommandSubject+"."+localAgentID)
+	}
+	handler := func(msg *nats.Msg) {
 		if msg.Reply == "" {
 			return
 		}
@@ -382,28 +487,65 @@ func runCommandListener(ctx context.Context, logger *slog.Logger, natsURL string
 		if err := json.Unmarshal(msg.Data, &req); err != nil {
 			return
 		}
+		targetAgentID := strings.TrimSpace(req.TargetAgentID)
+		if targetAgentID != "" && localAgentID != "" && targetAgentID != localAgentID {
+			return
+		}
+		cacheKey := ""
+		if strings.TrimSpace(req.RunID) != "" && strings.TrimSpace(req.StepID) != "" {
+			cacheKey = strings.TrimSpace(req.RunID) + "|" + strings.TrimSpace(req.StepID)
+		}
+		cachedReply, wait, execute := cache.begin(cacheKey)
+		if !execute {
+			if cachedReply != nil {
+				_ = nc.Publish(msg.Reply, cachedReply)
+				return
+			}
+			if wait != nil {
+				<-wait
+				cachedReply = cache.lookup(cacheKey)
+				if cachedReply != nil {
+					_ = nc.Publish(msg.Reply, cachedReply)
+				}
+				return
+			}
+		}
 		reply := executor.handle(ctx, req)
 		data, err := json.Marshal(reply)
 		if err != nil {
+			cache.abort(cacheKey)
 			return
 		}
+		cache.finish(cacheKey, data)
 		_ = nc.Publish(msg.Reply, data)
-	})
-	if err != nil {
-		return err
+	}
+	subs := make([]*nats.Subscription, 0, len(subjects))
+	for _, subject := range subjects {
+		sub, subErr := nc.Subscribe(subject, handler)
+		if subErr != nil {
+			for _, existing := range subs {
+				_ = existing.Unsubscribe()
+			}
+			return subErr
+		}
+		subs = append(subs, sub)
 	}
 
 	if err := nc.Flush(); err != nil {
-		_ = sub.Unsubscribe()
+		for _, sub := range subs {
+			_ = sub.Unsubscribe()
+		}
 		return err
 	}
 
-	logger.LogAttrs(context.Background(), slog.LevelInfo, "agent_command_subscribed",
-		slog.String("subject", agentCommandSubject),
+	logger.LogAttrs(context.Background(), slog.LevelInfo, "agent_command_subscribe",
+		slog.Any("subjects", subjects),
 	)
 
 	<-ctx.Done()
-	_ = sub.Unsubscribe()
+	for _, sub := range subs {
+		_ = sub.Unsubscribe()
+	}
 	_ = nc.Drain()
 	return nil
 }

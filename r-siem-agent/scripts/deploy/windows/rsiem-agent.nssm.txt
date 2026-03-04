@@ -1,0 +1,5 @@
+# NSSM example
+# nssm install rsiem-agent C:\ProgramData\rsiem\bin\agent.exe --config C:\ProgramData\rsiem\configs\agent.yaml
+# nssm set rsiem-agent AppStdout C:\ProgramData\rsiem\logs\agent.log
+# nssm set rsiem-agent AppStderr C:\ProgramData\rsiem\logs\agent.log
+# nssm set rsiem-agent Start SERVICE_AUTO_START

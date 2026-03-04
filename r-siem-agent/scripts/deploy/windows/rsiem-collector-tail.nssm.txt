@@ -1,0 +1,5 @@
+# NSSM example
+# nssm install rsiem-collector-tail C:\ProgramData\rsiem\bin\collector-tail.exe --config C:\ProgramData\rsiem\configs\collector.yaml
+# nssm set rsiem-collector-tail AppStdout C:\ProgramData\rsiem\logs\collector-tail.log
+# nssm set rsiem-collector-tail AppStderr C:\ProgramData\rsiem\logs\collector-tail.log
+# nssm set rsiem-collector-tail Start SERVICE_AUTO_START

@@ -32,6 +32,14 @@ type Alert struct {
 	EventTsUnixMs    int64
 	AlertTsUnixMs    int64
 	LatencyMs        int64
+	NodeID           string
+	SourceType       string
+	EventType        string
+	SrcIP            string
+	User             string
+	EventIdemKey     string
+	AgentID          string
+	TargetAgentID    string
 }
 
 // Publisher publishes ROE triggers using the pubtrigger schema.
@@ -96,6 +104,30 @@ func (p *Publisher) PublishAlert(alert Alert) (string, string, error) {
 	}
 	if strings.TrimSpace(alert.GroupKey) != "" {
 		payload["group_key"] = strings.TrimSpace(alert.GroupKey)
+	}
+	if strings.TrimSpace(alert.NodeID) != "" {
+		payload["node_id"] = strings.TrimSpace(alert.NodeID)
+	}
+	if strings.TrimSpace(alert.SourceType) != "" {
+		payload["source_type"] = strings.TrimSpace(alert.SourceType)
+	}
+	if strings.TrimSpace(alert.EventType) != "" {
+		payload["event_type"] = strings.TrimSpace(alert.EventType)
+	}
+	if strings.TrimSpace(alert.SrcIP) != "" {
+		payload["src_ip"] = strings.TrimSpace(alert.SrcIP)
+	}
+	if strings.TrimSpace(alert.User) != "" {
+		payload["user"] = strings.TrimSpace(alert.User)
+	}
+	if strings.TrimSpace(alert.EventIdemKey) != "" {
+		payload["event_idem_key"] = strings.TrimSpace(alert.EventIdemKey)
+	}
+	if strings.TrimSpace(alert.AgentID) != "" {
+		payload["agent_id"] = strings.TrimSpace(alert.AgentID)
+	}
+	if strings.TrimSpace(alert.TargetAgentID) != "" {
+		payload["target_agent_id"] = strings.TrimSpace(alert.TargetAgentID)
 	}
 
 	data, err := json.Marshal(payload)

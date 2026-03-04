@@ -6,14 +6,15 @@ import (
 )
 
 type Step struct {
-	ActionType string
-	Target     string
-	RunID      string
-	StepID     string
-	StepIndex  int
-	Lane       string
-	Params     map[string]any
-	TimeoutMs  *int64
+	ActionType    string
+	Target        string
+	TargetAgentID string
+	RunID         string
+	StepID        string
+	StepIndex     int
+	Lane          string
+	Params        map[string]any
+	TimeoutMs     *int64
 }
 
 type Connector interface {

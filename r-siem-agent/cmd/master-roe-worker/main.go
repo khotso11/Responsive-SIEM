@@ -98,6 +98,7 @@ type stepMessage struct {
 	StepIdemKey     string         `json:"step_idem_key"`
 	Attempt         int            `json:"attempt"`
 	Target          string         `json:"target"`
+	TargetAgentID   string         `json:"target_agent_id,omitempty"`
 	Actor           string         `json:"actor,omitempty"`
 	Params          map[string]any `json:"params,omitempty"`
 	PlannedAtUnixMs int64          `json:"planned_at_unix_ms"`
@@ -1123,6 +1124,7 @@ func decodeStep(data []byte) (stepMessage, error) {
 	step.Lane = strings.TrimSpace(step.Lane)
 	step.StepIdemKey = strings.TrimSpace(step.StepIdemKey)
 	step.Target = strings.TrimSpace(step.Target)
+	step.TargetAgentID = strings.TrimSpace(step.TargetAgentID)
 	step.Actor = strings.TrimSpace(step.Actor)
 	if step.RunID == "" || step.ActionType == "" || step.Lane == "" {
 		return stepMessage{}, fmt.Errorf("missing required fields")
@@ -1168,14 +1170,15 @@ func (r *workerRuntime) executeConnector(ctx context.Context, connector connecto
 		}
 	}
 	return connector.Execute(ctx, connectors.Step{
-		ActionType: step.ActionType,
-		Target:     step.Target,
-		RunID:      step.RunID,
-		StepID:     step.StepID,
-		StepIndex:  step.StepIndex,
-		Lane:       step.Lane,
-		Params:     step.Params,
-		TimeoutMs:  step.TimeoutMs,
+		ActionType:    step.ActionType,
+		Target:        step.Target,
+		TargetAgentID: step.TargetAgentID,
+		RunID:         step.RunID,
+		StepID:        step.StepID,
+		StepIndex:     step.StepIndex,
+		Lane:          step.Lane,
+		Params:        step.Params,
+		TimeoutMs:     step.TimeoutMs,
 	})
 }
 

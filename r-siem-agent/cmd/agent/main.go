@@ -71,7 +71,7 @@ func main() {
 			AllowedSourceRoots: cfg.AgentQuarantineAllowedSourceRoots(),
 		}
 		go func() {
-			listenerErrs <- runCommandListener(ctx, logger, commandNatsURL(), policy)
+			listenerErrs <- runCommandListener(ctx, logger, commandNatsURL(), cfg.AgentInstanceID(), policy)
 		}()
 		go func() {
 			if err := <-listenerErrs; err != nil {

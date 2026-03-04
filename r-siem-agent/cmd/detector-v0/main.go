@@ -60,6 +60,10 @@ type rawEvent struct {
 	User             string `json:"user,omitempty"`
 	SrcIP            string `json:"src_ip,omitempty"`
 	EventType        string `json:"event_type,omitempty"`
+	NodeID           string `json:"node_id,omitempty"`
+	SourceType       string `json:"source_type,omitempty"`
+	EventTsUnixMs    int64  `json:"event_ts_unix_ms,omitempty"`
+	RecvTsUnixMs     int64  `json:"recv_ts_unix_ms,omitempty"`
 	Ts               int64  `json:"ts,omitempty"`
 	GroupKey         string `json:"group_key"`
 	Source           string `json:"source"`
@@ -203,6 +207,8 @@ func handleMessage(ctx context.Context, logger *slog.Logger, kv nats.KeyValue, c
 		slog.String("severity", match.Severity),
 		slog.String("event_idem_key", evt.EventIdemKey),
 		slog.String("event_type", evt.EventType),
+		slog.String("source_type", evt.SourceType),
+		slog.String("node_id", detectorNodeID(evt)),
 		slog.String("src_ip", evt.SrcIP),
 		slog.String("user", evt.User),
 		slog.Int64("event_ts_unix_ms", eventTsUnixMs),
@@ -259,6 +265,13 @@ func handleMessage(ctx context.Context, logger *slog.Logger, kv nats.KeyValue, c
 		EventTsUnixMs:    eventTsUnixMs,
 		AlertTsUnixMs:    alertTsUnixMs,
 		LatencyMs:        latencyMs,
+		NodeID:           detectorNodeID(evt),
+		SourceType:       strings.TrimSpace(evt.SourceType),
+		EventType:        strings.TrimSpace(evt.EventType),
+		SrcIP:            strings.TrimSpace(evt.SrcIP),
+		User:             strings.TrimSpace(evt.User),
+		EventIdemKey:     strings.TrimSpace(evt.EventIdemKey),
+		AgentID:          detectorNodeID(evt),
 	}
 	_, triggerID, err := publisher.PublishAlert(alert)
 	if err != nil {
@@ -275,6 +288,8 @@ func handleMessage(ctx context.Context, logger *slog.Logger, kv nats.KeyValue, c
 		slog.String("rule_id", match.RuleID),
 		slog.String("severity", match.Severity),
 		slog.String("event_idem_key", evt.EventIdemKey),
+		slog.String("source_type", evt.SourceType),
+		slog.String("node_id", detectorNodeID(evt)),
 		slog.Int64("event_ts_unix_ms", eventTsUnixMs),
 		slog.Int64("alert_ts_unix_ms", alertTsUnixMs),
 		slog.Int64("latency_ms", latencyMs),
@@ -425,16 +440,32 @@ func extractEventTSUnixMs(evt rawEvent, message string) int64 {
 			return parsed
 		}
 	}
+	if evt.EventTsUnixMs > 0 {
+		return evt.EventTsUnixMs
+	}
 	if evt.Ts > 0 {
 		if evt.Ts >= 1_000_000_000_000 {
 			return evt.Ts
 		}
 		return evt.Ts * 1000
 	}
+	if evt.RecvTsUnixMs > 0 {
+		return evt.RecvTsUnixMs
+	}
 	if evt.ObservedAtUnixMs > 0 {
 		return evt.ObservedAtUnixMs
 	}
 	return time.Now().UnixMilli()
+}
+
+func detectorNodeID(evt rawEvent) string {
+	if trimmed := strings.TrimSpace(evt.NodeID); trimmed != "" {
+		return trimmed
+	}
+	if trimmed := strings.TrimSpace(evt.Host); trimmed != "" {
+		return trimmed
+	}
+	return ""
 }
 
 func parseUnixTSMillis(raw string) (int64, bool) {

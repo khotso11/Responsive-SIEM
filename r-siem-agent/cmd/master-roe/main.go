@@ -171,19 +171,23 @@ type roeConfigWrapper struct {
 
 type responseTrigger struct {
 	TriggerIdemKey   string
+	EventIdemKey     string
 	AlertKey         string
 	RuleID           string
 	RuleKind         string
 	Severity         string
 	EventType        string
 	SourceType       string
+	NodeID           string
 	SrcIP            string
 	UserName         string
 	Lane             string
 	GroupBy          string
 	GroupKey         string
 	AgentID          string
+	TargetAgentID    string
 	EventTsUnixMs    int64
+	AlertTsUnixMs    int64
 	ObservedAtUnixMs int64
 	Stream           string
 	Consumer         string
@@ -195,10 +199,18 @@ type responseTrigger struct {
 type runRecord struct {
 	RunID                     string            `json:"run_id"`
 	TriggerIdemKey            string            `json:"trigger_idem_key"`
+	EventIdemKey              string            `json:"event_idem_key,omitempty"`
 	AlertKey                  string            `json:"alert_key"`
 	RuleID                    string            `json:"rule_id"`
 	RuleKind                  string            `json:"rule_kind"`
 	Severity                  string            `json:"severity"`
+	EventType                 string            `json:"event_type,omitempty"`
+	SourceType                string            `json:"source_type,omitempty"`
+	NodeID                    string            `json:"node_id,omitempty"`
+	SrcIP                     string            `json:"src_ip,omitempty"`
+	UserName                  string            `json:"user,omitempty"`
+	AgentID                   string            `json:"agent_id,omitempty"`
+	TargetAgentID             string            `json:"target_agent_id,omitempty"`
 	Lane                      string            `json:"lane"`
 	GroupBy                   string            `json:"group_by,omitempty"`
 	GroupKey                  string            `json:"group_key,omitempty"`
@@ -1076,10 +1088,18 @@ func processTrigger(runtime *roeRuntime, msg *nats.Msg, lane string, runJournal 
 	run := runRecord{
 		RunID:           runID,
 		TriggerIdemKey:  trigger.TriggerIdemKey,
+		EventIdemKey:    trigger.EventIdemKey,
 		AlertKey:        trigger.AlertKey,
 		RuleID:          trigger.RuleID,
 		RuleKind:        trigger.RuleKind,
 		Severity:        trigger.Severity,
+		EventType:       trigger.EventType,
+		SourceType:      trigger.SourceType,
+		NodeID:          trigger.NodeID,
+		SrcIP:           trigger.SrcIP,
+		UserName:        trigger.UserName,
+		AgentID:         trigger.AgentID,
+		TargetAgentID:   trigger.TargetAgentID,
 		Lane:            trigger.Lane,
 		GroupBy:         trigger.GroupBy,
 		GroupKey:        trigger.GroupKey,
@@ -1580,18 +1600,21 @@ func decodeTrigger(data []byte) (responseTrigger, error) {
 	}
 	trigger := responseTrigger{
 		TriggerIdemKey: stringFieldRaw(raw, "trigger_idem_key"),
+		EventIdemKey:   stringFieldRaw(raw, "event_idem_key"),
 		AlertKey:       stringFieldRaw(raw, "alert_key"),
 		RuleID:         stringFieldRaw(raw, "rule_id"),
 		RuleKind:       stringFieldRaw(raw, "rule_kind"),
 		Severity:       stringFieldRaw(raw, "severity"),
 		EventType:      stringFieldRaw(raw, "event_type"),
 		SourceType:     stringFieldRaw(raw, "source_type"),
+		NodeID:         stringFieldRaw(raw, "node_id"),
 		SrcIP:          stringFieldRaw(raw, "src_ip"),
 		UserName:       stringFieldRaw(raw, "user"),
 		Lane:           stringFieldRaw(raw, "lane"),
 		GroupBy:        stringFieldRaw(raw, "group_by"),
 		GroupKey:       stringFieldRaw(raw, "group_key"),
 		AgentID:        stringFieldRaw(raw, "agent_id"),
+		TargetAgentID:  stringFieldRaw(raw, "target_agent_id"),
 		Stream:         stringFieldRaw(raw, "stream"),
 		Consumer:       stringFieldRaw(raw, "consumer"),
 		Subject:        stringFieldRaw(raw, "subject"),
@@ -1605,6 +1628,9 @@ func decodeTrigger(data []byte) (responseTrigger, error) {
 	}
 	if ts, ok := int64Field(raw, "event_ts_unix_ms"); ok {
 		trigger.EventTsUnixMs = ts
+	}
+	if ts, ok := int64Field(raw, "alert_ts_unix_ms"); ok {
+		trigger.AlertTsUnixMs = ts
 	}
 	if jsSeq, ok := uint64Field(raw, "js_seq"); ok {
 		trigger.JSSeq = &jsSeq
@@ -2312,6 +2338,30 @@ func (r *roeRuntime) exportRunUpdate(run runRecord) error {
 		"last_updated_at_unix_ms":     run.LastUpdatedAtUnixMs,
 		"actor":                       auditActor(run.ApprovalActor),
 	}
+	if trimmed := strings.TrimSpace(run.NodeID); trimmed != "" {
+		obj["node_id"] = trimmed
+	}
+	if trimmed := strings.TrimSpace(run.SourceType); trimmed != "" {
+		obj["source_type"] = trimmed
+	}
+	if trimmed := strings.TrimSpace(run.EventType); trimmed != "" {
+		obj["event_type"] = trimmed
+	}
+	if trimmed := strings.TrimSpace(run.SrcIP); trimmed != "" {
+		obj["src_ip"] = trimmed
+	}
+	if trimmed := strings.TrimSpace(run.UserName); trimmed != "" {
+		obj["user"] = trimmed
+	}
+	if trimmed := strings.TrimSpace(run.AgentID); trimmed != "" {
+		obj["agent_id"] = trimmed
+	}
+	if trimmed := strings.TrimSpace(run.TargetAgentID); trimmed != "" {
+		obj["target_agent_id"] = trimmed
+	}
+	if trimmed := strings.TrimSpace(run.EventIdemKey); trimmed != "" {
+		obj["event_idem_key"] = trimmed
+	}
 	if strings.TrimSpace(run.Target) != "" {
 		obj["target"] = strings.TrimSpace(run.Target)
 	}
@@ -2686,9 +2736,15 @@ func buildROEDBRecord(trigger responseTrigger, raw []byte) roeDBRecord {
 	}
 	recvTs := trigger.ObservedAtUnixMs
 	if recvTs <= 0 {
+		recvTs = trigger.AlertTsUnixMs
+	}
+	if recvTs <= 0 {
 		recvTs = nowMs
 	}
-	nodeID := strings.TrimSpace(trigger.AgentID)
+	nodeID := strings.TrimSpace(trigger.NodeID)
+	if nodeID == "" {
+		nodeID = strings.TrimSpace(trigger.AgentID)
+	}
 	if nodeID == "" {
 		nodeID = "unknown"
 	}
@@ -2700,7 +2756,10 @@ func buildROEDBRecord(trigger responseTrigger, raw []byte) roeDBRecord {
 	if eventType == "" {
 		eventType = deriveEventType(sourceType, trigger.RuleID)
 	}
-	eventID := strings.TrimSpace(trigger.TriggerIdemKey)
+	eventID := strings.TrimSpace(trigger.EventIdemKey)
+	if eventID == "" {
+		eventID = strings.TrimSpace(trigger.TriggerIdemKey)
+	}
 	if eventID == "" {
 		eventID = shortHash(fmt.Sprintf("%s|%s|%d", trigger.AlertKey, trigger.RuleID, recvTs))
 	}

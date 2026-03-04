@@ -1,0 +1,19 @@
+# Copy to scripts/deploy/master/master_env and edit for your LAN.
+
+# Optional explicit LAN IP to print in summary.
+MASTER_IP=
+
+# NATS docker settings
+NATS_CONTAINER_NAME=rsiem-nats-lan
+NATS_IMAGE=nats:2
+NATS_PORT=4222
+NATS_MON_PORT=8222
+
+# Local nats CLI target used by demo_up.sh precheck.
+NATS_URL=nats://127.0.0.1:4222
+
+# Optional DB names used by scripts/db_up.sh
+DB_CONTAINER_NAME=rsiem-timescale
+DB_NAME=rsiem
+DB_USER=rsiem
+DB_PASSWORD=rsiem

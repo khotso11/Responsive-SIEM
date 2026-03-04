@@ -1,0 +1,20 @@
+# Optional non-docker NATS server config for LAN master deployments.
+
+port: 4222
+http_port: 8222
+
+jetstream {
+  store_dir: "/var/lib/nats/js"
+  max_file_store: 50Gb
+  max_memory_store: 2Gb
+}
+
+# To bind to specific LAN interface, set host here.
+# host: "0.0.0.0"
+
+# Optional auth hardening for production:
+# authorization {
+#   users = [
+#     {user: "rsiem", password: "change-me"}
+#   ]
+# }

@@ -6,16 +6,17 @@ export function StatusBadge({ status }: { status?: string }) {
   const s = (status || "unknown").toUpperCase();
   if (s === "SUCCEEDED") return <span className="badge-good">SUCCEEDED</span>;
   if (s === "FAILED_SAFE") return <span className="badge-bad">FAILED_SAFE</span>;
+  if (s === "WAITING_APPROVAL") return <span className="badge-warn">WAITING_APPROVAL</span>;
   if (s === "FAILED_TRANSIENT") return <span className="badge-warn">FAILED_TRANSIENT</span>;
   if (s === "RUNNING") return <span className="badge-info">RUNNING</span>;
-  return <span className="badge bg-ink-700 text-ink-100">{s}</span>;
+  return <span className="badge" style={{ background: "rgba(30,42,68,0.65)", color: "#E7ECFF" }}>{s}</span>;
 }
 
 export function LaneBadge({ lane }: { lane?: string }) {
   const l = (lane || "").toUpperCase();
-  if (l === "FAST") return <span className="badge-bad">FAST</span>;
-  if (l === "STANDARD") return <span className="badge-info">STANDARD</span>;
-  return <span className="badge bg-ink-700 text-ink-100">N/A</span>;
+  if (l === "FAST") return <span className="badge-lane-fast">FAST</span>;
+  if (l === "STANDARD") return <span className="badge-lane-standard">STANDARD</span>;
+  return <span className="badge" style={{ background: "rgba(30,42,68,0.65)", color: "#E7ECFF" }}>N/A</span>;
 }
 
 export function EmptyState({ title, detail }: { title: string; detail?: string }) {

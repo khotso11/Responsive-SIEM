@@ -52,8 +52,9 @@ cleanup_stale_ui_procs
 
 start_if_needed "ui-api" ".pids/ui-api.pid" "logs/ui-api.log" env \
   UI_API_KEY="$UI_API_KEY" \
+  GOFLAGS="${GOFLAGS:--mod=mod}" \
   GOCACHE="$ROOT_DIR/.cache/go-build" \
-  go run -mod=vendor ./cmd/ui-api --addr "$UI_API_ADDR" --master-config configs/master.yaml
+  go run ./cmd/ui-api --addr "$UI_API_ADDR" --master-config configs/master.yaml
 
 if [[ ! -d ui/node_modules ]]; then
   echo "Installing UI dependencies (first run)..."

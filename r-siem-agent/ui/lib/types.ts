@@ -25,6 +25,12 @@ export type Incident = {
   source?: string;
 };
 
+export type IncidentUIState = {
+  assignment?: string;
+  reviewed?: boolean;
+  notes?: Array<{ ts: string; actor: string; note: string }>;
+};
+
 export type IncidentListResponse = {
   items: Incident[];
   count: number;
@@ -32,6 +38,13 @@ export type IncidentListResponse = {
   page?: number;
   limit?: number;
   sort?: string;
+  source: string;
+};
+
+export type IncidentDetailResponse = {
+  run: Incident;
+  steps: StepResult[];
+  ui_state?: IncidentUIState;
   source: string;
 };
 
@@ -92,4 +105,61 @@ export type SearchResponse = {
   events: EventRow[];
   count_incidents: number;
   count_events: number;
+};
+
+export type AuthUser = {
+  username: string;
+  role: "admin" | "analyst";
+};
+
+export type DashboardSummary = {
+  window_ms: number;
+  from_unix_ms: number;
+  to_unix_ms: number;
+  incidents_last_window: number;
+  critical_incidents_last_window?: number;
+  approvals_pending: number;
+  failed_safe_count: number;
+  endpoints_active: number;
+  ingestion_rate_per_min: number;
+  latency_p95_ms: number;
+  total_events_last_window?: number;
+  model_alerts_last_window?: number;
+  mitre_tactics_processed?: Array<{
+    tactic: string;
+    count: number;
+    high_critical: number;
+    delta?: number;
+  }>;
+};
+
+export type DashboardIncidentPoint = {
+  ts_unix_ms: number;
+  count: number;
+  fast: number;
+  standard: number;
+  failed_safe: number;
+};
+
+export type EndpointGeoSummary = {
+  node_id: string;
+  last_seen_rfc3339: string;
+  events_5m: number;
+  events_1h: number;
+  status: "active" | "warning" | "critical" | "unknown";
+  source_dist: Record<string, number>;
+  geo: {
+    lat: number;
+    lon: number;
+    label?: string;
+    source: "configured" | "derived" | "none";
+  };
+};
+
+export type EndpointsGeoResponse = {
+  window: string;
+  generated_at: string;
+  endpoints: EndpointGeoSummary[];
+  count: number;
+  source: string;
 };

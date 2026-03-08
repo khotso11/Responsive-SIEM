@@ -3,7 +3,12 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -22,6 +27,7 @@ import (
 
 	_ "github.com/lib/pq"
 	"github.com/nats-io/nats.go"
+	"golang.org/x/crypto/bcrypt"
 	"gopkg.in/yaml.v3"
 
 	"r-siem-agent/internal/config"
@@ -41,8 +47,16 @@ const (
 	defaultNATSURL         = "nats://127.0.0.1:4222"
 	defaultMasterConfig    = "configs/master.yaml"
 	defaultStepFastSubject = "rsiem.response.steps.fast"
+	defaultUsersPath       = "configs/ui_users.json"
+	defaultGeoEndpoints    = "configs/ui_geo_endpoints.json"
+	defaultUIStatePath     = "retained/ui_state/ui_actions.jsonl"
+	defaultUIStateDir      = "ui_state"
+	defaultArtifactLimit   = 200
+	maxArtifactPageLimit   = 1000
+	maxArtifactScanEntries = 50000
 	maxListLimit           = 2000
 	maxArtifactListEntries = 1000
+	sessionTTL             = 12 * time.Hour
 )
 
 type masterROEConfig struct {
@@ -67,6 +81,11 @@ type serverConfig struct {
 	DBDSN         string
 	NATSURL       string
 	ApprovalsSubj string
+	UsersPath     string
+	GeoConfigPath string
+	UIStatePath   string
+	UIStateDir    string
+	SessionSecret string
 }
 
 type app struct {
@@ -79,6 +98,92 @@ type app struct {
 	js nats.JetStreamContext
 
 	mu sync.RWMutex
+
+	usersMu sync.RWMutex
+	users   map[string]uiUser
+}
+
+func (a *app) natsReadyLocked() bool {
+	if a.nc == nil || a.js == nil {
+		return false
+	}
+	switch a.nc.Status() {
+	case nats.CONNECTED, nats.RECONNECTING:
+		return true
+	default:
+		return false
+	}
+}
+
+func (a *app) connectNATSLocked() error {
+	if a.nc != nil {
+		a.nc.Close()
+		a.nc = nil
+		a.js = nil
+	}
+
+	nc, err := nats.Connect(a.cfg.NATSURL, nats.Name("r-siem-ui-api"))
+	if err != nil {
+		a.logger.Warn("ui_api_nats_unavailable", slog.String("error", err.Error()))
+		return err
+	}
+	js, err := nc.JetStream()
+	if err != nil {
+		nc.Close()
+		a.logger.Warn("ui_api_jetstream_unavailable", slog.String("error", err.Error()))
+		return err
+	}
+	a.nc = nc
+	a.js = js
+	a.logger.Info("ui_api_nats_connected",
+		slog.String("url", a.cfg.NATSURL),
+		slog.String("approvals_subject", a.cfg.ApprovalsSubj),
+	)
+	return nil
+}
+
+func (a *app) ensureNATS() error {
+	a.mu.RLock()
+	ready := a.natsReadyLocked()
+	a.mu.RUnlock()
+	if ready {
+		return nil
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.natsReadyLocked() {
+		return nil
+	}
+	return a.connectNATSLocked()
+}
+
+func (a *app) publishNATS(subject string, data []byte) error {
+	if err := a.ensureNATS(); err != nil {
+		return err
+	}
+
+	a.mu.RLock()
+	js := a.js
+	a.mu.RUnlock()
+	if js == nil {
+		return errors.New("nats unavailable")
+	}
+	if _, err := js.Publish(subject, data); err == nil {
+		return nil
+	}
+
+	if err := a.ensureNATS(); err != nil {
+		return err
+	}
+	a.mu.RLock()
+	js = a.js
+	a.mu.RUnlock()
+	if js == nil {
+		return errors.New("nats unavailable")
+	}
+	_, err := js.Publish(subject, data)
+	return err
 }
 
 type incident struct {
@@ -159,6 +264,36 @@ type endpointSummary struct {
 	SourceTypeSamples []string       `json:"source_types,omitempty"`
 }
 
+type endpointGeoConfigEntry struct {
+	Lat   float64 `json:"lat"`
+	Lon   float64 `json:"lon"`
+	Label string  `json:"label,omitempty"`
+}
+
+type endpointGeoPoint struct {
+	Lat    float64 `json:"lat"`
+	Lon    float64 `json:"lon"`
+	Label  string  `json:"label,omitempty"`
+	Source string  `json:"source"`
+}
+
+type endpointGeoSummary struct {
+	NodeID          string           `json:"node_id"`
+	LastSeenRFC3339 string           `json:"last_seen_rfc3339"`
+	Events5m        int64            `json:"events_5m"`
+	Events1h        int64            `json:"events_1h"`
+	Status          string           `json:"status"`
+	SourceDist      map[string]int   `json:"source_dist"`
+	Geo             endpointGeoPoint `json:"geo"`
+}
+
+type tacticTile struct {
+	Tactic       string `json:"tactic"`
+	Count        int    `json:"count"`
+	HighCritical int    `json:"high_critical"`
+	Delta        int    `json:"delta,omitempty"`
+}
+
 type auditEntry struct {
 	TS       string         `json:"ts"`
 	Msg      string         `json:"msg"`
@@ -168,6 +303,36 @@ type auditEntry struct {
 	Status   string         `json:"status,omitempty"`
 	Details  map[string]any `json:"details,omitempty"`
 	Source   string         `json:"source"`
+}
+
+type uiUser struct {
+	Username     string `json:"username"`
+	PasswordHash string `json:"password_hash"`
+	Role         string `json:"role"`
+	Disabled     bool   `json:"disabled,omitempty"`
+}
+
+type authClaims struct {
+	Username string `json:"username"`
+	Role     string `json:"role"`
+	Exp      int64  `json:"exp"`
+	Iat      int64  `json:"iat"`
+}
+
+type uiStateRecord struct {
+	TS             string `json:"ts"`
+	Action         string `json:"action"`
+	RunID          string `json:"run_id"`
+	Actor          string `json:"actor"`
+	Assignee       string `json:"assignee,omitempty"`
+	Note           string `json:"note,omitempty"`
+	Status         string `json:"status,omitempty"`
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
+}
+
+type roleContext struct {
+	Username string
+	Role     string
 }
 
 func main() {
@@ -180,6 +345,10 @@ func main() {
 	flag.StringVar(&cfg.UIAPILogPath, "ui-api-log-path", defaultUIAPILogPath, "Path to ui api log")
 	flag.StringVar(&cfg.ArtifactsRoot, "artifacts-root", defaultArtifactsRoot, "Allowed artifacts root")
 	flag.StringVar(&cfg.RetainedRoot, "retained-root", defaultRetainedRoot, "Allowed retained root")
+	flag.StringVar(&cfg.UsersPath, "users-path", defaultUsersPath, "Path to UI users JSON")
+	flag.StringVar(&cfg.GeoConfigPath, "geo-config-path", defaultGeoEndpoints, "Path to UI geo endpoint mapping JSON")
+	flag.StringVar(&cfg.UIStatePath, "ui-state-path", defaultUIStatePath, "Path to UI state actions JSONL")
+	flag.StringVar(&cfg.UIStateDir, "ui-state-dir", defaultUIStateDir, "Path to UI state directory (notes.jsonl + assignments.jsonl)")
 	flag.Parse()
 
 	cfg.APIKey = strings.TrimSpace(os.Getenv("UI_API_KEY"))
@@ -212,6 +381,17 @@ func main() {
 	if strings.TrimSpace(os.Getenv("UI_NATS_URL")) == "" && roeNATSURL != "" {
 		cfg.NATSURL = roeNATSURL
 	}
+	cfg.SessionSecret = strings.TrimSpace(os.Getenv("UI_SESSION_SECRET"))
+	if cfg.SessionSecret == "" {
+		cfg.SessionSecret = "dev-session-secret-change-me"
+	}
+	if strings.TrimSpace(cfg.UIStateDir) == "" {
+		if strings.TrimSpace(cfg.UIStatePath) != "" {
+			cfg.UIStateDir = filepath.Dir(cfg.UIStatePath)
+		} else {
+			cfg.UIStateDir = defaultUIStateDir
+		}
+	}
 
 	logger, err := logging.NewLogger("INFO")
 	if err != nil {
@@ -219,7 +399,15 @@ func main() {
 		os.Exit(1)
 	}
 
-	a := &app{cfg: cfg, logger: logger}
+	a := &app{
+		cfg:    cfg,
+		logger: logger,
+		users:  map[string]uiUser{},
+	}
+	if err := a.loadUsers(); err != nil {
+		fmt.Fprintf(os.Stderr, "load ui users: %v\n", err)
+		os.Exit(1)
+	}
 
 	if cfg.DBDSN != "" {
 		db, dErr := sql.Open("postgres", cfg.DBDSN)
@@ -239,37 +427,42 @@ func main() {
 		}
 	}
 
-	nc, nErr := nats.Connect(cfg.NATSURL, nats.Name("r-siem-ui-api"))
-	if nErr == nil {
-		js, jErr := nc.JetStream()
-		if jErr == nil {
-			a.nc = nc
-			a.js = js
-			logger.Info("ui_api_nats_connected", slog.String("url", cfg.NATSURL), slog.String("approvals_subject", cfg.ApprovalsSubj))
-		} else {
-			logger.Warn("ui_api_jetstream_unavailable", slog.String("error", jErr.Error()))
-			nc.Close()
-		}
-	} else {
-		logger.Warn("ui_api_nats_unavailable", slog.String("error", nErr.Error()))
-	}
+	_ = a.ensureNATS()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", a.handleHealth)
-	mux.HandleFunc("GET /api/meta", a.withAPIKey(a.handleMeta))
-	mux.HandleFunc("GET /api/incidents", a.withAPIKey(a.handleIncidents))
-	mux.HandleFunc("GET /api/incidents/{run_id}", a.withAPIKey(a.handleIncidentDetail))
-	mux.HandleFunc("POST /api/incidents/{run_id}/approve", a.withAPIKey(a.handleIncidentApprove))
-	mux.HandleFunc("GET /api/incidents/{run_id}/events", a.withAPIKey(a.handleIncidentEvents))
-	mux.HandleFunc("GET /api/search", a.withAPIKey(a.handleSearch))
-	mux.HandleFunc("GET /api/stream", a.withAPIKey(a.handleStream))
-	mux.HandleFunc("GET /api/endpoints", a.withAPIKey(a.handleEndpoints))
-	mux.HandleFunc("GET /api/endpoints/{node_id}/events", a.withAPIKey(a.handleEndpointEvents))
-	mux.HandleFunc("GET /api/endpoints/{node_id}/runs", a.withAPIKey(a.handleEndpointRuns))
-	mux.HandleFunc("POST /api/endpoints/{node_id}/targeted-test", a.withAPIKey(a.handleEndpointTargetedTest))
-	mux.HandleFunc("GET /api/audit", a.withAPIKey(a.handleAudit))
-	mux.HandleFunc("GET /api/artifacts", a.withAPIKey(a.handleArtifacts))
-	mux.HandleFunc("GET /api/artifact", a.withAPIKey(a.handleArtifactDownload))
+	mux.HandleFunc("POST /api/auth/login", a.handleAuthLogin)
+	mux.HandleFunc("POST /api/auth/logout", a.handleAuthLogout)
+	mux.HandleFunc("GET /api/auth/me", a.withAuthRole(a.handleAuthMe, "analyst"))
+	mux.HandleFunc("GET /api/meta", a.withAuthRole(a.handleMeta, "analyst"))
+	mux.HandleFunc("GET /api/dashboard/summary", a.withAuthRole(a.handleDashboardSummary, "analyst"))
+	mux.HandleFunc("GET /api/dashboard/series/incidents", a.withAuthRole(a.handleDashboardIncidentsSeries, "analyst"))
+	mux.HandleFunc("GET /api/dashboard/series/severity", a.withAuthRole(a.handleDashboardSeveritySeries, "analyst"))
+	mux.HandleFunc("GET /api/dashboard/series/lanes", a.withAuthRole(a.handleDashboardLanesSeries, "analyst"))
+	mux.HandleFunc("GET /api/dashboard/top/entities", a.withAuthRole(a.handleDashboardTopEntities, "analyst"))
+	mux.HandleFunc("GET /api/incidents", a.withAuthRole(a.handleIncidents, "analyst"))
+	mux.HandleFunc("GET /api/incidents/{run_id}", a.withAuthRole(a.handleIncidentDetail, "analyst"))
+	mux.HandleFunc("POST /api/incidents/{run_id}/approve", a.withAuthRole(a.handleIncidentApprove, "analyst"))
+	mux.HandleFunc("POST /api/incidents/{run_id}/reject", a.withAuthRole(a.handleIncidentReject, "analyst"))
+	mux.HandleFunc("POST /api/incidents/{run_id}/assign", a.withAuthRole(a.handleIncidentAssign, "analyst"))
+	mux.HandleFunc("POST /api/incidents/{run_id}/notes", a.withAuthRole(a.handleIncidentNotes, "analyst"))
+	mux.HandleFunc("POST /api/incidents/{run_id}/review", a.withAuthRole(a.handleIncidentMarkReviewed, "analyst"))
+	mux.HandleFunc("GET /api/incidents/{run_id}/events", a.withAuthRole(a.handleIncidentEvents, "analyst"))
+	mux.HandleFunc("GET /api/search", a.withAuthRole(a.handleSearch, "analyst"))
+	mux.HandleFunc("GET /api/stream", a.withAuthRole(a.handleStream, "analyst"))
+	mux.HandleFunc("GET /api/endpoints", a.withAuthRole(a.handleEndpoints, "analyst"))
+	mux.HandleFunc("GET /api/endpoints/geo", a.withAuthRole(a.handleEndpointsGeo, "analyst"))
+	mux.HandleFunc("GET /api/endpoints/{node_id}/events", a.withAuthRole(a.handleEndpointEvents, "analyst"))
+	mux.HandleFunc("GET /api/endpoints/{node_id}/runs", a.withAuthRole(a.handleEndpointRuns, "analyst"))
+	mux.HandleFunc("POST /api/endpoints/{node_id}/targeted-test", a.withAuthRole(a.handleEndpointTargetedTest, "analyst"))
+	mux.HandleFunc("GET /api/audit", a.withAuthRole(a.handleAudit, "analyst"))
+	mux.HandleFunc("GET /api/artifacts", a.withAuthRole(a.handleArtifacts, "analyst"))
+	mux.HandleFunc("GET /api/artifact", a.withAuthRole(a.handleArtifactDownload, "analyst"))
+	mux.HandleFunc("GET /api/users", a.withAuthRole(a.handleAdminUsersList, "admin"))
+	mux.HandleFunc("POST /api/users", a.withAuthRole(a.handleAdminUsersUpsert, "admin"))
+	mux.HandleFunc("POST /api/users/{id}/disable", a.withAuthRole(a.handleAdminUsersDisable, "admin"))
+	mux.HandleFunc("GET /api/admin/users", a.withAuthRole(a.handleAdminUsersList, "admin"))
+	mux.HandleFunc("POST /api/admin/users", a.withAuthRole(a.handleAdminUsersUpsert, "admin"))
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
@@ -333,6 +526,86 @@ func (a *app) withAPIKey(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+type requestContextKey string
+
+const roleCtxKey requestContextKey = "role_ctx"
+
+func (a *app) withAuthRole(next http.HandlerFunc, requiredRole string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		roleCtx, ok, err := a.authContextFromRequest(r)
+		if err != nil {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+			return
+		}
+		if !ok {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "login required"})
+			return
+		}
+		if !roleAllowed(roleCtx.Role, requiredRole) {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "forbidden"})
+			return
+		}
+		ctx := context.WithValue(r.Context(), roleCtxKey, roleCtx)
+		next(w, r.WithContext(ctx))
+	}
+}
+
+func roleAllowed(actualRole string, requiredRole string) bool {
+	order := map[string]int{"analyst": 1, "admin": 2}
+	actual := order[strings.ToLower(strings.TrimSpace(actualRole))]
+	required := order[strings.ToLower(strings.TrimSpace(requiredRole))]
+	if required == 0 {
+		required = 1
+	}
+	return actual >= required
+}
+
+func (a *app) authContextFromRequest(r *http.Request) (roleContext, bool, error) {
+	apiKey := strings.TrimSpace(r.Header.Get("X-API-Key"))
+	if apiKey == "" {
+		apiKey = strings.TrimSpace(r.URL.Query().Get("api_key"))
+	}
+	if apiKey != "" && apiKey == a.cfg.APIKey {
+		return roleContext{Username: "api-key", Role: "admin"}, true, nil
+	}
+
+	token := ""
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+		token = strings.TrimSpace(auth[7:])
+	}
+	if token == "" {
+		if c, err := r.Cookie("rsiem_ui_session"); err == nil {
+			token = strings.TrimSpace(c.Value)
+		}
+	}
+	if token == "" {
+		token = strings.TrimSpace(r.URL.Query().Get("token"))
+	}
+	if token == "" {
+		return roleContext{}, false, nil
+	}
+	claims, err := a.verifySessionToken(token)
+	if err != nil {
+		return roleContext{}, false, err
+	}
+	return roleContext{
+		Username: claims.Username,
+		Role:     claims.Role,
+	}, true, nil
+}
+
+func roleFromRequest(r *http.Request) roleContext {
+	v := r.Context().Value(roleCtxKey)
+	if v == nil {
+		return roleContext{}
+	}
+	if rc, ok := v.(roleContext); ok {
+		return rc
+	}
+	return roleContext{}
+}
+
 func (a *app) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":      true,
@@ -341,30 +614,127 @@ func (a *app) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+func (a *app) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := decodeJSONBody(r.Body, &body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	username := strings.TrimSpace(strings.ToLower(body.Username))
+	if username == "" || strings.TrimSpace(body.Password) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "username and password are required"})
+		return
+	}
+	a.usersMu.RLock()
+	user, ok := a.users[username]
+	a.usersMu.RUnlock()
+	if !ok || user.Disabled {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid credentials"})
+		return
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(body.Password)); err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid credentials"})
+		return
+	}
+	now := time.Now().Unix()
+	token, err := a.signSessionToken(authClaims{
+		Username: user.Username,
+		Role:     user.Role,
+		Iat:      now,
+		Exp:      now + int64(sessionTTL.Seconds()),
+	})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to issue token"})
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     "rsiem_ui_session",
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int(sessionTTL.Seconds()),
+	})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true,
+		"user": map[string]any{
+			"username": user.Username,
+			"role":     user.Role,
+		},
+		"token": token,
+	})
+}
+
+func (a *app) handleAuthLogout(w http.ResponseWriter, _ *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "rsiem_ui_session",
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (a *app) handleAuthMe(w http.ResponseWriter, r *http.Request) {
+	roleCtx := roleFromRequest(r)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true,
+		"user": map[string]any{
+			"username": roleCtx.Username,
+			"role":     roleCtx.Role,
+		},
+	})
+}
+
 func (a *app) handleMeta(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"service": "ui-api",
 		"routes": []map[string]any{
 			{"method": "GET", "path": "/api/health", "summary": "Service health"},
+			{"method": "POST", "path": "/api/auth/login", "summary": "Login and issue session token"},
+			{"method": "POST", "path": "/api/auth/logout", "summary": "Logout current session"},
+			{"method": "GET", "path": "/api/auth/me", "summary": "Current authenticated user"},
 			{"method": "GET", "path": "/api/meta", "summary": "Route + schema summary"},
+			{"method": "GET", "path": "/api/dashboard/summary", "summary": "Dashboard posture KPIs", "query": []string{"window"}},
+			{"method": "GET", "path": "/api/dashboard/series/incidents", "summary": "Incident trend time buckets", "query": []string{"window", "bucket"}},
+			{"method": "GET", "path": "/api/dashboard/series/severity", "summary": "Severity distribution", "query": []string{"window"}},
+			{"method": "GET", "path": "/api/dashboard/series/lanes", "summary": "FAST vs STANDARD distribution", "query": []string{"window"}},
+			{"method": "GET", "path": "/api/dashboard/top/entities", "summary": "Top src_ip/user/node entities", "query": []string{"window"}},
 			{"method": "GET", "path": "/api/incidents", "summary": "List incidents", "query": []string{"status", "severity", "lane", "playbook_id", "rule_id", "node_id", "from", "to", "q", "limit", "page", "sort"}},
 			{"method": "GET", "path": "/api/incidents/{run_id}", "summary": "Incident detail"},
 			{"method": "POST", "path": "/api/incidents/{run_id}/approve", "summary": "Approve/reject FAST action", "body": map[string]string{"decision": "approve|reject|deny", "actor": "string"}},
+			{"method": "POST", "path": "/api/incidents/{run_id}/reject", "summary": "Reject FAST action", "body": map[string]string{"actor": "string"}},
+			{"method": "POST", "path": "/api/incidents/{run_id}/assign", "summary": "Assign run to analyst/admin", "body": map[string]string{"assignee": "string"}},
+			{"method": "POST", "path": "/api/incidents/{run_id}/notes", "summary": "Add incident note", "body": map[string]string{"note": "string"}},
+			{"method": "POST", "path": "/api/incidents/{run_id}/review", "summary": "Mark run reviewed"},
 			{"method": "GET", "path": "/api/incidents/{run_id}/events", "summary": "Timeline events around incident", "query": []string{"window_seconds"}},
 			{"method": "GET", "path": "/api/search", "summary": "Global search across incidents and events", "query": []string{"q", "from", "to", "limit"}},
 			{"method": "GET", "path": "/api/stream", "summary": "SSE refresh hints and approval queue counts"},
 			{"method": "GET", "path": "/api/endpoints", "summary": "Endpoint summaries"},
+			{"method": "GET", "path": "/api/endpoints/geo", "summary": "Endpoint summaries with geo posture", "query": []string{"window"}},
 			{"method": "GET", "path": "/api/endpoints/{node_id}/events", "summary": "Recent endpoint events", "query": []string{"from", "to", "limit"}},
 			{"method": "GET", "path": "/api/endpoints/{node_id}/runs", "summary": "Recent runs affecting endpoint", "query": []string{"limit"}},
 			{"method": "POST", "path": "/api/endpoints/{node_id}/targeted-test", "summary": "Publish harmless targeted step", "body": map[string]string{"actor": "string", "target_agent_id": "string (optional)"}},
 			{"method": "GET", "path": "/api/audit", "summary": "Approvals and key actions audit"},
+			{"method": "GET", "path": "/api/users", "summary": "List UI users (admin only)"},
+			{"method": "POST", "path": "/api/users", "summary": "Create/update user (admin only)"},
+			{"method": "POST", "path": "/api/users/{id}/disable", "summary": "Disable user (admin only)"},
+			{"method": "GET", "path": "/api/admin/users", "summary": "Alias for /api/users (admin only)"},
+			{"method": "POST", "path": "/api/admin/users", "summary": "Alias for /api/users (admin only)"},
 			{"method": "GET", "path": "/api/artifacts", "summary": "List artifacts", "query": []string{"prefix"}},
 			{"method": "GET", "path": "/api/artifact", "summary": "Download artifact", "query": []string{"path"}},
 		},
 		"schemas": map[string]any{
-			"incident":  incident{},
-			"step":      stepResult{},
-			"event_row": eventRow{},
+			"incident":     incident{},
+			"step":         stepResult{},
+			"event_row":    eventRow{},
+			"endpoint_geo": endpointGeoSummary{},
+			"auth_claim":   authClaims{},
 		},
 	})
 }
@@ -556,9 +926,10 @@ func (a *app) handleIncidentDetail(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"run":    found,
-		"steps":  steps,
-		"source": "exports",
+		"run":      found,
+		"steps":    steps,
+		"ui_state": a.loadUIStateForRun(runID),
+		"source":   "exports",
 	})
 }
 
@@ -568,7 +939,7 @@ func (a *app) handleIncidentApprove(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing run_id"})
 		return
 	}
-	if a.js == nil {
+	if err := a.ensureNATS(); err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "nats unavailable"})
 		return
 	}
@@ -591,7 +962,11 @@ func (a *app) handleIncidentApprove(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "decision must be approve or reject"})
 		return
 	}
+	roleCtx := roleFromRequest(r)
 	actor := strings.TrimSpace(body.Actor)
+	if actor == "" {
+		actor = roleCtx.Username
+	}
 	if actor == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "actor is required"})
 		return
@@ -605,7 +980,7 @@ func (a *app) handleIncidentApprove(w http.ResponseWriter, r *http.Request) {
 		"ts_unix_ms": time.Now().UnixMilli(),
 	}
 	data, _ := json.Marshal(payload)
-	if _, err := a.js.Publish(a.cfg.ApprovalsSubj, data); err != nil {
+	if err := a.publishNATS(a.cfg.ApprovalsSubj, data); err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
 		return
 	}
@@ -623,6 +998,129 @@ func (a *app) handleIncidentApprove(w http.ResponseWriter, r *http.Request) {
 		"subject":  a.cfg.ApprovalsSubj,
 		"ts":       time.Now().UTC().Format(time.RFC3339),
 	})
+}
+
+func (a *app) handleIncidentReject(w http.ResponseWriter, r *http.Request) {
+	runID := strings.TrimSpace(r.PathValue("run_id"))
+	if runID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing run_id"})
+		return
+	}
+	roleCtx := roleFromRequest(r)
+	var body struct {
+		Actor  string `json:"actor"`
+		Reason string `json:"reason"`
+	}
+	_ = decodeJSONBody(r.Body, &body)
+	actor := strings.TrimSpace(body.Actor)
+	if actor == "" {
+		actor = roleCtx.Username
+	}
+	if actor == "" {
+		actor = "analyst"
+	}
+	reqBody := map[string]any{
+		"decision": "reject",
+		"actor":    actor,
+		"reason":   strings.TrimSpace(body.Reason),
+	}
+	buf, _ := json.Marshal(reqBody)
+	r.Body = io.NopCloser(strings.NewReader(string(buf)))
+	a.handleIncidentApprove(w, r)
+}
+
+func (a *app) handleIncidentAssign(w http.ResponseWriter, r *http.Request) {
+	runID := strings.TrimSpace(r.PathValue("run_id"))
+	if runID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing run_id"})
+		return
+	}
+	roleCtx := roleFromRequest(r)
+	var body struct {
+		Assignee string `json:"assignee"`
+	}
+	if err := decodeJSONBody(r.Body, &body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	assignee := strings.TrimSpace(strings.ToLower(body.Assignee))
+	if assignee == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "assignee is required"})
+		return
+	}
+	if strings.ToLower(roleCtx.Role) != "admin" && assignee != strings.ToLower(roleCtx.Username) {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "analyst can only assign to self"})
+		return
+	}
+	rec := uiStateRecord{
+		TS:       time.Now().UTC().Format(time.RFC3339Nano),
+		Action:   "assign",
+		RunID:    runID,
+		Actor:    roleCtx.Username,
+		Assignee: assignee,
+	}
+	rec.IdempotencyKey = a.uiStateIdempotencyKey(rec)
+	if err := a.appendUIStateRecord(a.assignmentsStatePath(), rec); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "run_id": runID, "assignee": assignee, "actor": roleCtx.Username})
+}
+
+func (a *app) handleIncidentNotes(w http.ResponseWriter, r *http.Request) {
+	runID := strings.TrimSpace(r.PathValue("run_id"))
+	if runID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing run_id"})
+		return
+	}
+	roleCtx := roleFromRequest(r)
+	var body struct {
+		Note string `json:"note"`
+	}
+	if err := decodeJSONBody(r.Body, &body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	note := strings.TrimSpace(body.Note)
+	if note == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "note is required"})
+		return
+	}
+	rec := uiStateRecord{
+		TS:     time.Now().UTC().Format(time.RFC3339Nano),
+		Action: "note",
+		RunID:  runID,
+		Actor:  roleCtx.Username,
+		Note:   note,
+	}
+	rec.IdempotencyKey = a.uiStateIdempotencyKey(rec)
+	if err := a.appendUIStateRecord(a.notesStatePath(), rec); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "run_id": runID})
+}
+
+func (a *app) handleIncidentMarkReviewed(w http.ResponseWriter, r *http.Request) {
+	runID := strings.TrimSpace(r.PathValue("run_id"))
+	if runID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing run_id"})
+		return
+	}
+	roleCtx := roleFromRequest(r)
+	rec := uiStateRecord{
+		TS:     time.Now().UTC().Format(time.RFC3339Nano),
+		Action: "mark_reviewed",
+		RunID:  runID,
+		Actor:  roleCtx.Username,
+		Status: "reviewed",
+	}
+	rec.IdempotencyKey = a.uiStateIdempotencyKey(rec)
+	if err := a.appendUIStateRecord(a.assignmentsStatePath(), rec); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "run_id": runID, "status": "reviewed"})
 }
 
 func (a *app) handleIncidentEvents(w http.ResponseWriter, r *http.Request) {
@@ -674,53 +1172,399 @@ func (a *app) handleIncidentEvents(w http.ResponseWriter, r *http.Request) {
 		fromMs, toMs = toMs, fromMs
 	}
 
-	clauses := []string{"recv_ts_unix_ms BETWEEN $1 AND $2"}
-	args := []any{fromMs, toMs}
+	loadEvents := func(clauses []string, args []any) ([]eventRow, error) {
+		query := "SELECT event_ts_unix_ms, recv_ts_unix_ms, node_id, source_type, event_type, COALESCE(src_ip::text,''), COALESCE(user_name,''), COALESCE(severity,''), COALESCE(rule_id,''), event_idem_key FROM normalized_events WHERE " + strings.Join(clauses, " AND ") + fmt.Sprintf(" ORDER BY recv_ts_unix_ms DESC LIMIT %d", limit)
+		rows, err := a.db.QueryContext(r.Context(), query, args...)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		items := make([]eventRow, 0, 128)
+		for rows.Next() {
+			var ev eventRow
+			if err := rows.Scan(&ev.EventTSUnixMs, &ev.RecvTSUnixMs, &ev.NodeID, &ev.SourceType, &ev.EventType, &ev.SrcIP, &ev.UserName, &ev.Severity, &ev.RuleID, &ev.EventIdemKey); err == nil {
+				items = append(items, ev)
+			}
+		}
+		return items, nil
+	}
+
+	// First pass: strict run-scoped matching.
+	strictClauses := []string{"recv_ts_unix_ms BETWEEN $1 AND $2"}
+	strictArgs := []any{fromMs, toMs}
 	idx := 3
 	nodeMatch := chooseNonEmpty(pivotNode, run.NodeID)
 	if nodeMatch != "" {
-		clauses = append(clauses, fmt.Sprintf("node_id = $%d", idx))
-		args = append(args, nodeMatch)
+		strictClauses = append(strictClauses, fmt.Sprintf("node_id = $%d", idx))
+		strictArgs = append(strictArgs, nodeMatch)
 		idx++
 	}
 	userMatch := chooseNonEmpty(pivotUser, run.User)
 	if userMatch != "" {
-		clauses = append(clauses, fmt.Sprintf("COALESCE(user_name,'') = $%d", idx))
-		args = append(args, userMatch)
+		strictClauses = append(strictClauses, fmt.Sprintf("COALESCE(user_name,'') = $%d", idx))
+		strictArgs = append(strictArgs, userMatch)
 		idx++
 	}
 	srcIPMatch := chooseNonEmpty(pivotSrcIP, run.SrcIP)
 	if srcIPMatch != "" {
-		clauses = append(clauses, fmt.Sprintf("COALESCE(src_ip::text,'') = $%d", idx))
-		args = append(args, srcIPMatch)
+		strictClauses = append(strictClauses, fmt.Sprintf("COALESCE(src_ip::text,'') = $%d", idx))
+		strictArgs = append(strictArgs, srcIPMatch)
 		idx++
 	}
 	if run.SourceType != "" {
-		clauses = append(clauses, fmt.Sprintf("source_type = $%d", idx))
-		args = append(args, run.SourceType)
+		strictClauses = append(strictClauses, fmt.Sprintf("source_type = $%d", idx))
+		strictArgs = append(strictArgs, run.SourceType)
 		idx++
 	}
 	if run.EventType != "" {
-		clauses = append(clauses, fmt.Sprintf("event_type = $%d", idx))
-		args = append(args, run.EventType)
+		strictClauses = append(strictClauses, fmt.Sprintf("event_type = $%d", idx))
+		strictArgs = append(strictArgs, run.EventType)
 		idx++
 	}
-	query := "SELECT event_ts_unix_ms, recv_ts_unix_ms, node_id, source_type, event_type, COALESCE(src_ip::text,''), COALESCE(user_name,''), COALESCE(severity,''), COALESCE(rule_id,''), event_idem_key FROM normalized_events WHERE " + strings.Join(clauses, " AND ") + fmt.Sprintf(" ORDER BY recv_ts_unix_ms DESC LIMIT %d", limit)
-	rows, err := a.db.QueryContext(r.Context(), query, args...)
+	items, err := loadEvents(strictClauses, strictArgs)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-	defer rows.Close()
+	if len(items) > 0 {
+		writeJSON(w, http.StatusOK, map[string]any{"items": items, "count": len(items), "source": "db", "query_mode": "strict"})
+		return
+	}
 
-	items := make([]eventRow, 0, 128)
-	for rows.Next() {
-		var ev eventRow
-		if err := rows.Scan(&ev.EventTSUnixMs, &ev.RecvTSUnixMs, &ev.NodeID, &ev.SourceType, &ev.EventType, &ev.SrcIP, &ev.UserName, &ev.Severity, &ev.RuleID, &ev.EventIdemKey); err == nil {
-			items = append(items, ev)
+	// Fallback: wider time window + less strict entity matching.
+	wideWindowSec := windowSec * 2
+	if wideWindowSec < 1800 {
+		wideWindowSec = 1800
+	}
+	fallbackFrom := center - (wideWindowSec * 1000)
+	fallbackTo := center + (wideWindowSec * 1000)
+	fallbackClauses := []string{"recv_ts_unix_ms BETWEEN $1 AND $2"}
+	fallbackArgs := []any{fallbackFrom, fallbackTo}
+	idx = 3
+
+	// Respect explicit pivots when provided.
+	if pivotNode != "" {
+		fallbackClauses = append(fallbackClauses, fmt.Sprintf("node_id = $%d", idx))
+		fallbackArgs = append(fallbackArgs, pivotNode)
+		idx++
+	}
+	if pivotUser != "" {
+		fallbackClauses = append(fallbackClauses, fmt.Sprintf("COALESCE(user_name,'') = $%d", idx))
+		fallbackArgs = append(fallbackArgs, pivotUser)
+		idx++
+	}
+	if pivotSrcIP != "" {
+		fallbackClauses = append(fallbackClauses, fmt.Sprintf("COALESCE(src_ip::text,'') = $%d", idx))
+		fallbackArgs = append(fallbackArgs, pivotSrcIP)
+		idx++
+	}
+
+	// If no explicit pivots, match any known run entities (OR) to avoid empty timelines.
+	if pivotNode == "" && pivotUser == "" && pivotSrcIP == "" {
+		entityOr := make([]string, 0, 4)
+		if run.NodeID != "" {
+			entityOr = append(entityOr, fmt.Sprintf("node_id = $%d", idx))
+			fallbackArgs = append(fallbackArgs, run.NodeID)
+			idx++
+		}
+		if run.SrcIP != "" {
+			entityOr = append(entityOr, fmt.Sprintf("COALESCE(src_ip::text,'') = $%d", idx))
+			fallbackArgs = append(fallbackArgs, run.SrcIP)
+			idx++
+		}
+		if run.User != "" {
+			entityOr = append(entityOr, fmt.Sprintf("COALESCE(user_name,'') = $%d", idx))
+			fallbackArgs = append(fallbackArgs, run.User)
+			idx++
+		}
+		if run.EventIdemKey != "" {
+			entityOr = append(entityOr, fmt.Sprintf("event_idem_key = $%d", idx))
+			fallbackArgs = append(fallbackArgs, run.EventIdemKey)
+			idx++
+		}
+		if len(entityOr) > 0 {
+			fallbackClauses = append(fallbackClauses, "("+strings.Join(entityOr, " OR ")+")")
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": items, "count": len(items), "source": "db"})
+
+	items, err = loadEvents(fallbackClauses, fallbackArgs)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"items":         items,
+		"count":         len(items),
+		"source":        "db",
+		"query_mode":    "fallback",
+		"fallback_from": fallbackFrom,
+		"fallback_to":   fallbackTo,
+	})
+}
+
+func (a *app) handleDashboardSummary(w http.ResponseWriter, r *http.Request) {
+	windowMs := parseWindowMs(r.URL.Query().Get("window"), 24*time.Hour)
+	nowMs := time.Now().UnixMilli()
+	fromMs := nowMs - windowMs
+	prevFromMs := fromMs - windowMs
+	prevToMs := fromMs
+
+	runs, _, _ := a.loadState()
+	incidents := 0
+	waiting := 0
+	failedSafe := 0
+	criticalIncidents := 0
+	activeNodes := map[string]struct{}{}
+	mitreNow := map[string]*tacticTile{}
+	mitrePrev := map[string]int{}
+	initMitre := func() {
+		for _, tactic := range []string{
+			"Privilege Escalation",
+			"Lateral Movement",
+			"Discovery",
+			"Impact",
+			"Command & Control",
+			"Exfiltration",
+		} {
+			mitreNow[tactic] = &tacticTile{Tactic: tactic}
+			mitrePrev[tactic] = 0
+		}
+	}
+	initMitre()
+	for _, run := range runs {
+		ts := run.LastUpdatedAtUnixMs
+		if ts >= fromMs {
+			incidents++
+			if strings.ToUpper(run.Status) == "WAITING_APPROVAL" {
+				waiting++
+			}
+			if strings.ToUpper(run.Status) == "FAILED_SAFE" {
+				failedSafe++
+			}
+			if severityRank(run.Severity) >= severityRank("critical") {
+				criticalIncidents++
+			}
+			if run.NodeID != "" {
+				activeNodes[run.NodeID] = struct{}{}
+			}
+			if tactic := mitreTacticFromRun(run); tactic != "" {
+				tile := mitreNow[tactic]
+				tile.Count++
+				if severityRank(run.Severity) >= severityRank("high") {
+					tile.HighCritical++
+				}
+			}
+		}
+		if ts >= prevFromMs && ts < prevToMs {
+			if tactic := mitreTacticFromRun(run); tactic != "" {
+				mitrePrev[tactic]++
+			}
+		}
+	}
+	endpointsActive := len(activeNodes)
+	ingestionPerMin := 0.0
+	latencyP95Ms := int64(0)
+	totalEventsWindow := int64(0)
+	modelAlertsWindow := int64(0)
+	if a.db != nil {
+		var c int64
+		if err := a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM normalized_events WHERE recv_ts_unix_ms >= $1`, nowMs-5*60*1000).Scan(&c); err == nil {
+			ingestionPerMin = float64(c) / 5.0
+		}
+		_ = a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM normalized_events WHERE recv_ts_unix_ms >= $1`, fromMs).Scan(&totalEventsWindow)
+		_ = a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM normalized_events WHERE recv_ts_unix_ms >= $1 AND COALESCE(rule_id,'') <> ''`, fromMs).Scan(&modelAlertsWindow)
+		var p95 sql.NullFloat64
+		if err := a.db.QueryRowContext(r.Context(), `
+SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY GREATEST(recv_ts_unix_ms - event_ts_unix_ms,0))
+FROM normalized_events
+WHERE recv_ts_unix_ms >= $1 AND event_ts_unix_ms > 0
+`, fromMs).Scan(&p95); err == nil && p95.Valid {
+			latencyP95Ms = int64(p95.Float64)
+		}
+	}
+	mitreTiles := make([]tacticTile, 0, len(mitreNow))
+	for tactic, tile := range mitreNow {
+		cp := *tile
+		cp.Delta = cp.Count - mitrePrev[tactic]
+		mitreTiles = append(mitreTiles, cp)
+	}
+	sort.SliceStable(mitreTiles, func(i, j int) bool {
+		if mitreTiles[i].Count == mitreTiles[j].Count {
+			return mitreTiles[i].Tactic < mitreTiles[j].Tactic
+		}
+		return mitreTiles[i].Count > mitreTiles[j].Count
+	})
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"window_ms":                      windowMs,
+		"from_unix_ms":                   fromMs,
+		"to_unix_ms":                     nowMs,
+		"incidents_last_window":          incidents,
+		"critical_incidents_last_window": criticalIncidents,
+		"approvals_pending":              waiting,
+		"failed_safe_count":              failedSafe,
+		"endpoints_active":               endpointsActive,
+		"ingestion_rate_per_min":         ingestionPerMin,
+		"latency_p95_ms":                 latencyP95Ms,
+		"total_events_last_window":       totalEventsWindow,
+		"model_alerts_last_window":       modelAlertsWindow,
+		"mitre_tactics_processed":        mitreTiles,
+	})
+}
+
+func (a *app) handleDashboardIncidentsSeries(w http.ResponseWriter, r *http.Request) {
+	windowMs := parseWindowMs(r.URL.Query().Get("window"), 24*time.Hour)
+	bucketMs := parseWindowMs(r.URL.Query().Get("bucket"), time.Hour)
+	if bucketMs <= 0 {
+		bucketMs = int64(time.Hour / time.Millisecond)
+	}
+	nowMs := time.Now().UnixMilli()
+	fromMs := nowMs - windowMs
+	runs, _, _ := a.loadState()
+	type point struct {
+		TS         int64 `json:"ts_unix_ms"`
+		Count      int   `json:"count"`
+		Fast       int   `json:"fast"`
+		Standard   int   `json:"standard"`
+		FailedSafe int   `json:"failed_safe"`
+	}
+	m := map[int64]*point{}
+	for _, run := range runs {
+		if run.LastUpdatedAtUnixMs < fromMs {
+			continue
+		}
+		b := (run.LastUpdatedAtUnixMs / bucketMs) * bucketMs
+		p := m[b]
+		if p == nil {
+			p = &point{TS: b}
+			m[b] = p
+		}
+		p.Count++
+		switch strings.ToUpper(run.Lane) {
+		case "FAST":
+			p.Fast++
+		case "STANDARD":
+			p.Standard++
+		}
+		if strings.ToUpper(run.Status) == "FAILED_SAFE" {
+			p.FailedSafe++
+		}
+	}
+	out := make([]point, 0, len(m))
+	for _, p := range m {
+		out = append(out, *p)
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].TS < out[j].TS })
+	writeJSON(w, http.StatusOK, map[string]any{"items": out, "count": len(out), "window_ms": windowMs, "bucket_ms": bucketMs})
+}
+
+func (a *app) handleDashboardSeveritySeries(w http.ResponseWriter, r *http.Request) {
+	windowMs := parseWindowMs(r.URL.Query().Get("window"), 24*time.Hour)
+	nowMs := time.Now().UnixMilli()
+	fromMs := nowMs - windowMs
+	runs, _, _ := a.loadState()
+	counts := map[string]int{"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0, "unknown": 0}
+	for _, run := range runs {
+		if run.LastUpdatedAtUnixMs < fromMs {
+			continue
+		}
+		sev := strings.ToLower(strings.TrimSpace(run.Severity))
+		if sev == "" {
+			sev = "unknown"
+		}
+		if _, ok := counts[sev]; !ok {
+			counts[sev] = 0
+		}
+		counts[sev]++
+	}
+	items := make([]map[string]any, 0, len(counts))
+	for k, v := range counts {
+		items = append(items, map[string]any{"severity": k, "count": v})
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		ri := severityRank(strVal(items[i]["severity"]))
+		rj := severityRank(strVal(items[j]["severity"]))
+		if ri == rj {
+			return strVal(items[i]["severity"]) < strVal(items[j]["severity"])
+		}
+		return ri > rj
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "count": len(items), "window_ms": windowMs})
+}
+
+func (a *app) handleDashboardLanesSeries(w http.ResponseWriter, r *http.Request) {
+	windowMs := parseWindowMs(r.URL.Query().Get("window"), 24*time.Hour)
+	nowMs := time.Now().UnixMilli()
+	fromMs := nowMs - windowMs
+	runs, _, _ := a.loadState()
+	fast := 0
+	standard := 0
+	unknown := 0
+	for _, run := range runs {
+		if run.LastUpdatedAtUnixMs < fromMs {
+			continue
+		}
+		switch strings.ToUpper(strings.TrimSpace(run.Lane)) {
+		case "FAST":
+			fast++
+		case "STANDARD":
+			standard++
+		default:
+			unknown++
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"items": []map[string]any{
+			{"lane": "FAST", "count": fast},
+			{"lane": "STANDARD", "count": standard},
+			{"lane": "UNKNOWN", "count": unknown},
+		},
+		"window_ms": windowMs,
+	})
+}
+
+func (a *app) handleDashboardTopEntities(w http.ResponseWriter, r *http.Request) {
+	windowMs := parseWindowMs(r.URL.Query().Get("window"), time.Hour)
+	nowMs := time.Now().UnixMilli()
+	fromMs := nowMs - windowMs
+	resp := map[string]any{
+		"window_ms": windowMs,
+		"src_ip":    []map[string]any{},
+		"user_name": []map[string]any{},
+		"node_id":   []map[string]any{},
+	}
+	if a.db == nil {
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+
+	queryTop := func(col string) []map[string]any {
+		rows, err := a.db.QueryContext(r.Context(), fmt.Sprintf(`
+SELECT %s AS v, COUNT(*) AS c
+FROM normalized_events
+WHERE recv_ts_unix_ms >= $1 AND COALESCE(%s::text,'') <> ''
+GROUP BY %s
+ORDER BY c DESC, v ASC
+LIMIT 8
+`, col, col, col), fromMs)
+		if err != nil {
+			return []map[string]any{}
+		}
+		defer rows.Close()
+		out := make([]map[string]any, 0, 8)
+		for rows.Next() {
+			var v string
+			var c int64
+			if err := rows.Scan(&v, &c); err == nil {
+				out = append(out, map[string]any{"value": v, "count": c})
+			}
+		}
+		return out
+	}
+	resp["src_ip"] = queryTop("src_ip")
+	resp["user_name"] = queryTop("user_name")
+	resp["node_id"] = queryTop("node_id")
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (a *app) handleSearch(w http.ResponseWriter, r *http.Request) {
@@ -841,6 +1685,15 @@ func (a *app) handleStream(w http.ResponseWriter, r *http.Request) {
 		if _, err := fmt.Fprintf(w, "event: hint\ndata: %s\n\n", string(data)); err != nil {
 			return false
 		}
+		if _, err := fmt.Fprintf(w, "event: incidents_updated\ndata: %s\n\n", string(data)); err != nil {
+			return false
+		}
+		if _, err := fmt.Fprintf(w, "event: approvals_pending_count\ndata: %s\n\n", string(data)); err != nil {
+			return false
+		}
+		if _, err := fmt.Fprintf(w, "event: endpoints_activity_updated\ndata: %s\n\n", string(data)); err != nil {
+			return false
+		}
 		flusher.Flush()
 		return true
 	}
@@ -863,12 +1716,65 @@ func (a *app) handleStream(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) handleEndpoints(w http.ResponseWriter, r *http.Request) {
+	items, source, err := a.endpointSummaries(r.Context(), int64(time.Hour/time.Millisecond))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "count": len(items), "source": source})
+}
+
+func (a *app) handleEndpointsGeo(w http.ResponseWriter, r *http.Request) {
+	windowMs := parseWindowMs(r.URL.Query().Get("window"), time.Hour)
+	items, source, err := a.endpointSummaries(r.Context(), windowMs)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	geoCfg := a.loadGeoConfig()
+	nowMs := time.Now().UnixMilli()
+	failedSafeByNode := a.failedSafeCountsByNode(nowMs - windowMs)
+
+	out := make([]endpointGeoSummary, 0, len(items))
+	for _, ep := range items {
+		geo := geoForNode(ep.NodeID, geoCfg)
+		status := endpointStatus(ep, nowMs, failedSafeByNode[ep.NodeID], geo.Source)
+		lastSeen := ""
+		if ep.LastSeenUnixMs > 0 {
+			lastSeen = time.UnixMilli(ep.LastSeenUnixMs).UTC().Format(time.RFC3339)
+		}
+		out = append(out, endpointGeoSummary{
+			NodeID:          ep.NodeID,
+			LastSeenRFC3339: lastSeen,
+			Events5m:        ep.EventCount5m,
+			Events1h:        ep.EventCount1h,
+			Status:          status,
+			SourceDist:      ep.SourceTypeDist,
+			Geo:             geo,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"window":       r.URL.Query().Get("window"),
+		"generated_at": time.Now().UTC().Format(time.RFC3339),
+		"endpoints":    out,
+		"count":        len(out),
+		"source":       source,
+	})
+}
+
+func (a *app) endpointSummaries(ctx context.Context, windowMs int64) ([]endpointSummary, string, error) {
+	nowMs := time.Now().UnixMilli()
+	fiveMin := nowMs - 5*60*1000
+	windowStart := nowMs - windowMs
+	if windowStart <= 0 {
+		windowStart = nowMs - 60*60*1000
+	}
+
 	if a.db == nil {
-		// fallback from run exports
 		runs, _, _ := a.loadState()
 		byNode := map[string]*endpointSummary{}
 		for _, run := range runs {
-			node := run.NodeID
+			node := strings.TrimSpace(run.NodeID)
 			if node == "" {
 				continue
 			}
@@ -880,10 +1786,14 @@ func (a *app) handleEndpoints(w http.ResponseWriter, r *http.Request) {
 			if run.LastUpdatedAtUnixMs > ep.LastSeenUnixMs {
 				ep.LastSeenUnixMs = run.LastUpdatedAtUnixMs
 			}
-			ep.EventCount1h++
-			ep.EventCount5m++
-			if run.SourceType != "" {
-				ep.SourceTypeDist[run.SourceType]++
+			if run.LastUpdatedAtUnixMs >= fiveMin {
+				ep.EventCount5m++
+			}
+			if run.LastUpdatedAtUnixMs >= windowStart {
+				ep.EventCount1h++
+				if run.SourceType != "" {
+					ep.SourceTypeDist[run.SourceType]++
+				}
 			}
 		}
 		items := make([]endpointSummary, 0, len(byNode))
@@ -891,30 +1801,31 @@ func (a *app) handleEndpoints(w http.ResponseWriter, r *http.Request) {
 			for st := range ep.SourceTypeDist {
 				ep.SourceTypeSamples = append(ep.SourceTypeSamples, st)
 			}
+			sort.Strings(ep.SourceTypeSamples)
 			items = append(items, *ep)
 		}
-		sort.SliceStable(items, func(i, j int) bool { return items[i].LastSeenUnixMs > items[j].LastSeenUnixMs })
-		writeJSON(w, http.StatusOK, map[string]any{"items": items, "count": len(items), "source": "exports"})
-		return
+		sort.SliceStable(items, func(i, j int) bool {
+			if items[i].LastSeenUnixMs == items[j].LastSeenUnixMs {
+				return items[i].NodeID < items[j].NodeID
+			}
+			return items[i].LastSeenUnixMs > items[j].LastSeenUnixMs
+		})
+		return items, "exports", nil
 	}
-
-	nowMs := time.Now().UnixMilli()
-	fiveMin := nowMs - 5*60*1000
-	oneHour := nowMs - 60*60*1000
 
 	query := `
 SELECT node_id,
        MAX(recv_ts_unix_ms) AS last_seen,
        SUM(CASE WHEN recv_ts_unix_ms >= $1 THEN 1 ELSE 0 END) AS count_5m,
-       SUM(CASE WHEN recv_ts_unix_ms >= $2 THEN 1 ELSE 0 END) AS count_1h
+       SUM(CASE WHEN recv_ts_unix_ms >= $2 THEN 1 ELSE 0 END) AS count_window
 FROM normalized_events
+WHERE COALESCE(node_id,'') <> ''
 GROUP BY node_id
 ORDER BY last_seen DESC
 LIMIT 500`
-	rows, err := a.db.QueryContext(r.Context(), query, fiveMin, oneHour)
+	rows, err := a.db.QueryContext(ctx, query, fiveMin, windowStart)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return
+		return nil, "", err
 	}
 	defer rows.Close()
 
@@ -922,16 +1833,23 @@ LIMIT 500`
 	idx := map[string]int{}
 	for rows.Next() {
 		var node string
-		var lastSeen, c5, c1 sql.NullInt64
-		if err := rows.Scan(&node, &lastSeen, &c5, &c1); err != nil {
+		var lastSeen, c5, cW sql.NullInt64
+		if err := rows.Scan(&node, &lastSeen, &c5, &cW); err != nil {
 			continue
 		}
-		ep := endpointSummary{NodeID: node, LastSeenUnixMs: lastSeen.Int64, EventCount5m: c5.Int64, EventCount1h: c1.Int64, SourceTypeDist: map[string]int{}, DerivedFrom: "db"}
+		ep := endpointSummary{
+			NodeID:         node,
+			LastSeenUnixMs: lastSeen.Int64,
+			EventCount5m:   c5.Int64,
+			EventCount1h:   cW.Int64,
+			SourceTypeDist: map[string]int{},
+			DerivedFrom:    "db",
+		}
 		idx[node] = len(items)
 		items = append(items, ep)
 	}
 
-	dRows, err := a.db.QueryContext(r.Context(), `SELECT node_id, source_type, COUNT(*) FROM normalized_events WHERE recv_ts_unix_ms >= $1 GROUP BY node_id, source_type`, oneHour)
+	dRows, err := a.db.QueryContext(ctx, `SELECT node_id, source_type, COUNT(*) FROM normalized_events WHERE recv_ts_unix_ms >= $1 AND COALESCE(node_id,'') <> '' GROUP BY node_id, source_type`, windowStart)
 	if err == nil {
 		defer dRows.Close()
 		for dRows.Next() {
@@ -950,8 +1868,13 @@ LIMIT 500`
 		}
 		sort.Strings(items[i].SourceTypeSamples)
 	}
-
-	writeJSON(w, http.StatusOK, map[string]any{"items": items, "count": len(items), "source": "db"})
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].LastSeenUnixMs == items[j].LastSeenUnixMs {
+			return items[i].NodeID < items[j].NodeID
+		}
+		return items[i].LastSeenUnixMs > items[j].LastSeenUnixMs
+	})
+	return items, "db", nil
 }
 
 func (a *app) handleEndpointEvents(w http.ResponseWriter, r *http.Request) {
@@ -1037,7 +1960,7 @@ func (a *app) handleEndpointTargetedTest(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing node_id"})
 		return
 	}
-	if a.js == nil {
+	if err := a.ensureNATS(); err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "nats unavailable"})
 		return
 	}
@@ -1051,6 +1974,9 @@ func (a *app) handleEndpointTargetedTest(w http.ResponseWriter, r *http.Request)
 	}
 	actor := strings.TrimSpace(body.Actor)
 	if actor == "" {
+		actor = roleFromRequest(r).Username
+	}
+	if actor == "" {
 		actor = "ui"
 	}
 	targetAgentID := strings.TrimSpace(body.TargetAgentID)
@@ -1061,16 +1987,16 @@ func (a *app) handleEndpointTargetedTest(w http.ResponseWriter, r *http.Request)
 	runID := fmt.Sprintf("ui_target_%d", now)
 	stepID := fmt.Sprintf("%016x", now)
 	payload := map[string]any{
-		"run_id":         runID,
-		"step_id":        stepID,
-		"step_index":     0,
-		"action_type":    "agent_command",
-		"lane":           "FAST",
-		"step_idem_key":   fmt.Sprintf("step.%s.%s", runID, stepID),
-		"attempt":         0,
-		"target":          nodeID,
-		"target_agent_id": targetAgentID,
-		"actor":           actor,
+		"run_id":             runID,
+		"step_id":            stepID,
+		"step_index":         0,
+		"action_type":        "agent_command",
+		"lane":               "FAST",
+		"step_idem_key":      fmt.Sprintf("step.%s.%s", runID, stepID),
+		"attempt":            0,
+		"target":             nodeID,
+		"target_agent_id":    targetAgentID,
+		"actor":              actor,
 		"planned_at_unix_ms": now,
 		"emitted_at_unix_ms": now,
 		"params": map[string]any{
@@ -1079,7 +2005,7 @@ func (a *app) handleEndpointTargetedTest(w http.ResponseWriter, r *http.Request)
 		},
 	}
 	data, _ := json.Marshal(payload)
-	if _, err := a.js.Publish(defaultStepFastSubject, data); err != nil {
+	if err := a.publishNATS(defaultStepFastSubject, data); err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
 		return
 	}
@@ -1103,9 +2029,11 @@ func (a *app) handleEndpointTargetedTest(w http.ResponseWriter, r *http.Request)
 }
 
 func (a *app) handleAudit(w http.ResponseWriter, r *http.Request) {
+	roleCtx := roleFromRequest(r)
 	entries := make([]auditEntry, 0, 512)
 	entries = append(entries, parseAuditLog(a.cfg.MasterLogPath, "master")...)
 	entries = append(entries, parseAuditLog(a.cfg.UIAPILogPath, "ui-api")...)
+	entries = append(entries, a.parseUIStateAudit()...)
 	q := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("q")))
 	fromMs := parseInt64(r.URL.Query().Get("from"), 0)
 	toMs := parseInt64(r.URL.Query().Get("to"), 0)
@@ -1134,6 +2062,15 @@ func (a *app) handleAudit(w http.ResponseWriter, r *http.Request) {
 		filtered = append(filtered, entry)
 	}
 	entries = filtered
+	if strings.ToLower(roleCtx.Role) != "admin" {
+		for i := range entries {
+			if entries[i].Details != nil {
+				entries[i].Details = map[string]any{
+					"summary": "restricted_to_admin",
+				}
+			}
+		}
+	}
 	sort.SliceStable(entries, func(i, j int) bool {
 		return entries[i].TS > entries[j].TS
 	})
@@ -1148,6 +2085,19 @@ func (a *app) handleArtifacts(w http.ResponseWriter, r *http.Request) {
 	if prefix == "" {
 		prefix = a.cfg.ArtifactsRoot
 	}
+	filterQ := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("q")))
+	page := int(parseInt64(r.URL.Query().Get("page"), 1))
+	limit := int(parseInt64(r.URL.Query().Get("limit"), defaultArtifactLimit))
+	if page <= 0 {
+		page = 1
+	}
+	if limit <= 0 {
+		limit = defaultArtifactLimit
+	}
+	if limit > maxArtifactPageLimit {
+		limit = maxArtifactPageLimit
+	}
+
 	path, err := a.safePath(prefix)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
@@ -1162,8 +2112,9 @@ func (a *app) handleArtifacts(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "prefix is not a directory"})
 		return
 	}
-	entries := make([]map[string]any, 0, 128)
-	count := 0
+
+	entries := make([]map[string]any, 0, 256)
+	scanned := 0
 	err = filepath.WalkDir(path, func(p string, d os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return nil
@@ -1171,25 +2122,63 @@ func (a *app) handleArtifacts(w http.ResponseWriter, r *http.Request) {
 		if p == path {
 			return nil
 		}
-		if count >= maxArtifactListEntries {
+		if scanned >= maxArtifactScanEntries {
 			return io.EOF
 		}
 		rel, _ := filepath.Rel(".", p)
+		relPath := filepath.ToSlash(rel)
+		if filterQ != "" && !strings.Contains(strings.ToLower(relPath), filterQ) {
+			scanned++
+			return nil
+		}
 		info, _ := d.Info()
 		entries = append(entries, map[string]any{
-			"path":     filepath.ToSlash(rel),
+			"path":     relPath,
 			"is_dir":   d.IsDir(),
 			"size":     info.Size(),
 			"modified": info.ModTime().UTC().Format(time.RFC3339),
 		})
-		count++
+		scanned++
+		if filterQ == "" && len(entries) >= maxArtifactListEntries {
+			return io.EOF
+		}
 		return nil
 	})
 	if err != nil && !errors.Is(err, io.EOF) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": entries, "count": len(entries), "source": "filesystem"})
+
+	sort.SliceStable(entries, func(i, j int) bool {
+		pi := strVal(entries[i]["path"])
+		pj := strVal(entries[j]["path"])
+		if pi == pj {
+			return strVal(entries[i]["modified"]) > strVal(entries[j]["modified"])
+		}
+		return pi > pj
+	})
+
+	total := len(entries)
+	start := (page - 1) * limit
+	if start > total {
+		start = total
+	}
+	end := start + limit
+	if end > total {
+		end = total
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"items":     entries[start:end],
+		"count":     len(entries[start:end]),
+		"total":     total,
+		"page":      page,
+		"limit":     limit,
+		"has_more":  end < total,
+		"source":    "filesystem",
+		"filter_q":  filterQ,
+		"scan_path": filepath.ToSlash(prefix),
+	})
 }
 
 func (a *app) handleArtifactDownload(w http.ResponseWriter, r *http.Request) {
@@ -1452,6 +2441,350 @@ func (a *app) loadState() ([]incident, map[string][]stepResult, map[string]creat
 	return runs, stepsByRun, created
 }
 
+func (a *app) handleAdminUsersList(w http.ResponseWriter, _ *http.Request) {
+	a.usersMu.RLock()
+	defer a.usersMu.RUnlock()
+	items := make([]map[string]any, 0, len(a.users))
+	for _, user := range a.users {
+		items = append(items, map[string]any{
+			"username": user.Username,
+			"role":     user.Role,
+			"disabled": user.Disabled,
+		})
+	}
+	sort.SliceStable(items, func(i, j int) bool { return strVal(items[i]["username"]) < strVal(items[j]["username"]) })
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "count": len(items)})
+}
+
+func (a *app) handleAdminUsersUpsert(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+		Role     string `json:"role"`
+		Disabled bool   `json:"disabled"`
+	}
+	if err := decodeJSONBody(r.Body, &body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	username := strings.TrimSpace(strings.ToLower(body.Username))
+	if username == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "username is required"})
+		return
+	}
+	role := normalizeRole(body.Role)
+	if role == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "role must be admin or analyst"})
+		return
+	}
+	a.usersMu.Lock()
+	user, exists := a.users[username]
+	user.Username = username
+	user.Role = role
+	user.Disabled = body.Disabled
+	if strings.TrimSpace(body.Password) != "" {
+		hash, err := bcrypt.GenerateFromPassword([]byte(body.Password), bcrypt.DefaultCost)
+		if err != nil {
+			a.usersMu.Unlock()
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "password hash failed"})
+			return
+		}
+		user.PasswordHash = string(hash)
+	} else if !exists || user.PasswordHash == "" {
+		a.usersMu.Unlock()
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "password required for new user"})
+		return
+	}
+	a.users[username] = user
+	a.usersMu.Unlock()
+	if err := a.saveUsers(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "username": username, "role": role, "disabled": body.Disabled})
+}
+
+func (a *app) handleAdminUsersDisable(w http.ResponseWriter, r *http.Request) {
+	username := strings.TrimSpace(strings.ToLower(r.PathValue("id")))
+	if username == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "id is required"})
+		return
+	}
+	a.usersMu.Lock()
+	user, exists := a.users[username]
+	if !exists {
+		a.usersMu.Unlock()
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "user not found"})
+		return
+	}
+	user.Disabled = true
+	a.users[username] = user
+	a.usersMu.Unlock()
+	if err := a.saveUsers(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "username": username, "disabled": true})
+}
+
+func normalizeRole(role string) string {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "admin":
+		return "admin"
+	case "analyst", "soc_analyst", "soc-analyst":
+		return "analyst"
+	default:
+		return ""
+	}
+}
+
+func (a *app) loadUsers() error {
+	data, err := os.ReadFile(a.cfg.UsersPath)
+	if err != nil {
+		return err
+	}
+	type userFile struct {
+		Users []uiUser `json:"users"`
+	}
+	parsed := userFile{}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return err
+	}
+	if len(parsed.Users) == 0 {
+		return fmt.Errorf("no users defined in %s", a.cfg.UsersPath)
+	}
+	a.usersMu.Lock()
+	defer a.usersMu.Unlock()
+	a.users = map[string]uiUser{}
+	for _, u := range parsed.Users {
+		name := strings.TrimSpace(strings.ToLower(u.Username))
+		role := normalizeRole(u.Role)
+		if name == "" || role == "" || strings.TrimSpace(u.PasswordHash) == "" {
+			continue
+		}
+		u.Username = name
+		u.Role = role
+		a.users[name] = u
+	}
+	if len(a.users) == 0 {
+		return fmt.Errorf("no valid users in %s", a.cfg.UsersPath)
+	}
+	return nil
+}
+
+func (a *app) saveUsers() error {
+	a.usersMu.RLock()
+	items := make([]uiUser, 0, len(a.users))
+	for _, u := range a.users {
+		items = append(items, u)
+	}
+	a.usersMu.RUnlock()
+	sort.SliceStable(items, func(i, j int) bool { return items[i].Username < items[j].Username })
+	payload := map[string]any{
+		"users": items,
+	}
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(a.cfg.UsersPath), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(a.cfg.UsersPath, append(data, '\n'), 0o644)
+}
+
+func (a *app) signSessionToken(claims authClaims) (string, error) {
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		return "", err
+	}
+	msg := base64.RawURLEncoding.EncodeToString(payload)
+	mac := hmac.New(sha256.New, []byte(a.cfg.SessionSecret))
+	if _, err := mac.Write([]byte(msg)); err != nil {
+		return "", err
+	}
+	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	return msg + "." + sig, nil
+}
+
+func (a *app) verifySessionToken(token string) (authClaims, error) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 2 {
+		return authClaims{}, fmt.Errorf("invalid token format")
+	}
+	msg := parts[0]
+	gotSig := parts[1]
+	mac := hmac.New(sha256.New, []byte(a.cfg.SessionSecret))
+	if _, err := mac.Write([]byte(msg)); err != nil {
+		return authClaims{}, err
+	}
+	expectSig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	if subtle.ConstantTimeCompare([]byte(gotSig), []byte(expectSig)) != 1 {
+		return authClaims{}, fmt.Errorf("invalid token signature")
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(msg)
+	if err != nil {
+		return authClaims{}, err
+	}
+	var claims authClaims
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return authClaims{}, err
+	}
+	if claims.Exp <= time.Now().Unix() {
+		return authClaims{}, fmt.Errorf("token expired")
+	}
+	if normalizeRole(claims.Role) == "" || strings.TrimSpace(claims.Username) == "" {
+		return authClaims{}, fmt.Errorf("invalid claims")
+	}
+	return claims, nil
+}
+
+func (a *app) notesStatePath() string {
+	return filepath.Join(a.cfg.UIStateDir, "notes.jsonl")
+}
+
+func (a *app) assignmentsStatePath() string {
+	return filepath.Join(a.cfg.UIStateDir, "assignments.jsonl")
+}
+
+func (a *app) uiStateIdempotencyKey(rec uiStateRecord) string {
+	base := strings.Join([]string{
+		strings.TrimSpace(rec.Action),
+		strings.TrimSpace(rec.RunID),
+		strings.TrimSpace(strings.ToLower(rec.Actor)),
+		strings.TrimSpace(strings.ToLower(rec.Assignee)),
+		strings.TrimSpace(rec.Note),
+		strings.TrimSpace(rec.Status),
+	}, "|")
+	sum := sha256.Sum256([]byte(base))
+	return "ui." + hex.EncodeToString(sum[:12])
+}
+
+func (a *app) appendUIStateRecord(path string, rec uiStateRecord) error {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("ui state path is empty")
+	}
+	if strings.TrimSpace(rec.IdempotencyKey) == "" {
+		rec.IdempotencyKey = a.uiStateIdempotencyKey(rec)
+	}
+	exists, err := uiStateRecordExists(path, rec.IdempotencyKey)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := f.Write(append(data, '\n')); err != nil {
+		return err
+	}
+	a.logger.Info("ui_state_event",
+		slog.String("action", rec.Action),
+		slog.String("run_id", rec.RunID),
+		slog.String("actor", rec.Actor),
+		slog.String("assignee", rec.Assignee),
+		slog.String("idempotency_key", rec.IdempotencyKey),
+		slog.String("path", path),
+	)
+	return nil
+}
+
+func uiStateRecordExists(path string, key string) (bool, error) {
+	if strings.TrimSpace(key) == "" {
+		return false, nil
+	}
+	found := false
+	err := scanJSONLines(path, func(obj map[string]any) {
+		if strVal(obj["idempotency_key"]) == key {
+			found = true
+		}
+	})
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return found, nil
+}
+
+func (a *app) loadUIStateForRun(runID string) map[string]any {
+	out := map[string]any{
+		"assignment": "",
+		"notes":      []map[string]any{},
+		"reviewed":   false,
+	}
+	_ = scanJSONLines(a.assignmentsStatePath(), func(obj map[string]any) {
+		if strVal(obj["run_id"]) != runID {
+			return
+		}
+		action := strVal(obj["action"])
+		switch action {
+		case "assign":
+			out["assignment"] = strVal(obj["assignee"])
+		case "mark_reviewed":
+			out["reviewed"] = true
+		}
+	})
+	_ = scanJSONLines(a.notesStatePath(), func(obj map[string]any) {
+		if strVal(obj["run_id"]) != runID {
+			return
+		}
+		action := strVal(obj["action"])
+		switch action {
+		case "note":
+			notes, _ := out["notes"].([]map[string]any)
+			notes = append(notes, map[string]any{
+				"ts":    strVal(obj["ts"]),
+				"actor": strVal(obj["actor"]),
+				"note":  strVal(obj["note"]),
+			})
+			out["notes"] = notes
+		}
+	})
+	return out
+}
+
+func (a *app) parseUIStateAudit() []auditEntry {
+	entries := make([]auditEntry, 0, 128)
+	appendEntry := func(obj map[string]any) {
+		action := strVal(obj["action"])
+		if action == "" {
+			return
+		}
+		msg := "ui_" + action
+		entries = append(entries, auditEntry{
+			TS:       strVal(obj["ts"]),
+			Msg:      msg,
+			RunID:    strVal(obj["run_id"]),
+			Actor:    strVal(obj["actor"]),
+			Decision: "",
+			Status:   strVal(obj["status"]),
+			Details: map[string]any{
+				"assignee": strVal(obj["assignee"]),
+				"note":     strVal(obj["note"]),
+				"idem_key": strVal(obj["idempotency_key"]),
+			},
+			Source: "ui-state",
+		})
+	}
+	_ = scanJSONLines(a.assignmentsStatePath(), appendEntry)
+	_ = scanJSONLines(a.notesStatePath(), appendEntry)
+	return entries
+}
+
 func scanJSONLinesTail(path string, maxBytes int64, fn func(map[string]any)) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -1525,6 +2858,133 @@ func parseAuditLog(path string, source string) []auditEntry {
 		})
 	})
 	return entries
+}
+
+func (a *app) failedSafeCountsByNode(fromMs int64) map[string]int {
+	out := map[string]int{}
+	runs, _, _ := a.loadState()
+	for _, run := range runs {
+		if run.LastUpdatedAtUnixMs < fromMs {
+			continue
+		}
+		if strings.ToUpper(strings.TrimSpace(run.Status)) != "FAILED_SAFE" {
+			continue
+		}
+		node := strings.TrimSpace(run.NodeID)
+		if node == "" {
+			continue
+		}
+		out[node]++
+	}
+	return out
+}
+
+func (a *app) loadGeoConfig() map[string]endpointGeoConfigEntry {
+	out := map[string]endpointGeoConfigEntry{}
+	path := strings.TrimSpace(a.cfg.GeoConfigPath)
+	if path == "" {
+		return out
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return out
+	}
+	parsed := map[string]endpointGeoConfigEntry{}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return out
+	}
+	for k, v := range parsed {
+		node := strings.TrimSpace(k)
+		if node == "" {
+			continue
+		}
+		if v.Lat < -90 || v.Lat > 90 || v.Lon < -180 || v.Lon > 180 {
+			continue
+		}
+		v.Label = strings.TrimSpace(v.Label)
+		out[node] = v
+	}
+	return out
+}
+
+func geoForNode(nodeID string, cfg map[string]endpointGeoConfigEntry) endpointGeoPoint {
+	node := strings.TrimSpace(nodeID)
+	if node == "" {
+		return endpointGeoPoint{Source: "none"}
+	}
+	if v, ok := cfg[node]; ok {
+		label := v.Label
+		if label == "" {
+			label = node
+		}
+		return endpointGeoPoint{
+			Lat:    roundCoord(v.Lat),
+			Lon:    roundCoord(v.Lon),
+			Label:  label,
+			Source: "configured",
+		}
+	}
+	sum := sha256.Sum256([]byte(strings.ToLower(node)))
+	latRaw := (uint16(sum[0]) << 8) | uint16(sum[1])
+	lonRaw := (uint16(sum[2]) << 8) | uint16(sum[3])
+	lat := -55.0 + (float64(latRaw)/65535.0)*125.0
+	lon := -170.0 + (float64(lonRaw)/65535.0)*340.0
+	return endpointGeoPoint{
+		Lat:    roundCoord(lat),
+		Lon:    roundCoord(lon),
+		Label:  "Derived " + node,
+		Source: "derived",
+	}
+}
+
+func roundCoord(v float64) float64 {
+	if v >= 0 {
+		return float64(int64(v*10000.0+0.5)) / 10000.0
+	}
+	return float64(int64(v*10000.0-0.5)) / 10000.0
+}
+
+func endpointStatus(ep endpointSummary, nowMs int64, failedSafeCount int, geoSource string) string {
+	if strings.TrimSpace(ep.NodeID) == "" || geoSource == "none" {
+		return "unknown"
+	}
+	if failedSafeCount >= 3 || ep.EventCount1h == 0 {
+		return "critical"
+	}
+	if ep.LastSeenUnixMs <= 0 {
+		return "unknown"
+	}
+	age := nowMs - ep.LastSeenUnixMs
+	if age > int64((15*time.Minute)/time.Millisecond) || ep.EventCount5m == 0 {
+		return "warning"
+	}
+	return "active"
+}
+
+func mitreTacticFromRun(run incident) string {
+	hay := strings.ToUpper(strings.Join([]string{
+		run.RuleID,
+		run.PlaybookID,
+		run.EventType,
+		run.SourceType,
+		run.FailedSafeReason,
+	}, "|"))
+	switch {
+	case strings.Contains(hay, "PRIVESC") || strings.Contains(hay, "PRIVILEGE"):
+		return "Privilege Escalation"
+	case strings.Contains(hay, "LATERAL"):
+		return "Lateral Movement"
+	case strings.Contains(hay, "DISCOVER") || strings.Contains(hay, "PROCESS"):
+		return "Discovery"
+	case strings.Contains(hay, "RANSOM") || strings.Contains(hay, "QUARANTINE") || strings.Contains(hay, "IMPACT"):
+		return "Impact"
+	case strings.Contains(hay, "C2") || strings.Contains(hay, "BEACON") || strings.Contains(hay, "COMMAND"):
+		return "Command & Control"
+	case strings.Contains(hay, "EXFIL"):
+		return "Exfiltration"
+	default:
+		return ""
+	}
 }
 
 func scanJSONLines(path string, fn func(map[string]any)) error {
@@ -1630,6 +3090,30 @@ func parseInt64(s string, fallback int64) int64 {
 		return ts.UnixMilli()
 	}
 	return fallback
+}
+
+func parseWindowMs(s string, fallback time.Duration) int64 {
+	s = strings.TrimSpace(strings.ToLower(s))
+	if s == "" {
+		return int64(fallback / time.Millisecond)
+	}
+	d, err := time.ParseDuration(s)
+	if err == nil && d > 0 {
+		return int64(d / time.Millisecond)
+	}
+	switch s {
+	case "24h":
+		return int64((24 * time.Hour) / time.Millisecond)
+	case "7d":
+		return int64((7 * 24 * time.Hour) / time.Millisecond)
+	case "1h":
+		return int64(time.Hour / time.Millisecond)
+	case "15m":
+		return int64((15 * time.Minute) / time.Millisecond)
+	case "5m":
+		return int64((5 * time.Minute) / time.Millisecond)
+	}
+	return int64(fallback / time.Millisecond)
 }
 
 func severityRank(v string) int {

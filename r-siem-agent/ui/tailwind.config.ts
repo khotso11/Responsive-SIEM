@@ -11,26 +11,31 @@ const config: Config = {
     extend: {
       colors: {
         ink: {
-          50: "#f6f7f9",
-          100: "#e9ecf1",
-          200: "#ccd3df",
-          300: "#a5b1c5",
-          400: "#7383a0",
-          500: "#54627f",
-          600: "#3f4a62",
-          700: "#2e3648",
-          800: "#1f2433",
-          900: "#141923"
+          50: "#E7ECFF",
+          100: "#D2DAF5",
+          200: "#A7B0D6",
+          300: "#8E98C2",
+          400: "#6C769E",
+          500: "#4B567F",
+          600: "#2F3A5D",
+          700: "#1E2A44",
+          800: "#101A2F",
+          900: "#0B1020",
+          950: "#070A12"
+        },
+        accent: {
+          cyan: "#35D3FF",
+          violet: "#8A5CFF"
         },
         signal: {
-          good: "#15803d",
-          warn: "#d97706",
-          bad: "#b91c1c",
-          info: "#0369a1"
+          good: "#27E0A3",
+          warn: "#FFB020",
+          bad: "#FF4D6D",
+          info: "#35D3FF"
         }
       },
       boxShadow: {
-        panel: "0 8px 28px rgba(16, 24, 40, 0.14)"
+        panel: "0 8px 28px rgba(0, 0, 0, 0.35)"
       }
     }
   },

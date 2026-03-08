@@ -1,11 +1,42 @@
-import { AuditEntry, EndpointSummary, EventRow, Incident, IncidentListResponse, SearchResponse, StepResult } from "@/lib/types";
+import {
+  AuditEntry,
+  AuthUser,
+  DashboardIncidentPoint,
+  DashboardSummary,
+  EndpointsGeoResponse,
+  EndpointSummary,
+  EventRow,
+  Incident,
+  IncidentDetailResponse,
+  IncidentListResponse,
+  SearchResponse,
+  StepResult
+} from "@/lib/types";
 
 const API_BASE = process.env.NEXT_PUBLIC_UI_API_BASE || "http://127.0.0.1:8090";
 const API_KEY = process.env.NEXT_PUBLIC_UI_API_KEY || "dev-ui-key";
+const TOKEN_KEY = "rsiem_ui_token";
+
+function authToken(): string {
+  if (typeof window === "undefined") return "";
+  return window.localStorage.getItem(TOKEN_KEY) || "";
+}
+
+export function setAuthToken(token: string): void {
+  if (typeof window === "undefined") return;
+  if (token) {
+    window.localStorage.setItem(TOKEN_KEY, token);
+  } else {
+    window.localStorage.removeItem(TOKEN_KEY);
+  }
+}
 
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers || {});
-  headers.set("X-API-Key", API_KEY);
+  const token = authToken();
+  if (token) {
+    headers.set("Authorization", `Bearer ${token}`);
+  }
   if (!headers.has("Content-Type") && init?.method && init.method !== "GET") {
     headers.set("Content-Type", "application/json");
   }
@@ -23,11 +54,59 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   return (await res.json()) as T;
 }
 
+export async function login(username: string, password: string): Promise<{ ok: boolean; user: AuthUser; token: string }> {
+  const res = await apiFetch<{ ok: boolean; user: AuthUser; token: string }>("/api/auth/login", {
+    method: "POST",
+    body: JSON.stringify({ username, password })
+  });
+  if (res.token) {
+    setAuthToken(res.token);
+  }
+  return res;
+}
+
+export async function logout(): Promise<void> {
+  try {
+    await apiFetch<{ ok: boolean }>("/api/auth/logout", { method: "POST" });
+  } finally {
+    setAuthToken("");
+  }
+}
+
+export async function me(): Promise<{ ok: boolean; user: AuthUser }> {
+  return apiFetch("/api/auth/me");
+}
+
+export async function getDashboardSummary(window = "24h"): Promise<DashboardSummary> {
+  return apiFetch(`/api/dashboard/summary?window=${encodeURIComponent(window)}`);
+}
+
+export async function getDashboardIncidentsSeries(window = "24h", bucket = "1h"): Promise<{ items: DashboardIncidentPoint[]; count: number }> {
+  return apiFetch(`/api/dashboard/series/incidents?window=${encodeURIComponent(window)}&bucket=${encodeURIComponent(bucket)}`);
+}
+
+export async function getDashboardSeverity(window = "24h"): Promise<{ items: Array<{ severity: string; count: number }> }> {
+  return apiFetch(`/api/dashboard/series/severity?window=${encodeURIComponent(window)}`);
+}
+
+export async function getDashboardLanes(window = "24h"): Promise<{ items: Array<{ lane: string; count: number }> }> {
+  return apiFetch(`/api/dashboard/series/lanes?window=${encodeURIComponent(window)}`);
+}
+
+export async function getDashboardTopEntities(window = "1h"): Promise<{
+  window_ms: number;
+  src_ip: Array<{ value: string; count: number }>;
+  user_name: Array<{ value: string; count: number }>;
+  node_id: Array<{ value: string; count: number }>;
+}> {
+  return apiFetch(`/api/dashboard/top/entities?window=${encodeURIComponent(window)}`);
+}
+
 export async function getIncidents(query = ""): Promise<IncidentListResponse> {
   return apiFetch(`/api/incidents${query ? `?${query}` : ""}`);
 }
 
-export async function getIncident(runId: string): Promise<{ run: Incident; steps: StepResult[]; source: string }> {
+export async function getIncident(runId: string): Promise<IncidentDetailResponse> {
   return apiFetch(`/api/incidents/${encodeURIComponent(runId)}`);
 }
 
@@ -53,8 +132,40 @@ export async function approveIncident(runId: string, decision: "approve" | "reje
   });
 }
 
+export async function rejectIncident(runId: string, actor: string): Promise<{ ok: boolean }> {
+  return apiFetch(`/api/incidents/${encodeURIComponent(runId)}/reject`, {
+    method: "POST",
+    body: JSON.stringify({ actor })
+  });
+}
+
+export async function assignIncident(runId: string, assignee: string): Promise<{ ok: boolean }> {
+  return apiFetch(`/api/incidents/${encodeURIComponent(runId)}/assign`, {
+    method: "POST",
+    body: JSON.stringify({ assignee })
+  });
+}
+
+export async function addIncidentNote(runId: string, note: string): Promise<{ ok: boolean }> {
+  return apiFetch(`/api/incidents/${encodeURIComponent(runId)}/notes`, {
+    method: "POST",
+    body: JSON.stringify({ note })
+  });
+}
+
+export async function markIncidentReviewed(runId: string): Promise<{ ok: boolean }> {
+  return apiFetch(`/api/incidents/${encodeURIComponent(runId)}/review`, {
+    method: "POST",
+    body: JSON.stringify({})
+  });
+}
+
 export async function getEndpoints(): Promise<{ items: EndpointSummary[]; count: number; source: string }> {
   return apiFetch("/api/endpoints");
+}
+
+export async function getEndpointsGeo(window = "1h"): Promise<EndpointsGeoResponse> {
+  return apiFetch(`/api/endpoints/geo?window=${encodeURIComponent(window)}`);
 }
 
 export async function getEndpointEvents(nodeID: string, query = ""): Promise<{ items: EventRow[]; count: number; source: string }> {
@@ -89,8 +200,34 @@ export async function getSearch(query: string, from?: number, to?: number, limit
   return apiFetch(`/api/search?${qs.toString()}`);
 }
 
-export async function getArtifacts(prefix: string): Promise<{ items: Array<{ path: string; is_dir: boolean; size: number; modified: string }>; count: number }> {
-  return apiFetch(`/api/artifacts?prefix=${encodeURIComponent(prefix)}`);
+export async function getArtifacts(
+  prefix: string,
+  opts?: { q?: string; page?: number; limit?: number }
+): Promise<{ items: Array<{ path: string; is_dir: boolean; size: number; modified: string }>; count: number; total?: number; page?: number; limit?: number; has_more?: boolean }> {
+  const qs = new URLSearchParams();
+  qs.set("prefix", prefix);
+  if (opts?.q) qs.set("q", opts.q);
+  if (opts?.page) qs.set("page", String(opts.page));
+  if (opts?.limit) qs.set("limit", String(opts.limit));
+  return apiFetch(`/api/artifacts?${qs.toString()}`);
+}
+
+export async function getAdminUsers(): Promise<{ items: Array<{ username: string; role: string; disabled: boolean }>; count: number }> {
+  return apiFetch("/api/users");
+}
+
+export async function upsertAdminUser(payload: { username: string; role: string; disabled?: boolean; password?: string }): Promise<{ ok: boolean }> {
+  return apiFetch("/api/users", {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export async function disableUser(username: string): Promise<{ ok: boolean; username: string; disabled: boolean }> {
+  return apiFetch(`/api/users/${encodeURIComponent(username)}/disable`, {
+    method: "POST",
+    body: JSON.stringify({})
+  });
 }
 
 export function getApiBase(): string {
@@ -102,5 +239,9 @@ export function getApiKey(): string {
 }
 
 export function getStreamURL(): string {
+  const token = authToken();
+  if (token) {
+    return `${API_BASE}/api/stream?token=${encodeURIComponent(token)}`;
+  }
   return `${API_BASE}/api/stream?api_key=${encodeURIComponent(API_KEY)}`;
 }

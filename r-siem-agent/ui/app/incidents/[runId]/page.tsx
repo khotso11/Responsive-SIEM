@@ -25,10 +25,15 @@ export default function IncidentDetailPage({ params }: { params: { runId: string
       const detail = await getIncident(runID);
       setRun(detail.run);
       setSteps(detail.steps || []);
-      const ev = await getIncidentEvents(runID, 900);
+      const ev = await getIncidentEvents(runID, { windowSeconds: 900 });
       setEvents(ev.items || []);
-      const art = await getArtifacts("demo_artifacts");
-      setArtifacts((art.items || []).filter((a) => a.path.includes("/fr04/") || a.path.endsWith("chain_of_custody.json") || a.path.endsWith("capture.pcap")));
+      const collected: Array<{ path: string; is_dir: boolean; size: number; modified: string }> = [];
+      for (let p = 1; p <= 3; p++) {
+        const art = await getArtifacts("demo_artifacts", { q: "/fr04/", page: p, limit: 200 });
+        collected.push(...(art.items || []));
+        if (!art.has_more) break;
+      }
+      setArtifacts(collected.filter((a) => a.path.includes("/fr04/") || a.path.endsWith("chain_of_custody.json") || a.path.endsWith("capture.pcap")));
     } catch (e) {
       setError((e as Error).message || String(e));
     } finally {
@@ -43,7 +48,7 @@ export default function IncidentDetailPage({ params }: { params: { runId: string
 
   const canApprove = useMemo(() => {
     if (!run) return false;
-    return (run.lane || "").toUpperCase() === "FAST" && (run.status || "").toUpperCase() === "RUNNING";
+    return (run.status || "").toUpperCase() === "WAITING_APPROVAL";
   }, [run]);
 
   const doDecision = async (decision: "approve" | "reject") => {

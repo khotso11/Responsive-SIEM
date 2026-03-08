@@ -2,8 +2,9 @@
 
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { getIncidents } from "@/lib/api";
+import { INCIDENT_MUTATED_EVENT, INCIDENTS_UPDATED_EVENT } from "@/lib/events";
 import { Incident, IncidentListResponse } from "@/lib/types";
 import { IncidentDrawer } from "@/components/incident-drawer";
 import { EmptyState, ErrorState, LaneBadge, LoadingState, StatusBadge, unixMsToLocal } from "@/components/ui";
@@ -49,6 +50,7 @@ export default function IncidentsPage() {
   const [sort, setSort] = useState("updated_desc");
   const [selectedRunID, setSelectedRunID] = useState("");
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [refreshNonce, setRefreshNonce] = useState(0);
   const globalFrom = useMemo(() => parseQueryTime(searchParams.get("gfrom")), [searchParams]);
   const globalTo = useMemo(() => parseQueryTime(searchParams.get("gto")), [searchParams]);
 
@@ -66,7 +68,7 @@ export default function IncidentsPage() {
     setQ(searchParams.get("gq") || "");
   }, [searchParams]);
 
-  useEffect(() => {
+  const load = useCallback(() => {
     const params = new URLSearchParams();
     if (status) params.set("status", status);
     if (lane) params.set("lane", lane);
@@ -83,7 +85,7 @@ export default function IncidentsPage() {
 
     setLoading(true);
     setError(null);
-    getIncidents(params.toString())
+    return getIncidents(params.toString())
       .then((res: IncidentListResponse) => {
         setItems(res.items || []);
         setTotal(res.total || res.count || 0);
@@ -91,6 +93,20 @@ export default function IncidentsPage() {
       .catch((e) => setError(e.message || String(e)))
       .finally(() => setLoading(false));
   }, [status, lane, severity, nodeID, playbookID, ruleID, q, globalFrom, globalTo, page, limit, sort]);
+
+  useEffect(() => {
+    void load();
+  }, [load, refreshNonce]);
+
+  useEffect(() => {
+    const onRefresh = () => setRefreshNonce((v) => v + 1);
+    window.addEventListener(INCIDENTS_UPDATED_EVENT, onRefresh);
+    window.addEventListener(INCIDENT_MUTATED_EVENT, onRefresh);
+    return () => {
+      window.removeEventListener(INCIDENTS_UPDATED_EVENT, onRefresh);
+      window.removeEventListener(INCIDENT_MUTATED_EVENT, onRefresh);
+    };
+  }, []);
 
   const pages = useMemo(() => Math.max(1, Math.ceil(total / limit)), [total, limit]);
 
@@ -106,11 +122,11 @@ export default function IncidentsPage() {
     <section className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h2 className="text-lg font-semibold">Incident Queue</h2>
-          <p className="text-sm text-ink-300">SOC queue with deterministic sort/paging, triage filters, and drawer investigation.</p>
+          <h2 className="text-[18px] font-semibold">Incident Queue</h2>
+          <p className="text-[13px] text-ink-300">SOC queue with deterministic sort/paging, triage filters, and drawer investigation.</p>
         </div>
         <div className="flex flex-wrap items-center gap-2 text-xs">
-          <select value={sort} onChange={(e) => setSort(e.target.value)} className="rounded bg-ink-800 px-2 py-1">
+          <select value={sort} onChange={(e) => setSort(e.target.value)} className="select-field py-1 text-xs">
             <option value="updated_desc">Updated desc</option>
             <option value="updated_asc">Updated asc</option>
             <option value="severity_desc">Severity desc</option>
@@ -122,7 +138,7 @@ export default function IncidentsPage() {
               setLimit(Number(e.target.value) || 50);
               setPage(1);
             }}
-            className="rounded bg-ink-800 px-2 py-1"
+            className="select-field py-1 text-xs"
           >
             <option value={25}>25</option>
             <option value={50}>50</option>
@@ -131,14 +147,14 @@ export default function IncidentsPage() {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 gap-2 md:grid-cols-8">
-        <input className="rounded border border-ink-700 bg-ink-900 px-2 py-2 text-sm" placeholder="Search run/user/src/node/rule" value={q} onChange={(e) => setQ(e.target.value)} />
-        <input className="rounded border border-ink-700 bg-ink-900 px-2 py-2 text-sm" placeholder="Status (WAITING_APPROVAL...)" value={status} onChange={(e) => setStatus(e.target.value)} />
-        <input className="rounded border border-ink-700 bg-ink-900 px-2 py-2 text-sm" placeholder="Lane (FAST/STANDARD)" value={lane} onChange={(e) => setLane(e.target.value)} />
-        <input className="rounded border border-ink-700 bg-ink-900 px-2 py-2 text-sm" placeholder="Severity" value={severity} onChange={(e) => setSeverity(e.target.value)} />
-        <input className="rounded border border-ink-700 bg-ink-900 px-2 py-2 text-sm" placeholder="Node ID" value={nodeID} onChange={(e) => setNodeID(e.target.value)} />
-        <input className="rounded border border-ink-700 bg-ink-900 px-2 py-2 text-sm" placeholder="Playbook ID" value={playbookID} onChange={(e) => setPlaybookID(e.target.value)} />
-        <input className="rounded border border-ink-700 bg-ink-900 px-2 py-2 text-sm" placeholder="Rule ID" value={ruleID} onChange={(e) => setRuleID(e.target.value)} />
+      <div className="sticky top-2 z-20 panel-elevated grid grid-cols-1 gap-2 p-2 md:grid-cols-8">
+        <input className="input-field" placeholder="Search run/user/src/node/rule" value={q} onChange={(e) => setQ(e.target.value)} />
+        <input className="input-field" placeholder="Status (WAITING_APPROVAL...)" value={status} onChange={(e) => setStatus(e.target.value)} />
+        <input className="input-field" placeholder="Lane (FAST/STANDARD)" value={lane} onChange={(e) => setLane(e.target.value)} />
+        <input className="input-field" placeholder="Severity" value={severity} onChange={(e) => setSeverity(e.target.value)} />
+        <input className="input-field" placeholder="Node ID" value={nodeID} onChange={(e) => setNodeID(e.target.value)} />
+        <input className="input-field" placeholder="Playbook ID" value={playbookID} onChange={(e) => setPlaybookID(e.target.value)} />
+        <input className="input-field" placeholder="Rule ID" value={ruleID} onChange={(e) => setRuleID(e.target.value)} />
         <button
           onClick={() => {
             setQ("");
@@ -150,7 +166,7 @@ export default function IncidentsPage() {
             setRuleID("");
             setPage(1);
           }}
-          className="rounded bg-ink-700 px-3 py-2 text-sm hover:bg-ink-600"
+          className="btn-secondary"
         >
           Clear filters
         </button>
@@ -158,7 +174,7 @@ export default function IncidentsPage() {
 
       <div className="flex flex-wrap gap-2">
         {DEFAULT_VIEWS.map((v) => (
-          <button key={v.name} className="rounded bg-ink-800 px-3 py-1 text-xs hover:bg-ink-700" onClick={() => saveView(v)}>
+          <button key={v.name} className="btn-secondary px-3 py-1 text-xs" onClick={() => saveView(v)}>
             {v.name}
           </button>
         ))}
@@ -171,17 +187,17 @@ export default function IncidentsPage() {
       {!loading && !error && items.length > 0 ? (
         <div className="overflow-auto">
           <table className="min-w-full text-sm">
-            <thead className="text-left text-ink-300">
+            <thead className="text-left">
               <tr>
-                <th className="p-2">Severity</th>
-                <th className="p-2">Run ID</th>
-                <th className="p-2">Status</th>
-                <th className="p-2">Lane</th>
-                <th className="p-2">Rule / Playbook</th>
-                <th className="p-2">Node</th>
-                <th className="p-2">Source</th>
-                <th className="p-2">Updated</th>
-                <th className="p-2">Approvals</th>
+                <th className="table-head p-2">Severity</th>
+                <th className="table-head p-2">Run ID</th>
+                <th className="table-head p-2">Status</th>
+                <th className="table-head p-2">Lane</th>
+                <th className="table-head p-2">Rule / Playbook</th>
+                <th className="table-head p-2">Node</th>
+                <th className="table-head p-2">Source</th>
+                <th className="table-head p-2">Updated</th>
+                <th className="table-head p-2">Approvals</th>
               </tr>
             </thead>
             <tbody>
@@ -212,13 +228,13 @@ export default function IncidentsPage() {
                           e.stopPropagation();
                           navigator.clipboard.writeText(it.run_id);
                         }}
-                        className="rounded bg-ink-800 px-1.5 py-0.5 text-[11px] hover:bg-ink-700"
+                        className="btn-secondary px-1.5 py-0.5 text-[11px]"
                         title="Copy run_id"
                       >
                         copy
                       </button>
                       <Link
-                        className="rounded bg-ink-800 px-1.5 py-0.5 text-[11px] hover:bg-ink-700"
+                        className="btn-secondary px-1.5 py-0.5 text-[11px]"
                         href={`/incidents/${encodeURIComponent(it.run_id)}`}
                         onClick={(e) => e.stopPropagation()}
                         title="Open dedicated detail page"
@@ -253,20 +269,20 @@ export default function IncidentsPage() {
         </div>
       ) : null}
 
-      <div className="flex items-center justify-between rounded border border-ink-800 px-3 py-2 text-xs text-ink-300">
+      <div className="panel-elevated flex items-center justify-between px-3 py-2 text-xs text-ink-300">
         <div>
           total={total} page={page}/{pages}
         </div>
         <div className="flex items-center gap-2">
           <button
-            className="rounded bg-ink-800 px-2 py-1 disabled:opacity-50"
+            className="btn-secondary px-2 py-1 text-xs disabled:opacity-50"
             onClick={() => setPage((p) => Math.max(1, p - 1))}
             disabled={page <= 1}
           >
             Prev
           </button>
           <button
-            className="rounded bg-ink-800 px-2 py-1 disabled:opacity-50"
+            className="btn-secondary px-2 py-1 text-xs disabled:opacity-50"
             onClick={() => setPage((p) => Math.min(pages, p + 1))}
             disabled={page >= pages}
           >

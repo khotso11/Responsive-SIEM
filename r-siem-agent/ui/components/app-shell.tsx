@@ -2,11 +2,14 @@
 
 import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { Activity, Clock3, ListChecks, Search, ShieldCheck, Zap } from "lucide-react";
+import { Activity, BarChart3, Clock3, ListChecks, Search, ShieldCheck, UserCircle2, Zap } from "lucide-react";
 import { ReactNode, useEffect, useMemo, useState } from "react";
-import { getStreamURL } from "@/lib/api";
+import { getStreamURL, login, logout, me, setAuthToken } from "@/lib/api";
+import { emitIncidentsUpdated } from "@/lib/events";
+import { AuthUser } from "@/lib/types";
 
 const NAV = [
+  { href: "/", label: "Dashboard", icon: BarChart3 },
   { href: "/incidents", label: "Incidents", icon: ListChecks },
   { href: "/endpoints", label: "Endpoints", icon: Activity },
   { href: "/audit", label: "Audit", icon: ShieldCheck }
@@ -58,6 +61,12 @@ export function AppShell({ children }: { children: ReactNode }) {
   const [waitingApprovals, setWaitingApprovals] = useState<number>(0);
   const [streamStatus, setStreamStatus] = useState<"live" | "polling">("polling");
 
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+  const [loginUser, setLoginUser] = useState("analyst");
+  const [loginPass, setLoginPass] = useState("");
+  const [loginErr, setLoginErr] = useState("");
+
   useEffect(() => {
     const now = Date.now();
     setMounted(true);
@@ -74,25 +83,58 @@ export function AppShell({ children }: { children: ReactNode }) {
   }, [searchParams]);
 
   useEffect(() => {
-    if (!live) {
+    let cancelled = false;
+    const probeToken = (searchParams.get("ui_probe_token") || "").trim();
+    if (probeToken) {
+      setAuthToken(probeToken);
+    }
+    setAuthLoading(true);
+    me()
+      .then((res) => {
+        if (!cancelled) {
+          setAuthUser(res.user);
+          setLoginErr("");
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setAuthUser(null);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setAuthLoading(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [searchParams]);
+
+  useEffect(() => {
+    if (!live || !authUser) {
       setStreamStatus("polling");
       return;
     }
     const ev = new EventSource(getStreamURL());
     let closed = false;
-    ev.addEventListener("hint", (raw) => {
+    const onRefresh = (raw: MessageEvent) => {
       if (closed) return;
+      let parsed: { waiting_approvals?: number } | undefined;
       try {
-        const parsed = JSON.parse((raw as MessageEvent).data) as { waiting_approvals?: number };
+        parsed = JSON.parse(raw.data) as { waiting_approvals?: number };
         setWaitingApprovals(parsed.waiting_approvals || 0);
       } catch {
-        // ignore parse errors; keep UI functional
+        // ignore parse errors
       }
+      emitIncidentsUpdated(parsed);
       const now = Date.now();
       setNowMs(now);
       setLastRefresh(now);
       setStreamStatus("live");
-    });
+    };
+    ev.addEventListener("hint", onRefresh as EventListener);
+    ev.addEventListener("incidents_updated", onRefresh as EventListener);
     ev.onerror = () => {
       setStreamStatus("polling");
     };
@@ -100,7 +142,7 @@ export function AppShell({ children }: { children: ReactNode }) {
       closed = true;
       ev.close();
     };
-  }, [live]);
+  }, [live, authUser]);
 
   useEffect(() => {
     if (live && streamStatus === "live") {
@@ -142,21 +184,81 @@ export function AppShell({ children }: { children: ReactNode }) {
     return new Date(lastRefresh).toLocaleTimeString();
   }, [mounted, lastRefresh]);
 
+  const doLogin = async () => {
+    try {
+      setLoginErr("");
+      const res = await login(loginUser, loginPass);
+      setAuthUser(res.user);
+      setLoginPass("");
+    } catch (e) {
+      setLoginErr((e as Error).message);
+    }
+  };
+
+  const doLogout = async () => {
+    await logout();
+    setAuthUser(null);
+  };
+
+  if (authLoading) {
+    return <div className="p-8 text-sm text-ink-200">Loading authentication...</div>;
+  }
+
+  if (!authUser) {
+    return (
+      <div className="flex min-h-screen items-center justify-center p-4">
+        <div className="panel w-full max-w-md p-5">
+          <h1 className="mb-2 text-xl font-semibold">R-SIEM SOC Console Login</h1>
+          <p className="mb-4 text-sm text-ink-300">Sign in with a local UI API user (admin/analyst).</p>
+          <div className="space-y-3">
+            <input
+              value={loginUser}
+              onChange={(e) => setLoginUser(e.target.value)}
+              className="input-field w-full"
+              placeholder="username"
+            />
+            <input
+              type="password"
+              value={loginPass}
+              onChange={(e) => setLoginPass(e.target.value)}
+              className="input-field w-full"
+              placeholder="password"
+              onKeyDown={(e) => {
+                if (e.key === "Enter") doLogin();
+              }}
+            />
+            <button className="btn-primary w-full" onClick={doLogin}>
+              Login
+            </button>
+            {loginErr ? <div className="rounded bg-rose-950/50 px-3 py-2 text-xs text-rose-300">{loginErr}</div> : null}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className="min-h-screen px-4 py-4 md:px-8">
-      <header className="panel mb-4 p-4">
+    <div className="h-screen overflow-hidden px-4 py-4 md:px-8">
+      <div className="mx-auto flex h-full max-w-[1400px] flex-col">
+      <header className="panel mb-4 shrink-0 p-4">
         <div className="mb-4 flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
           <div>
-            <h1 className="text-xl font-semibold tracking-tight">R-SIEM SOC Console</h1>
-            <p className="text-sm text-ink-300">Queue triage, investigation workspace, approvals, endpoint posture, and audit.</p>
+            <h1 className="text-[24px] font-semibold tracking-tight">R-SIEM SOC Console</h1>
+            <p className="text-sm text-ink-300">Posture dashboard, triage, investigations, approvals, endpoints, and audit.</p>
           </div>
-          <div className="flex items-center gap-2 rounded-lg border border-ink-700 bg-ink-900/70 px-3 py-2 text-xs text-ink-200">
+          <div className="flex flex-wrap items-center gap-2 rounded-lg border border-ink-700 bg-ink-900/70 px-3 py-2 text-xs text-ink-200">
             <Clock3 className="h-4 w-4" />
             <span>Last refresh: {quickNow}</span>
             <span className={`rounded px-2 py-0.5 ${streamStatus === "live" ? "bg-sky-900 text-sky-300" : "bg-amber-900 text-amber-300"}`}>
               {streamStatus === "live" ? "LIVE" : "POLL"}
             </span>
             <span className="rounded bg-ink-800 px-2 py-0.5">FAST waiting: {waitingApprovals}</span>
+            <span className="ml-1 inline-flex items-center gap-1 rounded bg-ink-800 px-2 py-0.5">
+              <UserCircle2 className="h-3.5 w-3.5" /> {authUser.username} ({authUser.role})
+            </span>
+            <button className="btn-secondary px-2 py-0.5 text-xs" onClick={doLogout}>
+              Logout
+            </button>
           </div>
         </div>
 
@@ -174,7 +276,7 @@ export function AppShell({ children }: { children: ReactNode }) {
             />
           </div>
 
-          <select value={range} onChange={(e) => setRange(e.target.value)} className="rounded-lg border border-ink-700 bg-ink-900 px-2 py-2 text-sm">
+          <select value={range} onChange={(e) => setRange(e.target.value)} className="select-field">
             {RANGE_PRESETS.map((opt) => (
               <option key={opt.value} value={opt.value}>
                 {opt.label}
@@ -184,14 +286,14 @@ export function AppShell({ children }: { children: ReactNode }) {
 
           {range === "custom" ? (
             <div className="grid grid-cols-2 gap-2">
-              <input type="datetime-local" value={customFrom} onChange={(e) => setCustomFrom(e.target.value)} className="rounded-lg border border-ink-700 bg-ink-900 px-2 py-2 text-sm" />
-              <input type="datetime-local" value={customTo} onChange={(e) => setCustomTo(e.target.value)} className="rounded-lg border border-ink-700 bg-ink-900 px-2 py-2 text-sm" />
+              <input type="datetime-local" value={customFrom} onChange={(e) => setCustomFrom(e.target.value)} className="input-field" />
+              <input type="datetime-local" value={customTo} onChange={(e) => setCustomTo(e.target.value)} className="input-field" />
             </div>
           ) : (
             <div className="flex items-center rounded-lg border border-ink-700 bg-ink-900 px-2 text-xs text-ink-300">
               {mounted && nowMs > 0 ? (
                 <span>
-                  Window auto-applied: {toLocalInput(nowMs - rangeToMs(range)).replace("T", " ")} to {toLocalInput(nowMs).replace("T", " ")}
+                  Window: {toLocalInput(nowMs - rangeToMs(range)).replace("T", " ")} to {toLocalInput(nowMs).replace("T", " ")}
                 </span>
               ) : (
                 <span>Window auto-applied after load</span>
@@ -201,25 +303,25 @@ export function AppShell({ children }: { children: ReactNode }) {
 
           <div className="flex items-center justify-end gap-2">
             <button
-              className={`rounded px-2 py-2 text-xs ${live ? "bg-sky-700 text-white" : "bg-ink-700 text-ink-200"}`}
+              className={`rounded px-2 py-2 text-xs ${live ? "bg-accent-cyan text-[#071019]" : "bg-ink-700 text-ink-200"}`}
               onClick={() => setLive((v) => !v)}
               title="Toggle live mode"
             >
               <Zap className="mr-1 inline h-3.5 w-3.5" />
               {live ? "Live ON" : "Live OFF"}
             </button>
-            <button className="rounded bg-ink-700 px-3 py-2 text-sm hover:bg-ink-600" onClick={applyGlobalControls}>
+            <button className="btn-secondary" onClick={applyGlobalControls}>
               Apply
             </button>
           </div>
         </div>
       </header>
 
-      <div className="grid grid-cols-1 gap-4 md:grid-cols-[260px_1fr]">
-        <aside className="panel p-3">
+      <div className="grid min-h-0 flex-1 grid-cols-1 gap-4 md:grid-cols-[260px_1fr]">
+        <aside className="panel overflow-auto p-3">
           <nav className="space-y-1.5">
             {NAV.map((item) => {
-              const active = pathname.startsWith(item.href);
+              const active = item.href === "/" ? pathname === "/" : pathname.startsWith(item.href);
               const Icon = item.icon;
               return (
                 <Link
@@ -242,7 +344,8 @@ export function AppShell({ children }: { children: ReactNode }) {
           </nav>
         </aside>
 
-        <main className="panel p-4 md:p-5">{children}</main>
+        <main className="panel min-h-0 overflow-auto p-4 md:p-5">{children}</main>
+      </div>
       </div>
     </div>
   );

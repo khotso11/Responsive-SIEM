@@ -1,0 +1,12 @@
+{
+  "linux-endpoint-01": {
+    "lat": -29.3,
+    "lon": 27.5,
+    "label": "Maseru"
+  },
+  "khotso-Latitude-5500": {
+    "lat": -29.31,
+    "lon": 27.48,
+    "label": "Lab"
+  }
+}

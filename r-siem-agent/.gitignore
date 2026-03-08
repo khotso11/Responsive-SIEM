@@ -1,11 +1,18 @@
 .cache/
+.gomodcache/
 data/
 certs/
-
-# ---- runtime logs / demo artifacts (DO NOT COMMIT) ----
-logs/
-demo_artifacts/
-**/*.log
+.pids/
+tmp/
+retained/
+ui_state/
+ui/.next/
+ui/node_modules/
+ui/tsconfig.tsbuildinfo
+ui-api
+master-roe
+master-roe-worker
+dist/
 
 # ---- runtime logs / demo artifacts (DO NOT COMMIT) ----
 logs/

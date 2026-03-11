@@ -25,6 +25,7 @@ type Alert struct {
 	AlertKey         string
 	RuleID           string
 	Severity         string
+	ConfidenceScore  int
 	Lane             string
 	GroupBy          string
 	GroupKey         string
@@ -36,10 +37,95 @@ type Alert struct {
 	SourceType       string
 	EventType        string
 	SrcIP            string
+	DstIP            string
 	User             string
+	ExecPath         string
+	Comm             string
+	Cmdline          string
+	FilePath         string
+	FileSHA256       string
+	ExecSHA256       string
+	SignerHint       string
+	DNSName          string
+	DNSType          string
 	EventIdemKey     string
 	AgentID          string
 	TargetAgentID    string
+}
+
+func normalizeConfidence(score int) int {
+	if score < 0 {
+		return 0
+	}
+	if score > 100 {
+		return 100
+	}
+	return score
+}
+
+func defaultConfidenceForSeverity(severity string) int {
+	switch strings.ToLower(strings.TrimSpace(severity)) {
+	case "critical":
+		return 70
+	case "high":
+		return 58
+	case "medium":
+		return 46
+	case "low":
+		return 32
+	case "info":
+		return 20
+	default:
+		return 40
+	}
+}
+
+func deriveConfidence(alert Alert) int {
+	score := defaultConfidenceForSeverity(alert.Severity)
+	if strings.EqualFold(strings.TrimSpace(alert.Lane), "FAST") {
+		score += 6
+	}
+	switch strings.ToLower(strings.TrimSpace(alert.SourceType)) {
+	case "auditd_exec":
+		score += 8
+	case "inotify":
+		score += 7
+	case "dns_packet":
+		score += 6
+	case "proc_net":
+		score += 4
+	case "host", "tail":
+		score += 3
+	}
+	user := strings.ToLower(strings.TrimSpace(alert.User))
+	if user != "" && user != "unknown" {
+		score += 6
+	}
+	if strings.TrimSpace(alert.ExecPath) != "" {
+		score += 6
+	}
+	if strings.TrimSpace(alert.Comm) != "" {
+		score += 4
+	}
+	if strings.TrimSpace(alert.Cmdline) != "" {
+		score += 4
+	}
+	if strings.TrimSpace(alert.DstIP) != "" {
+		score += 3
+	}
+	if strings.TrimSpace(alert.DNSName) != "" {
+		score += 6
+	}
+	if strings.TrimSpace(alert.FileSHA256) != "" {
+		score += 6
+	}
+	if strings.TrimSpace(alert.ExecSHA256) != "" {
+		score += 6
+	}
+	if strings.TrimSpace(alert.SignerHint) != "" {
+		score += 2
+	}
+	return normalizeConfidence(score)
 }
 
 // Publisher publishes ROE triggers using the pubtrigger schema.
@@ -99,6 +185,11 @@ func (p *Publisher) PublishAlert(alert Alert) (string, string, error) {
 		"alert_ts_unix_ms":    alertTs,
 		"latency_ms":          latencyMs,
 	}
+	confidence := normalizeConfidence(alert.ConfidenceScore)
+	if confidence == 0 {
+		confidence = deriveConfidence(alert)
+	}
+	payload["confidence_score"] = confidence
 	if strings.TrimSpace(alert.GroupBy) != "" {
 		payload["group_by"] = strings.TrimSpace(alert.GroupBy)
 	}
@@ -116,6 +207,36 @@ func (p *Publisher) PublishAlert(alert Alert) (string, string, error) {
 	}
 	if strings.TrimSpace(alert.SrcIP) != "" {
 		payload["src_ip"] = strings.TrimSpace(alert.SrcIP)
+	}
+	if strings.TrimSpace(alert.DstIP) != "" {
+		payload["dst_ip"] = strings.TrimSpace(alert.DstIP)
+	}
+	if strings.TrimSpace(alert.ExecPath) != "" {
+		payload["exec_path"] = strings.TrimSpace(alert.ExecPath)
+	}
+	if strings.TrimSpace(alert.Comm) != "" {
+		payload["comm"] = strings.TrimSpace(alert.Comm)
+	}
+	if strings.TrimSpace(alert.Cmdline) != "" {
+		payload["cmdline"] = strings.TrimSpace(alert.Cmdline)
+	}
+	if strings.TrimSpace(alert.FilePath) != "" {
+		payload["file_path"] = strings.TrimSpace(alert.FilePath)
+	}
+	if strings.TrimSpace(alert.FileSHA256) != "" {
+		payload["file_sha256"] = strings.TrimSpace(alert.FileSHA256)
+	}
+	if strings.TrimSpace(alert.ExecSHA256) != "" {
+		payload["exec_sha256"] = strings.TrimSpace(alert.ExecSHA256)
+	}
+	if strings.TrimSpace(alert.SignerHint) != "" {
+		payload["signer_hint"] = strings.TrimSpace(alert.SignerHint)
+	}
+	if strings.TrimSpace(alert.DNSName) != "" {
+		payload["dns_name"] = strings.TrimSpace(alert.DNSName)
+	}
+	if strings.TrimSpace(alert.DNSType) != "" {
+		payload["dns_type"] = strings.TrimSpace(alert.DNSType)
 	}
 	if strings.TrimSpace(alert.User) != "" {
 		payload["user"] = strings.TrimSpace(alert.User)

@@ -1,0 +1,13 @@
+log_level: INFO
+
+jetstream:
+  url: nats://127.0.0.1:4222
+  stream: RSIEM_EVENTS
+  subject: rsiem.events.raw
+
+collector:
+  paths:
+    - /etc
+  recursive: true
+  source_type: inotify
+  coalesce_window_ms: 1000

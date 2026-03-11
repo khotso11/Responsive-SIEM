@@ -1,0 +1,46 @@
+{
+  "name": "network identity fallback without match",
+  "events": [
+    {
+      "event": {
+        "event_idem_key": "evt.reg.fallback.proc",
+        "observed_at_unix_ms": 1000,
+        "event_type": "process_exec",
+        "source_type": "auditd_exec",
+        "node_id": "node-a",
+        "host": "node-a",
+        "user": "alice",
+        "exec_path": "/usr/bin/nmap",
+        "comm": "nmap",
+        "cmdline": "/usr/bin/nmap --version",
+        "message": "exec=/usr/bin/nmap user=alice"
+      },
+      "expect": {
+        "matched": true,
+        "rule_id": "R-PROC-FIRST-SEEN-SUSPICIOUS"
+      }
+    },
+    {
+      "event": {
+        "event_idem_key": "evt.reg.fallback.net",
+        "observed_at_unix_ms": 2000,
+        "event_type": "network_connection",
+        "source_type": "proc_net",
+        "node_id": "node-a",
+        "host": "node-a",
+        "src_ip": "10.0.0.10",
+        "dst_ip": "10.0.0.11",
+        "dst_port": 80,
+        "user": "unknown",
+        "message": "dst_ip=10.0.0.11 dst_port=80"
+      },
+      "expect": {
+        "matched": false,
+        "user": "alice",
+        "exec_path": "/usr/bin/nmap",
+        "comm": "nmap",
+        "cmdline": "/usr/bin/nmap --version"
+      }
+    }
+  ]
+}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -287,5 +288,296 @@ func TestMarkerCommandIdempotent(t *testing.T) {
 	}
 	if _, err := os.Stat(first.Stdout); err != nil {
 		t.Fatalf("expected marker file %q: %v", first.Stdout, err)
+	}
+}
+
+func TestAuthControlContainVerifyRestore(t *testing.T) {
+	base := t.TempDir()
+	authRoot := filepath.Join(base, "auth-controls")
+	t.Setenv("RSIEM_AGENT_AUTH_CONTROL_ROOT", authRoot)
+
+	exec := newCommandExecutor(slog.Default(), quarantinePolicy{})
+
+	contain := exec.handle(context.Background(), commandRequest{
+		RunID:      "run-auth-1",
+		StepID:     "step-1",
+		ActionType: "agent_command",
+		Target:     "10.10.10.10",
+		Params: map[string]any{
+			"command":     "auth_contain_src_ip",
+			"src_ip":      "10.10.10.10",
+			"user_name":   "alice",
+			"duration_ms": 600000,
+			"reason":      "auth abuse burst",
+			"node_id":     "endpoint-01",
+		},
+	})
+	if contain.Status != "ok" || contain.ExitCode != 0 {
+		t.Fatalf("unexpected contain reply: %#v", contain)
+	}
+
+	containUser := exec.handle(context.Background(), commandRequest{
+		RunID:      "run-auth-1",
+		StepID:     "step-2",
+		ActionType: "agent_command",
+		Params: map[string]any{
+			"command":     "auth_contain_user_access",
+			"user_name":   "alice",
+			"src_ip":      "10.10.10.10",
+			"duration_ms": 600000,
+		},
+	})
+	if containUser.Status != "ok" || containUser.ExitCode != 0 {
+		t.Fatalf("unexpected contain-user reply: %#v", containUser)
+	}
+
+	restoreBeforeVerify := exec.handle(context.Background(), commandRequest{
+		RunID:      "run-restore-1",
+		StepID:     "step-3",
+		ActionType: "agent_command",
+		Params: map[string]any{
+			"command":            "auth_restore_user_access",
+			"containment_run_id": "run-auth-1",
+			"user_name":          "alice",
+		},
+	})
+	if restoreBeforeVerify.Status != "error" || restoreBeforeVerify.ErrorClass != safeDeniedClass || !strings.Contains(restoreBeforeVerify.Stderr, "verification_required") {
+		t.Fatalf("expected verification-required denial, got %#v", restoreBeforeVerify)
+	}
+
+	verify := exec.handle(context.Background(), commandRequest{
+		RunID:      "run-verify-1",
+		StepID:     "step-4",
+		ActionType: "agent_command",
+		Params: map[string]any{
+			"command":                "auth_mark_user_verified",
+			"containment_run_id":     "run-auth-1",
+			"user_name":              "alice",
+			"verification_method":    "phone",
+			"verification_reference": "HD-42",
+			"verified_by":            "admin",
+			"notes":                  "confirmed by helpdesk",
+		},
+	})
+	if verify.Status != "ok" || verify.ExitCode != 0 {
+		t.Fatalf("unexpected verify reply: %#v", verify)
+	}
+
+	restore := exec.handle(context.Background(), commandRequest{
+		RunID:      "run-restore-2",
+		StepID:     "step-5",
+		ActionType: "agent_command",
+		Params: map[string]any{
+			"command":            "auth_restore_user_access",
+			"containment_run_id": "run-auth-1",
+			"user_name":          "alice",
+		},
+	})
+	if restore.Status != "ok" || restore.ExitCode != 0 {
+		t.Fatalf("unexpected restore reply: %#v", restore)
+	}
+
+	restoreIP := exec.handle(context.Background(), commandRequest{
+		RunID:      "run-restore-3",
+		StepID:     "step-6",
+		ActionType: "agent_command",
+		Params: map[string]any{
+			"command":            "auth_restore_src_ip",
+			"containment_run_id": "run-auth-1",
+			"src_ip":             "10.10.10.10",
+		},
+	})
+	if restoreIP.Status != "ok" || restoreIP.ExitCode != 0 {
+		t.Fatalf("unexpected restore-ip reply: %#v", restoreIP)
+	}
+
+	data, err := os.ReadFile(filepath.Join(authRoot, "run-auth-1.json"))
+	if err != nil {
+		t.Fatalf("read auth control record: %v", err)
+	}
+	if !strings.Contains(string(data), "\"status\": \"restored\"") {
+		t.Fatalf("expected restored state, got %s", string(data))
+	}
+	if !strings.Contains(string(data), "\"verified\": true") {
+		t.Fatalf("expected verified state, got %s", string(data))
+	}
+}
+
+func TestCommandResultStoreSaveLoad(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("RSIEM_AGENT_COMMAND_RESULT_ROOT", root)
+
+	store := newCommandResultStore()
+	replyBytes, err := json.Marshal(commandReply{
+		Status:     "ok",
+		ExitCode:   0,
+		DurationMs: 12,
+		Stdout:     "persisted",
+	})
+	if err != nil {
+		t.Fatalf("marshal reply: %v", err)
+	}
+	key := "run-1|step-1"
+	if err := store.save(key, "run-1", "step-1", replyBytes); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	loaded, err := store.load(key)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	var got commandReply
+	if err := json.Unmarshal(loaded, &got); err != nil {
+		t.Fatalf("unmarshal loaded reply: %v", err)
+	}
+	if got.Status != "ok" || got.ExitCode != 0 || got.DurationMs != 12 || got.Stdout != "persisted" {
+		t.Fatalf("unexpected loaded reply: %#v", got)
+	}
+}
+
+func TestCommandResultStoreDurableReplayAvoidsReexecution(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("RSIEM_AGENT_COMMAND_RESULT_ROOT", root)
+
+	runner := &fakeRunner{
+		result: execResult{
+			ExitCode:       0,
+			Stdout:         "pong",
+			DurationMillis: 1,
+		},
+	}
+	exec := &commandExecutor{
+		logger:    slog.Default(),
+		timeout:   time.Second,
+		runner:    runner,
+		allowlist: map[string]execSpec{"ping": {Command: "ping", RequiresTarget: true}},
+	}
+	req := commandRequest{
+		RunID:      "run-replay-1",
+		StepID:     "step-replay-1",
+		ActionType: "agent_command",
+		Target:     "127.0.0.1",
+		Params:     map[string]any{"command": "ping"},
+	}
+	reply := exec.handle(context.Background(), req)
+	if reply.Status != "ok" || reply.ExitCode != 0 {
+		t.Fatalf("unexpected first reply: %#v", reply)
+	}
+	if !runner.called {
+		t.Fatalf("expected runner to execute initial command")
+	}
+
+	replyBytes, err := json.Marshal(reply)
+	if err != nil {
+		t.Fatalf("marshal first reply: %v", err)
+	}
+	store := newCommandResultStore()
+	key := req.RunID + "|" + req.StepID
+	if err := store.save(key, req.RunID, req.StepID, replyBytes); err != nil {
+		t.Fatalf("save durable reply: %v", err)
+	}
+
+	restartedRunner := &fakeRunner{
+		result: execResult{
+			ExitCode:       99,
+			Stdout:         "should-not-run",
+			DurationMillis: 1,
+		},
+	}
+	loaded, err := store.load(key)
+	if err != nil {
+		t.Fatalf("load durable reply: %v", err)
+	}
+	if len(loaded) == 0 {
+		t.Fatalf("expected persisted reply bytes")
+	}
+	if restartedRunner.called {
+		t.Fatalf("runner should not have executed before replay")
+	}
+	var replayed commandReply
+	if err := json.Unmarshal(loaded, &replayed); err != nil {
+		t.Fatalf("unmarshal replayed reply: %v", err)
+	}
+	if replayed.Stdout != "pong" || replayed.ExitCode != 0 {
+		t.Fatalf("unexpected replayed reply: %#v", replayed)
+	}
+	if restartedRunner.called {
+		t.Fatalf("runner should not execute for durable replay")
+	}
+}
+
+func TestCommandReplySpoolEnqueueFlush(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("RSIEM_AGENT_COMMAND_REPLY_SPOOL_ROOT", root)
+
+	spool := newCommandReplySpool()
+	replyBytes, err := json.Marshal(commandReply{
+		Status:   "ok",
+		ExitCode: 0,
+		Stdout:   "spooled",
+	})
+	if err != nil {
+		t.Fatalf("marshal reply: %v", err)
+	}
+	if err := spool.enqueue("run-1|step-1", "run-1", "step-1", "_INBOX.test", replyBytes); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	var publishedSubject string
+	var publishedData []byte
+	if err := spool.flush(func(subject string, data []byte) error {
+		publishedSubject = subject
+		publishedData = append([]byte(nil), data...)
+		return nil
+	}); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	if publishedSubject != "_INBOX.test" {
+		t.Fatalf("published subject=%q", publishedSubject)
+	}
+	var got commandReply
+	if err := json.Unmarshal(publishedData, &got); err != nil {
+		t.Fatalf("unmarshal published data: %v", err)
+	}
+	if got.Status != "ok" || got.ExitCode != 0 || got.Stdout != "spooled" {
+		t.Fatalf("unexpected published data: %#v", got)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("expected spool empty after successful flush, found %d entries", len(entries))
+	}
+}
+
+func TestCommandReplySpoolFlushRetainsOnPublishFailure(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("RSIEM_AGENT_COMMAND_REPLY_SPOOL_ROOT", root)
+
+	spool := newCommandReplySpool()
+	replyBytes, err := json.Marshal(commandReply{
+		Status:   "ok",
+		ExitCode: 0,
+		Stdout:   "spooled",
+	})
+	if err != nil {
+		t.Fatalf("marshal reply: %v", err)
+	}
+	if err := spool.enqueue("run-2|step-2", "run-2", "step-2", "_INBOX.test", replyBytes); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	if err := spool.flush(func(subject string, data []byte) error {
+		return context.DeadlineExceeded
+	}); err == nil {
+		t.Fatalf("expected flush error")
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	if len(entries) == 0 {
+		t.Fatalf("expected spool file retained after publish failure")
 	}
 }

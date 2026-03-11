@@ -105,7 +105,7 @@ echo "[5/5] Summary"
 FAST_RUN_ID="$(new_master | rg '"msg":"response_run_created".*"rule_id":"R-COLLECT-INVALID-USER"' | tail -n 1 | sed -n 's/.*"run_id":"\([^"]*\)".*/\1/p')"
 STD_RUN_ID="$(new_master | rg '"msg":"response_run_created".*"rule_id":"R-COUNT-PROCESS-HOST"' | tail -n 1 | sed -n 's/.*"run_id":"\([^"]*\)".*/\1/p')"
 
-echo "FAST_EXPECTED=rule:R-COLLECT-INVALID-USER lane:FAST approval:required"
+echo "FAST_EXPECTED=rule:R-COLLECT-INVALID-USER playbook:PB-AUTH-ABUSE-CONTAIN lane:FAST approval:required"
 echo "FAST_RUN_ID=${FAST_RUN_ID:-}"
 echo "STANDARD_EXPECTED=rule:R-COUNT-PROCESS-HOST lane:STANDARD approval:auto"
 echo "STANDARD_RUN_ID=${STD_RUN_ID:-}"

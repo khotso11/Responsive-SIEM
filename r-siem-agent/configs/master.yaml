@@ -142,9 +142,11 @@ playbooks:
     policy_requirements:
       approval: "auto"
       max_blast_radius: 1
+      auto_min_confidence: 55
     steps:
       - name: "notify_soc"
         action_type: "notify"
+        reversibility: "reversible"
         timeout_ms: 2000
         retries: 0
         backoff_ms: 0
@@ -158,9 +160,11 @@ playbooks:
     policy_requirements:
       approval: "auto"
       max_blast_radius: 1
+      auto_min_confidence: 70
     steps:
       - name: "notify_before"
         action_type: "notify"
+        reversibility: "reversible"
         timeout_ms: 2000
         retries: 0
         backoff_ms: 0
@@ -168,6 +172,7 @@ playbooks:
 
       - name: "contain_host_stub"
         action_type: "agent_command"
+        reversibility: "mixed"
         timeout_ms: 5000
         retries: 2
         backoff_ms: 500
@@ -178,6 +183,7 @@ playbooks:
 
       - name: "notify_after"
         action_type: "notify"
+        reversibility: "reversible"
         timeout_ms: 2000
         retries: 0
         backoff_ms: 0
@@ -191,9 +197,11 @@ playbooks:
     policy_requirements:
       approval: "required_for_high"
       max_blast_radius: 1
+      auto_min_confidence: 85
     steps:
       - name: "quarantine_move"
         action_type: "agent_command"
+        reversibility: "mixed"
         timeout_ms: 5000
         retries: 0
         backoff_ms: 0
@@ -206,6 +214,7 @@ playbooks:
 
       - name: "quarantine_restore"
         action_type: "agent_command"
+        reversibility: "reversible"
         timeout_ms: 7000
         retries: 0
         backoff_ms: 0
@@ -225,9 +234,11 @@ playbooks:
     policy_requirements:
       approval: "required_for_high"
       max_blast_radius: 1
+      auto_min_confidence: 50
     steps:
       - name: "ping_localhost"
         action_type: "agent_command"
+        reversibility: "reversible"
         timeout_ms: 3000
         retries: 0
         backoff_ms: 0
@@ -235,6 +246,242 @@ playbooks:
         params:
           command: "ping"
           target: "127.0.0.1"
+
+  - id: "PB-AUTH-ABUSE-CONTAIN"
+    version: 1
+    enabled: true
+    selectors:
+      rule_ids:
+        - "R-AUTH-FAILED-PW-BURST-USER"
+        - "R-AUTH-FAILED-PW-BURST-SRCIP"
+        - "R-AUTH-USER-SRCIP-BURST"
+    policy_requirements:
+      approval: "required_for_high"
+      max_blast_radius: 1
+      auto_max_severity: "high"
+      auto_max_blast_radius: 1
+      auto_min_confidence: 88
+      require_approval_for_privileged: true
+      require_approval_for_local_src: true
+      require_identity_context: true
+      default_containment_duration_ms: 900000
+      max_containment_duration_ms: 1800000
+    steps:
+      - name: "auth_contain_src_ip"
+        action_type: "agent_command"
+        reversibility: "reversible"
+        timeout_ms: 4000
+        retries: 1
+        backoff_ms: 500
+        target_from: "global"
+        params:
+          command: "auth_contain_src_ip"
+          src_ip: "{src_ip}"
+          node_id: "{node_id}"
+          user_name: "{user}"
+          duration_ms: 900000
+          reason: "auth_abuse_detected"
+          state_file: "auth_access_state.json"
+
+      - name: "auth_contain_user_access"
+        action_type: "agent_command"
+        reversibility: "reversible"
+        timeout_ms: 4000
+        retries: 1
+        backoff_ms: 500
+        target_from: "global"
+        params:
+          command: "auth_contain_user_access"
+          src_ip: "{src_ip}"
+          node_id: "{node_id}"
+          user_name: "{user}"
+          duration_ms: 900000
+          reason: "auth_abuse_detected"
+          state_file: "auth_access_state.json"
+
+      - name: "notify_auth_containment"
+        action_type: "notify"
+        reversibility: "reversible"
+        timeout_ms: 2000
+        retries: 0
+        backoff_ms: 0
+        target_from: "group_key"
+
+  - id: "PB-AUTH-ACCESS-RESTORE"
+    version: 1
+    enabled: true
+    selectors:
+      rule_ids:
+        - "R-AUTH-ACCESS-RESTORE-REQUEST"
+    policy_requirements:
+      approval: "required"
+      max_blast_radius: 1
+      auto_min_confidence: 100
+      require_identity_context: true
+    steps:
+      - name: "auth_mark_user_verified"
+        action_type: "agent_command"
+        reversibility: "reversible"
+        timeout_ms: 3000
+        retries: 0
+        backoff_ms: 0
+        target_from: "global"
+        params:
+          command: "auth_mark_user_verified"
+          state_file: "auth_access_state.json"
+
+      - name: "auth_restore_src_ip"
+        action_type: "agent_command"
+        reversibility: "reversible"
+        timeout_ms: 4000
+        retries: 1
+        backoff_ms: 500
+        target_from: "global"
+        params:
+          command: "auth_restore_src_ip"
+          state_file: "auth_access_state.json"
+
+      - name: "auth_restore_user_access"
+        action_type: "agent_command"
+        reversibility: "reversible"
+        timeout_ms: 4000
+        retries: 1
+        backoff_ms: 500
+        target_from: "global"
+        params:
+          command: "auth_restore_user_access"
+          state_file: "auth_access_state.json"
+
+      - name: "notify_auth_restore"
+        action_type: "notify"
+        reversibility: "reversible"
+        timeout_ms: 2000
+        retries: 0
+        backoff_ms: 0
+        target_from: "group_key"
+
+  - id: "PB-FILE-SENSITIVE-CHANGE-NOTIFY"
+    version: 1
+    enabled: true
+    selectors:
+      rule_ids:
+        - "R-FILE-SENSITIVE-CHANGE"
+    policy_requirements:
+      approval: "auto"
+      max_blast_radius: 1
+      auto_min_confidence: 75
+    steps:
+      - name: "notify_sensitive_file_change"
+        action_type: "notify"
+        reversibility: "reversible"
+        timeout_ms: 2000
+        retries: 0
+        backoff_ms: 0
+        target_from: "group_key"
+
+  - id: "PB-DNS-SUSPICIOUS-QUERY-NOTIFY"
+    version: 1
+    enabled: true
+    selectors:
+      rule_ids:
+        - "R-DNS-SUSPICIOUS-QUERY"
+    policy_requirements:
+      approval: "auto"
+      max_blast_radius: 1
+      auto_min_confidence: 80
+    steps:
+      - name: "notify_suspicious_dns_query"
+        action_type: "notify"
+        reversibility: "reversible"
+        timeout_ms: 2000
+        retries: 0
+        backoff_ms: 0
+        target_from: "group_key"
+
+  - id: "PB-NET-OUTBOUND-OBSERVE"
+    version: 1
+    enabled: true
+    selectors:
+      rule_ids:
+        - "R-NET-OUTBOUND-CONNECTION"
+    policy_requirements:
+      approval: "auto"
+      max_blast_radius: 1
+      auto_min_confidence: 65
+    steps:
+      - name: "notify_outbound_connection"
+        action_type: "notify"
+        reversibility: "reversible"
+        timeout_ms: 2000
+        retries: 0
+        backoff_ms: 0
+        target_from: "group_key"
+
+  - id: "PB-NET-FIRST-SEEN-CONTAIN"
+    version: 1
+    enabled: true
+    selectors:
+      rule_ids:
+        - "R-NET-FIRST-SEEN-RISKY"
+    policy_requirements:
+      approval: "required_for_high"
+      max_blast_radius: 1
+      auto_min_confidence: 90
+    steps:
+      - name: "contain_destination_ip"
+        action_type: "agent_command"
+        reversibility: "reversible"
+        timeout_ms: 3000
+        retries: 0
+        backoff_ms: 0
+        target_from: "global"
+        params:
+          command: "contain_destination_ip"
+          dst_ip: "{dst_ip}"
+          reason: "first_seen_risky_destination"
+          duration_ms: 900000
+      - name: "notify_first_seen_risky_destination"
+        action_type: "notify"
+        reversibility: "reversible"
+        timeout_ms: 2000
+        retries: 0
+        backoff_ms: 0
+        target_from: "group_key"
+
+  - id: "PB-PROC-FIRST-SEEN-CONTAIN"
+    version: 1
+    enabled: true
+    selectors:
+      rule_ids:
+        - "R-PROC-FIRST-SEEN-SUSPICIOUS"
+    policy_requirements:
+      approval: "required_for_high"
+      max_blast_radius: 1
+      auto_min_confidence: 90
+    steps:
+      - name: "contain_process_exec"
+        action_type: "agent_command"
+        reversibility: "reversible"
+        timeout_ms: 3000
+        retries: 0
+        backoff_ms: 0
+        target_from: "global"
+        params:
+          command: "contain_process_exec"
+          exec_path: "{exec_path}"
+          comm: "{comm}"
+          cmdline: "{cmdline}"
+          exec_sha256: "{exec_sha256}"
+          signer_hint: "{signer_hint}"
+          reason: "first_seen_suspicious_process"
+          duration_ms: 900000
+      - name: "notify_first_seen_suspicious_process"
+        action_type: "notify"
+        reversibility: "reversible"
+        timeout_ms: 2000
+        retries: 0
+        backoff_ms: 0
+        target_from: "group_key"
 
   - id: "PB-SEQ-PROCESS-TO-NET"
     version: 1
@@ -244,9 +491,11 @@ playbooks:
     policy_requirements:
       approval: "required_for_high"
       max_blast_radius: 1
+      auto_min_confidence: 85
     steps:
       - name: "block_egress_stub"
         action_type: "network_block"
+        reversibility: "mixed"
         timeout_ms: 5000
         retries: 2
         backoff_ms: 500
@@ -260,9 +509,13 @@ playbooks:
     policy_requirements:
       approval: "required_for_high"
       max_blast_radius: 3
+      auto_max_severity: "high"
+      auto_max_blast_radius: 3
+      auto_min_confidence: 82
     steps:
       - name: "rate_limit_src_ip_stub"
         action_type: "network_rate_limit"
+        reversibility: "reversible"
         timeout_ms: 5000
         retries: 2
         backoff_ms: 500
@@ -274,11 +527,16 @@ playbooks:
     selectors:
       rule_ids: ["R-PB-BRUTEFORCE-IP-CONTAIN"]
     policy_requirements:
-      approval: "required_for_high"
+      approval: "required_for_critical"
       max_blast_radius: 1
+      auto_max_severity: "high"
+      auto_max_blast_radius: 1
+      auto_min_confidence: 88
+      require_approval_for_local_src: true
     steps:
       - name: "contain_bruteforce_ip"
         action_type: "agent_command"
+        reversibility: "reversible"
         timeout_ms: 3000
         retries: 0
         backoff_ms: 0
@@ -293,11 +551,13 @@ playbooks:
     selectors:
       rule_ids: ["R-PB-PRIVESC-LOCKDOWN"]
     policy_requirements:
-      approval: "required_for_high"
+      approval: "required"
       max_blast_radius: 1
+      auto_min_confidence: 95
     steps:
       - name: "lockdown_privesc"
         action_type: "agent_command"
+        reversibility: "irreversible"
         timeout_ms: 3000
         retries: 0
         backoff_ms: 0
@@ -312,11 +572,13 @@ playbooks:
     selectors:
       rule_ids: ["R-PB-LATERAL-MOVEMENT-HALT"]
     policy_requirements:
-      approval: "required_for_high"
+      approval: "required"
       max_blast_radius: 1
+      auto_min_confidence: 95
     steps:
       - name: "halt_lateral_movement"
         action_type: "agent_command"
+        reversibility: "mixed"
         timeout_ms: 3000
         retries: 0
         backoff_ms: 0
@@ -331,11 +593,16 @@ playbooks:
     selectors:
       rule_ids: ["R-PB-C2-BEACON-BLOCK"]
     policy_requirements:
-      approval: "required_for_high"
+      approval: "required_for_critical"
       max_blast_radius: 1
+      auto_max_severity: "high"
+      auto_max_blast_radius: 1
+      auto_min_confidence: 88
+      require_approval_for_local_src: true
     steps:
       - name: "block_c2_beacon"
         action_type: "agent_command"
+        reversibility: "reversible"
         timeout_ms: 3000
         retries: 0
         backoff_ms: 0
@@ -350,11 +617,13 @@ playbooks:
     selectors:
       rule_ids: ["R-PB-RANSOMWARE-KILL-CHAIN-STOP"]
     policy_requirements:
-      approval: "required_for_high"
+      approval: "required"
       max_blast_radius: 1
+      auto_min_confidence: 95
     steps:
       - name: "kill_chain_stage"
         action_type: "agent_command"
+        reversibility: "mixed"
         timeout_ms: 3000
         retries: 0
         backoff_ms: 0
@@ -365,6 +634,7 @@ playbooks:
 
       - name: "kill_chain_stop"
         action_type: "agent_command"
+        reversibility: "irreversible"
         timeout_ms: 3000
         retries: 0
         backoff_ms: 0
@@ -380,11 +650,15 @@ playbooks:
     selectors:
       rule_ids: ["R-PB-DATA-EXFIL-THROTTLE"]
     policy_requirements:
-      approval: "required_for_high"
+      approval: "required_for_critical"
       max_blast_radius: 1
+      auto_max_severity: "high"
+      auto_max_blast_radius: 1
+      auto_min_confidence: 86
     steps:
       - name: "throttle_exfil"
         action_type: "agent_command"
+        reversibility: "reversible"
         timeout_ms: 3000
         retries: 0
         backoff_ms: 0
@@ -397,13 +671,15 @@ playbooks:
     version: 1
     enabled: true
     selectors:
-      rule_ids: ["R-PB-CRITICAL-SERVICE-ABUSE-RESPONSE"]
+      rule_ids: ["R-PB-CRITICAL-SERVICE-ABUSE-RESPONSE", "R-AUTH-PROC-FILE-CHAIN"]
     policy_requirements:
-      approval: "required_for_high"
+      approval: "required"
       max_blast_radius: 1
+      auto_min_confidence: 95
     steps:
       - name: "protect_critical_service_stage"
         action_type: "agent_command"
+        reversibility: "mixed"
         timeout_ms: 3000
         retries: 0
         backoff_ms: 0
@@ -414,6 +690,7 @@ playbooks:
 
       - name: "protect_critical_service"
         action_type: "agent_command"
+        reversibility: "irreversible"
         timeout_ms: 3000
         retries: 0
         backoff_ms: 0
@@ -429,11 +706,13 @@ playbooks:
     selectors:
       rule_ids: ["R-PB-DETECTOR-HEALTH-SELF-PROTECT"]
     policy_requirements:
-      approval: "required_for_high"
+      approval: "auto"
       max_blast_radius: 1
+      auto_min_confidence: 60
     steps:
       - name: "detector_self_protect"
         action_type: "agent_command"
+        reversibility: "reversible"
         timeout_ms: 3000
         retries: 0
         backoff_ms: 0
@@ -447,21 +726,463 @@ policies:
     enabled: true
     # When ROE is degraded, require approvals more aggressively
     require_approval_when_degraded: true
+    rules:
+      - id: "safe_mode_degraded"
+        when:
+          degraded: true
+        apply:
+          require_approval_when_degraded: true
 
   approvals:
+    # Approval modes supported by playbooks:
+    # - auto: never require approval unless ROE is degraded
+    # - required: always require approval
+    # - required_for_high: require approval for high/critical severity
+    # - required_for_critical: require approval only for critical severity
+    #
+    # Optional playbook policy overrides:
+    # - auto_max_severity: auto-run if severity <= this level
+    # - auto_max_blast_radius: auto-run only if max_blast_radius <= this value
+    # - auto_min_confidence: minimum confidence score for autonomous action
+    #
+    # Step metadata:
+    # - reversibility: reversible | mixed | irreversible
+    #
+    # This lets R-SIEM auto-contain low-blast-radius, reversible cases while
+    # keeping disruptive actions under human control.
+    #
     # If approval is required, how long we wait before failing safe
     timeout_ms: 300000
+    default_auto_min_confidence: 70
+    rules:
+      - id: "safe_mode_degraded"
+        when:
+          degraded: true
+        decision:
+          required: true
+          reason: "safe_mode:degraded"
+      - id: "irreversible_action"
+        when:
+          reversibility_in: ["irreversible"]
+        decision:
+          required: true
+          reason: "policy:irreversible_action"
+      - id: "critical_asset_review"
+        when:
+          asset_criticality_in: ["critical"]
+        decision:
+          required: true
+          reason: "policy:critical_asset"
+      - id: "service_account_review"
+        when:
+          identity_service_account: true
+        decision:
+          required: true
+          reason: "policy:service_account"
+      - id: "privileged_identity_review"
+        when:
+          privileged_escalation_eligible: true
+        decision:
+          required: true
+          reason: "policy:privileged_identity"
+      - id: "local_source_review"
+        when:
+          local_source_escalation_eligible: true
+        decision:
+          required: true
+          reason: "policy:local_source"
+      - id: "auto_within_bounds"
+        when:
+          auto_bounds_defined: true
+          confidence_at_least_floor: true
+          severity_within_auto_max: true
+          blast_radius_within_auto_max: true
+        decision:
+          required: false
+          reason: "policy:auto_within_bounds"
+      - id: "required_always"
+        when:
+          mode_in: ["required"]
+        decision:
+          required: true
+          reason: "policy:required"
+      - id: "required_for_high_by_severity"
+        when:
+          mode_in: ["required_for_high"]
+          severity_gte: "high"
+        decision:
+          required: true
+          reason: "policy:severity>=high"
+      - id: "required_for_high_low_confidence"
+        when:
+          mode_in: ["required_for_high"]
+          confidence_below_floor: true
+        decision:
+          required: true
+          reason: "policy:confidence_below_threshold"
+      - id: "required_for_high_auto_path"
+        when:
+          mode_in: ["required_for_high"]
+        decision:
+          required: false
+          reason: "policy:auto_below_high"
+      - id: "required_for_critical_by_severity"
+        when:
+          mode_in: ["required_for_critical"]
+          severity_gte: "critical"
+        decision:
+          required: true
+          reason: "policy:severity>=critical"
+      - id: "required_for_critical_low_confidence"
+        when:
+          mode_in: ["required_for_critical"]
+          confidence_below_floor: true
+        decision:
+          required: true
+          reason: "policy:confidence_below_threshold"
+      - id: "required_for_critical_auto_path"
+        when:
+          mode_in: ["required_for_critical"]
+        decision:
+          required: false
+          reason: "policy:auto_below_critical"
+      - id: "auto_low_confidence_fails_safe"
+        when:
+          mode_in: ["auto"]
+          confidence_below_floor: true
+        decision:
+          required: true
+          reason: "policy:auto_confidence_below_threshold"
+      - id: "auto_default"
+        when:
+          mode_in: ["auto"]
+        decision:
+          required: false
+          reason: "policy:auto"
+      - id: "unknown_mode_fail_safe"
+        decision:
+          required: true
+          reason: "policy:unknown_mode_fail_safe"
+
+  guardrails:
+    rules:
+      - id: "enforce_identity_context"
+        when:
+          require_identity_context: true
+          action_type_in: ["agent_command", "network_block", "network_rate_limit"]
+        apply:
+          validate_identity_context: true
+      - id: "normalize_auth_containment_duration"
+        when:
+          action_type_in: ["agent_command"]
+          command_prefix: "auth_contain_"
+        apply:
+          normalize_containment_duration: true
+      - id: "normalize_generic_containment_duration"
+        when:
+          action_type_in: ["agent_command"]
+          command_prefix: "contain_"
+        apply:
+          normalize_containment_duration: true
 
   blast_radius:
     default_max: 1
 
+  assets:
+    default_environment: "operational"
+    nodes:
+      - node_id: "khotso-Latitude-5500"
+        target_agent_id: "khotso-Latitude-5500"
+        environment: "lab"
+        criticality: "high"
+        owner: "khotso"
+        team: "security-engineering"
+        role: "engineering-workstation"
+      - node_id: "linux-endpoint-01"
+        target_agent_id: "linux-endpoint-01"
+        environment: "prod"
+        criticality: "critical"
+        owner: "soc"
+        team: "security-operations"
+        role: "production-endpoint"
+      - node_id: "dev-instance"
+        target_agent_id: "dev-instance"
+        environment: "dev"
+        criticality: "medium"
+        owner: "platform"
+        team: "platform-engineering"
+        role: "development-host"
+      - node_id: "dev-instance-2"
+        target_agent_id: "dev-instance-2"
+        environment: "dev"
+        criticality: "medium"
+        owner: "platform"
+        team: "platform-engineering"
+        role: "development-host"
+      - node_id: "timeout-demo"
+        target_agent_id: "timeout-demo"
+        environment: "lab"
+        criticality: "medium"
+        owner: "security-engineering"
+        team: "security-engineering"
+        role: "test-node"
+      - node_id: "demo"
+        target_agent_id: "demo"
+        environment: "lab"
+        criticality: "medium"
+        owner: "security-engineering"
+        team: "security-engineering"
+        role: "test-node"
+
+  identity:
+    privileged_users:
+      - "root"
+      - "admin"
+      - "administrator"
+    local_source_ips:
+      - "127.0.0.1"
+      - "::1"
+    default_containment_duration_ms: 900000
+    max_containment_duration_ms: 1800000
+    users:
+      - user_name: "khotso"
+        display_name: "Khotso"
+        department: "security-engineering"
+        manager: "platform-security"
+        privileged: false
+        service_account: false
+      - user_name: "admin"
+        display_name: "Administrator"
+        department: "security-operations"
+        manager: "soc-lead"
+        privileged: true
+        service_account: false
+      - user_name: "analyst"
+        display_name: "SOC Analyst"
+        department: "security-operations"
+        manager: "soc-lead"
+        privileged: false
+        service_account: false
+      - user_name: "soc.analyst"
+        display_name: "SOC Analyst"
+        department: "security-operations"
+        manager: "soc-lead"
+        privileged: false
+        service_account: false
+      - user_name: "smoke_analyst_20260309_190140"
+        display_name: "Smoke Analyst"
+        department: "security-operations"
+        manager: "soc-lead"
+        privileged: false
+        service_account: false
+      - user_name: "admin-Khotso"
+        display_name: "Admin Khotso"
+        department: "security-operations"
+        manager: "soc-lead"
+        privileged: true
+        service_account: false
+      - user_name: "sello"
+        display_name: "Sello"
+        department: "security-operations"
+        manager: "soc-lead"
+        privileged: false
+        service_account: false
+      - user_name: "root"
+        display_name: "Root"
+        department: "platform"
+        manager: "platform-security"
+        privileged: true
+        service_account: false
+      - user_name: "svc-backup"
+        display_name: "Backup Service"
+        department: "platform"
+        manager: "platform-security"
+        privileged: true
+        service_account: true
+      - user_name: "svc-monitor"
+        display_name: "Monitoring Service"
+        department: "platform"
+        manager: "platform-security"
+        privileged: false
+        service_account: true
+
+  retention:
+    rules:
+      - id: "demo_test"
+        when:
+          environment_in: ["demo_test"]
+        decision:
+          class: "demo_test"
+          archive_after_days: 7
+          purge_after_days: 14
+      - id: "operational_service_account"
+        when:
+          service_account: true
+        decision:
+          class: "operational_service_account"
+          archive_after_days: 30
+          purge_after_days: 365
+      - id: "operational_critical_asset"
+        when:
+          asset_criticality_in: ["critical"]
+        decision:
+          class: "operational_critical_asset"
+          archive_after_days: 30
+          purge_after_days: 365
+      - id: "operational_high_review"
+        when:
+          high_impact: true
+        decision:
+          class: "operational_high_review"
+          archive_after_days: 30
+          purge_after_days: 365
+      - id: "operational_standard"
+        decision:
+          class: "operational_standard"
+          archive_after_days: 30
+          purge_after_days: 180
+
   action_allowlist:
-    # v0.1: planning only (no real connectors yet)
+    # Policy objective:
+    # containment and restore playbooks may only invoke their intended command families.
+    # Other playbooks retain the broader generic allowlist until narrowed explicitly.
     allowed_action_types:
       - "notify"
       - "agent_command"
       - "network_block"
       - "network_rate_limit"
+    rules:
+      - id: "allow_notify"
+        when:
+          action_type_in: ["notify"]
+        decision:
+          allowed: true
+      - id: "allow_auth_abuse_containment_commands"
+        when:
+          playbook_ids: ["PB-AUTH-ABUSE-CONTAIN"]
+          action_type_in: ["agent_command"]
+          command_prefix: "auth_contain_"
+        decision:
+          allowed: true
+      - id: "deny_auth_abuse_other_agent_commands"
+        when:
+          playbook_ids: ["PB-AUTH-ABUSE-CONTAIN"]
+          action_type_in: ["agent_command"]
+        decision:
+          allowed: false
+      - id: "allow_auth_restore_mark_verified"
+        when:
+          playbook_ids: ["PB-AUTH-ACCESS-RESTORE"]
+          action_type_in: ["agent_command"]
+          command_prefix: "auth_mark_"
+        decision:
+          allowed: true
+      - id: "allow_auth_restore_commands"
+        when:
+          playbook_ids: ["PB-AUTH-ACCESS-RESTORE"]
+          action_type_in: ["agent_command"]
+          command_prefix: "auth_restore_"
+        decision:
+          allowed: true
+      - id: "deny_auth_restore_other_agent_commands"
+        when:
+          playbook_ids: ["PB-AUTH-ACCESS-RESTORE"]
+          action_type_in: ["agent_command"]
+        decision:
+          allowed: false
+      - id: "allow_net_first_seen_containment_commands"
+        when:
+          playbook_ids: ["PB-NET-FIRST-SEEN-CONTAIN"]
+          action_type_in: ["agent_command"]
+          command_prefix: "contain_destination_"
+        decision:
+          allowed: true
+      - id: "deny_net_first_seen_other_agent_commands"
+        when:
+          playbook_ids: ["PB-NET-FIRST-SEEN-CONTAIN"]
+          action_type_in: ["agent_command"]
+        decision:
+          allowed: false
+      - id: "allow_proc_first_seen_containment_commands"
+        when:
+          playbook_ids: ["PB-PROC-FIRST-SEEN-CONTAIN"]
+          action_type_in: ["agent_command"]
+          command_prefix: "contain_process_"
+        decision:
+          allowed: true
+      - id: "deny_proc_first_seen_other_agent_commands"
+        when:
+          playbook_ids: ["PB-PROC-FIRST-SEEN-CONTAIN"]
+          action_type_in: ["agent_command"]
+        decision:
+          allowed: false
+      - id: "allow_privesc_lockdown_commands"
+        when:
+          playbook_ids: ["PB-PRIVESC-LOCKDOWN"]
+          action_type_in: ["agent_command"]
+          command_prefix: "lockdown_privesc"
+        decision:
+          allowed: true
+      - id: "deny_privesc_lockdown_other_agent_commands"
+        when:
+          playbook_ids: ["PB-PRIVESC-LOCKDOWN"]
+          action_type_in: ["agent_command"]
+        decision:
+          allowed: false
+      - id: "allow_lateral_movement_halt_commands"
+        when:
+          playbook_ids: ["PB-LATERAL-MOVEMENT-HALT"]
+          action_type_in: ["agent_command"]
+          command_prefix: "halt_lateral_movement"
+        decision:
+          allowed: true
+      - id: "deny_lateral_movement_halt_other_agent_commands"
+        when:
+          playbook_ids: ["PB-LATERAL-MOVEMENT-HALT"]
+          action_type_in: ["agent_command"]
+        decision:
+          allowed: false
+      - id: "allow_c2_beacon_block_commands"
+        when:
+          playbook_ids: ["PB-C2-BEACON-BLOCK"]
+          action_type_in: ["agent_command"]
+          command_prefix: "block_c2_beacon"
+        decision:
+          allowed: true
+      - id: "deny_c2_beacon_block_other_agent_commands"
+        when:
+          playbook_ids: ["PB-C2-BEACON-BLOCK"]
+          action_type_in: ["agent_command"]
+        decision:
+          allowed: false
+      - id: "allow_ransomware_kill_chain_commands"
+        when:
+          playbook_ids: ["PB-RANSOMWARE-KILL-CHAIN-STOP"]
+          action_type_in: ["agent_command"]
+          command_prefix: "kill_chain_"
+        decision:
+          allowed: true
+      - id: "deny_ransomware_kill_chain_other_agent_commands"
+        when:
+          playbook_ids: ["PB-RANSOMWARE-KILL-CHAIN-STOP"]
+          action_type_in: ["agent_command"]
+        decision:
+          allowed: false
+      - id: "allow_agent_command"
+        when:
+          action_type_in: ["agent_command"]
+        decision:
+          allowed: true
+      - id: "allow_network_block"
+        when:
+          action_type_in: ["network_block"]
+        decision:
+          allowed: true
+      - id: "allow_network_rate_limit"
+        when:
+          action_type_in: ["network_rate_limit"]
+        decision:
+          allowed: true
 
 consumer:
   fast_workers: 1
@@ -511,7 +1232,7 @@ rce:
       kind: stateless
       severity: medium
       when:
-        type: process
+        type: process_exec
         fields:
           severity: medium
 
@@ -523,7 +1244,7 @@ rce:
       window_ms: 60000
       threshold: 3
       when:
-        type: process
+        type: process_exec
 
     - id: R-COLLECT-FAILED-PW
       enabled: true
@@ -557,6 +1278,105 @@ rce:
         fields:
           message_contains: "Failed password"
 
+    - id: R-AUTH-FAILED-PW-BURST-USER
+      enabled: true
+      kind: count
+      severity: high
+      group_by: user
+      window_ms: 300000
+      threshold: 5
+      when:
+        type: auth
+        fields:
+          message_contains: "Failed password"
+
+    - id: R-AUTH-FAILED-PW-BURST-SRCIP
+      enabled: true
+      kind: count
+      severity: high
+      group_by: src_ip
+      window_ms: 300000
+      threshold: 8
+      when:
+        type: auth
+        fields:
+          message_contains: "Failed password"
+
+    - id: R-AUTH-USER-SRCIP-BURST
+      enabled: true
+      kind: count
+      severity: critical
+      group_by: user
+      window_ms: 300000
+      threshold: 10
+      when:
+        type: auth
+        fields:
+          message_contains: "Failed password"
+
+    - id: R-AUTH-ACCESS-RESTORE-REQUEST
+      enabled: true
+      kind: trigger
+      severity: medium
+      group_by: user
+      when:
+        type: auth
+        fields:
+          message_contains: "auth_restore_requested"
+
+    - id: R-FILE-SENSITIVE-CHANGE
+      enabled: true
+      kind: trigger
+      severity: high
+      group_by: host
+      when:
+        type: file_change
+        fields:
+          path_contains: "/etc/"
+
+    - id: R-NET-OUTBOUND-CONNECTION
+      enabled: true
+      kind: trigger
+      severity: medium
+      group_by: src_ip
+      when:
+        type: network_connection
+
+    - id: R-NET-FIRST-SEEN-RISKY
+      enabled: true
+      kind: trigger
+      severity: high
+      group_by: src_ip
+      when:
+        type: network_connection
+
+    - id: R-PROC-FIRST-SEEN-SUSPICIOUS
+      enabled: true
+      kind: trigger
+      severity: high
+      group_by: host
+      when:
+        type: process_exec
+
+    - id: R-DNS-SUSPICIOUS-QUERY
+      enabled: true
+      kind: trigger
+      severity: high
+      group_by: user
+      when:
+        type: dns_query
+
+    - id: R-AUTH-PROC-FILE-CHAIN
+      enabled: true
+      kind: sequence
+      severity: critical
+      group_by: host
+      window_ms: 300000
+      steps:
+        - type: auth
+        - type: process_exec
+        - type: file_change
+
     - id: R-SEQ-PROCESS-TO-NET
       enabled: true
       kind: sequence
@@ -564,8 +1384,8 @@ rce:
       group_by: host
       window_ms: 120000
       steps:
-        - type: process
-        - type: network
+        - type: process_exec
+        - type: network_connection
 
     - id: R-JOIN-HIGH-NET
       enabled: true
@@ -574,10 +1394,10 @@ rce:
       group_by: src_ip
       window_ms: 300000
       predicates:
-        - type: network
+        - type: network_connection
           fields:
             severity: high
-        - type: network
+        - type: network_connection
 
     - id: R-FR03-HOST-BRUTEFORCE-BURST
       enabled: true

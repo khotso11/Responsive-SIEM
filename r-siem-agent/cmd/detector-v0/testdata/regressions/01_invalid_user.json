@@ -1,0 +1,24 @@
+{
+  "name": "invalid user auth failed",
+  "events": [
+    {
+      "event": {
+        "event_idem_key": "evt.reg.invalid.1",
+        "observed_at_unix_ms": 1000,
+        "event_type": "auth_failed",
+        "node_id": "node-a",
+        "host": "node-a",
+        "src_ip": "10.0.0.8",
+        "user": "alice",
+        "message": "Failed password for invalid user alice from 10.0.0.8 port 22 ssh2"
+      },
+      "expect": {
+        "matched": true,
+        "rule_id": "R-COLLECT-INVALID-USER",
+        "lane": "FAST",
+        "severity": "high",
+        "group_key": "10.0.0.8"
+      }
+    }
+  ]
+}

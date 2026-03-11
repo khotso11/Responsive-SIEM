@@ -966,6 +966,11 @@ func (p *ResponseTriggerPublisher) PublishAlert(alert ResponseTriggerAlert) erro
 		"subject":             alert.Subject,
 		"batch_key":           alert.BatchKey,
 	}
+	confidence := normalizeConfidence(alert.ConfidenceScore)
+	if confidence == 0 {
+		confidence = deriveConfidence(alert.RuleKind, alert.Severity, lane, 1, nil)
+	}
+	payload["confidence_score"] = confidence
 	if alert.GroupBy != "" {
 		payload["group_by"] = alert.GroupBy
 	}
@@ -1024,6 +1029,7 @@ type ResponseTriggerAlert struct {
 	RuleID           string
 	RuleKind         string
 	Severity         string
+	ConfidenceScore  int
 	GroupBy          string
 	GroupKey         string
 	AgentID          string
@@ -1034,6 +1040,99 @@ type ResponseTriggerAlert struct {
 	Subject          string
 	JSSeq            *uint64
 	BatchKey         string
+}
+
+func normalizeConfidence(score int) int {
+	if score < 0 {
+		return 0
+	}
+	if score > 100 {
+		return 100
+	}
+	return score
+}
+
+func defaultConfidenceForSeverity(severity string) int {
+	switch strings.ToLower(strings.TrimSpace(severity)) {
+	case "critical":
+		return 70
+	case "high":
+		return 58
+	case "medium":
+		return 46
+	case "low":
+		return 32
+	case "info":
+		return 20
+	default:
+		return 40
+	}
+}
+
+func deriveConfidence(ruleKind, severity, lane string, evidenceCount int, rec *NormalizedRecord) int {
+	score := defaultConfidenceForSeverity(severity)
+	switch strings.ToLower(strings.TrimSpace(ruleKind)) {
+	case "join":
+		score += 18
+	case "sequence":
+		score += 14
+	case "count":
+		score += 10
+	case "trigger":
+		score += 6
+	}
+	if strings.EqualFold(strings.TrimSpace(lane), "FAST") {
+		score += 6
+	}
+	if evidenceCount > 1 {
+		if evidenceCount > 6 {
+			evidenceCount = 6
+		}
+		score += (evidenceCount - 1) * 3
+	}
+	if rec != nil {
+		switch strings.ToLower(strings.TrimSpace(stringField(rec.Fields, "source_type"))) {
+		case "auditd_exec":
+			score += 8
+		case "inotify":
+			score += 7
+		case "dns_packet":
+			score += 6
+		case "proc_net":
+			score += 4
+		case "host", "tail":
+			score += 3
+		}
+		user := strings.ToLower(strings.TrimSpace(stringField(rec.Fields, "user")))
+		if user != "" && user != "unknown" {
+			score += 6
+		}
+		if strings.TrimSpace(stringField(rec.Fields, "exec_path")) != "" {
+			score += 6
+		}
+		if strings.TrimSpace(stringField(rec.Fields, "comm")) != "" {
+			score += 4
+		}
+		if strings.TrimSpace(stringField(rec.Fields, "cmdline")) != "" {
+			score += 4
+		}
+		if strings.TrimSpace(stringField(rec.Fields, "dst_ip")) != "" {
+			score += 3
+		}
+		if strings.TrimSpace(stringField(rec.Fields, "dns_name")) != "" {
+			score += 6
+		}
+		if strings.TrimSpace(stringField(rec.Fields, "file_sha256")) != "" {
+			score += 6
+		}
+		if strings.TrimSpace(stringField(rec.Fields, "exec_sha256")) != "" {
+			score += 6
+		}
+		if strings.TrimSpace(stringField(rec.Fields, "signer_hint")) != "" {
+			score += 2
+		}
+	}
+	return normalizeConfidence(score)
 }
 
 type IncidentConfig struct {
@@ -2414,6 +2513,7 @@ func (r *RCE) emitAlert(rule RCERule, rec NormalizedRecord, groupKey string, rul
 			RuleID:           rule.ID,
 			RuleKind:         ruleKind,
 			Severity:         rule.Severity,
+			ConfidenceScore:  deriveConfidence(ruleKind, rule.Severity, rec.Lane, len(correlationHashes), &rec),
 			GroupBy:          rule.GroupBy,
 			GroupKey:         groupKey,
 			AgentID:          rec.AgentID,
@@ -2484,6 +2584,7 @@ func (r *RCE) emitTrigger(rule RCERule, rec NormalizedRecord, groupKey string) e
 		AlertKey:         alertKey,
 		RuleID:           rule.ID,
 		Severity:         rule.Severity,
+		ConfidenceScore:  deriveConfidence(rule.Kind, rule.Severity, lane, 1, &rec),
 		Lane:             lane,
 		GroupBy:          rule.GroupBy,
 		GroupKey:         key,

@@ -1,0 +1,22 @@
+[Unit]
+Description=R-SIEM Collector Procnet
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__SERVICE_USER__
+Group=__SERVICE_GROUP__
+WorkingDirectory=__INSTALL_DIR__
+ExecStart=__INSTALL_DIR__/bin/collector-procnet --config __ETC_DIR__/configs/collector-procnet.yaml
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=__DATA_DIR__ __LOG_DIR__ __ETC_DIR__
+StandardOutput=append:__LOG_DIR__/collector-procnet.log
+StandardError=append:__LOG_DIR__/collector-procnet.log
+
+[Install]
+WantedBy=multi-user.target

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -12,8 +11,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/nats-io/nats.go"
-
+	"r-siem-agent/internal/collector/common"
 	"r-siem-agent/internal/collector/tail"
 	"r-siem-agent/internal/config"
 	"r-siem-agent/internal/logging"
@@ -34,22 +32,20 @@ func main() {
 		os.Exit(1)
 	}
 
-	nc, err := nats.Connect(cfg.JetStream.URL, nats.Name("r-siem-collector-tail"))
+	publisher, err := common.NewOfflinePublisher(common.OfflinePublisherConfig{
+		Name:          "r-siem-collector-tail",
+		URL:           cfg.JetStream.URL,
+		Stream:        cfg.JetStream.Stream,
+		Subject:       cfg.JetStream.Subject,
+		SpoolPath:     cfg.JetStream.OfflineSpoolPath,
+		RetryInterval: time.Duration(cfg.JetStream.RetryMs) * time.Millisecond,
+		SpoolFsync:    cfg.JetStream.OfflineSpoolFsync != nil && *cfg.JetStream.OfflineSpoolFsync,
+	}, logger)
 	if err != nil {
-		logger.Error("nats_connect_failed", slog.String("error", err.Error()))
+		logger.Error("offline_publisher_init_failed", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
-	defer nc.Close()
-
-	js, err := nc.JetStream()
-	if err != nil {
-		logger.Error("jetstream_context_failed", slog.String("error", err.Error()))
-		os.Exit(1)
-	}
-	if err := ensureEventsStream(js, cfg.JetStream.Stream, cfg.JetStream.Subject); err != nil {
-		logger.Error("ensure_events_stream_failed", slog.String("error", err.Error()))
-		os.Exit(1)
-	}
+	defer publisher.Close()
 
 	tailPath := cfg.Tail.Path
 	pathSource := "config"
@@ -72,9 +68,10 @@ func main() {
 		PollInterval:   time.Duration(cfg.Tail.PollMs) * time.Millisecond,
 		Stream:         cfg.JetStream.Stream,
 		Subject:        cfg.JetStream.Subject,
-	}, logger, js)
+	}, logger, publisher)
 	ctx, cancel := signalContext()
 	defer cancel()
+	publisher.Start(ctx)
 
 	if err := collector.Start(ctx); err != nil {
 		logger.Error("collector_tail_start_failed", slog.String("error", err.Error()))
@@ -94,15 +91,4 @@ func signalContext() (context.Context, context.CancelFunc) {
 		cancel()
 	}()
 	return ctx, cancel
-}
-
-func ensureEventsStream(js nats.JetStreamContext, stream, subject string) error {
-	_, err := js.AddStream(&nats.StreamConfig{
-		Name:     stream,
-		Subjects: []string{subject},
-	})
-	if err != nil && !errors.Is(err, nats.ErrStreamNameAlreadyInUse) {
-		return err
-	}
-	return nil
 }

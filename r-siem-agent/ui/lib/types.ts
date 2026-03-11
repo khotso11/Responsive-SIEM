@@ -1,16 +1,33 @@
 export type Incident = {
   run_id: string;
+  trigger_idem_key?: string;
+  alert_key?: string;
   status: string;
   rule_id?: string;
   playbook_id?: string;
   playbook_version?: string;
   severity?: string;
+  confidence_score?: number;
   lane?: string;
   node_id?: string;
+  asset_environment?: string;
+  asset_criticality?: string;
+  asset_owner?: string;
+  asset_team?: string;
+  asset_role?: string;
   source_type?: string;
   event_type?: string;
   src_ip?: string;
+  dst_ip?: string;
   user_name?: string;
+  exec_path?: string;
+  comm?: string;
+  cmdline?: string;
+  identity_display_name?: string;
+  identity_department?: string;
+  identity_manager?: string;
+  identity_privileged?: boolean;
+  identity_service_account?: boolean;
   target?: string;
   target_agent_id?: string;
   actor?: string;
@@ -21,7 +38,25 @@ export type Incident = {
   step_failed_transient_count?: number;
   failed_safe_reason?: string;
   operator_action?: string;
+  approval_policy_mode?: string;
+  approval_policy_rule_id?: string;
+  allowlist_rule_id?: string;
+  approval_policy_reason?: string;
+  playbook_reversibility?: string;
+  approval_decision?: string;
+  approval_actor?: string;
   last_updated_at_unix_ms?: number;
+  lifecycle_state?: string;
+  environment_class?: string;
+  retention_class?: string;
+  retention_rule_id?: string;
+  archive_after_days?: number;
+  purge_after_days?: number;
+  age_days?: number;
+  archived?: boolean;
+  purge_eligible?: boolean;
+  identity_workflow_eligible?: boolean;
+  identity_workflow_reason?: string;
   source?: string;
 };
 
@@ -29,6 +64,26 @@ export type IncidentUIState = {
   assignment?: string;
   reviewed?: boolean;
   notes?: Array<{ ts: string; actor: string; note: string }>;
+  verification?: {
+    verified?: boolean;
+    ts?: string;
+    actor?: string;
+    method?: string;
+    reference?: string;
+    notes?: string;
+    status?: string;
+    result?: string;
+  };
+  restore?: {
+    restored?: boolean;
+    ts?: string;
+    actor?: string;
+    scope?: string;
+    reason?: string;
+    reference?: string;
+    status?: string;
+    result?: string;
+  };
 };
 
 export type IncidentListResponse = {
@@ -63,6 +118,8 @@ export type StepResult = {
   target_agent_id?: string;
   last_error?: string;
   receipt?: Record<string, unknown>;
+  allowlist_rule_id?: string;
+  guardrail_rule_ids?: string[];
 };
 
 export type EventRow = {
@@ -72,6 +129,7 @@ export type EventRow = {
   source_type: string;
   event_type: string;
   src_ip?: string;
+  dst_ip?: string;
   user_name?: string;
   severity?: string;
   rule_id?: string;

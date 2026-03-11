@@ -1,0 +1,24 @@
+{
+  "name": "suspicious dns tld",
+  "events": [
+    {
+      "event": {
+        "event_idem_key": "evt.reg.dns.1",
+        "observed_at_unix_ms": 1000,
+        "event_type": "dns_query",
+        "source_type": "dns_packet",
+        "node_id": "node-a",
+        "src_ip": "192.0.2.10",
+        "dns_name": "beacon.top",
+        "dns_type": "A"
+      },
+      "expect": {
+        "matched": true,
+        "rule_id": "R-DNS-SUSPICIOUS-QUERY",
+        "lane": "FAST",
+        "severity": "high",
+        "group_key": "beacon.top"
+      }
+    }
+  ]
+}

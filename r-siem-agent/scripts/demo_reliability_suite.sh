@@ -32,11 +32,11 @@ for tool in rg nats ps awk sed pkill kill go tee; do
   command -v "$tool" >/dev/null 2>&1 || { echo "FAIL: required command not found: $tool"; exit 1; }
 done
 
-AGENT_RE='((go[[:space:]]+run[^[:cntrl:]]*\./cmd/agent)|((cmd/agent|/agent)([^[:alnum:]_]|$))).*(-{1,2}config([=[:space:]])?configs/agent(2)?\.yaml)'
-WORKER_RE='((go[[:space:]]+run[^[:cntrl:]]*\./cmd/master-roe-worker)|((cmd/master-roe-worker|/master-roe-worker)([^[:alnum:]_]|$))).*(-{1,2}config([=[:space:]])?[^[:space:]]*master\.yaml)'
-MASTER_RE='((go[[:space:]]+run[^[:cntrl:]]*\./cmd/master-roe([^[:alnum:]_-]|$))|((cmd/master-roe|/master-roe)([^[:alnum:]_-]|$))).*(-{1,2}config([=[:space:]])?[^[:space:]]*master\.yaml)'
-DETECTOR_RE='(go[[:space:]]+run[^[:cntrl:]]*\./cmd/detector-v0|(cmd/detector-v0|/detector-v0)([^[:alnum:]_]|$))'
-COLLECTOR_RE='(go[[:space:]]+run[^[:cntrl:]]*\./cmd/collector-tail|(cmd/collector-tail|/collector-tail)([^[:alnum:]_]|$))'
+AGENT_RE='((go[[:space:]]+run[^[:cntrl:]]*\./cmd/agent)|((cmd/agent|/agent)([^[:alnum:]_]|$))).*(-{1,2}config([=[:space:]])?[^[:space:]]*agent(2)?\.yaml)'
+WORKER_RE='((go[[:space:]]+run[^[:cntrl:]]*\./cmd/master-roe-worker)|((cmd/master-roe-worker|/master-roe-worker)([^[:alnum:]_]|$))).*(-{1,2}config([=[:space:]])?[^[:space:]]+\.ya?ml)'
+MASTER_RE='((go[[:space:]]+run[^[:cntrl:]]*\./cmd/master-roe([^[:alnum:]_-]|$))|((cmd/master-roe|/master-roe)([^[:alnum:]_-]|$))).*(-{1,2}config([=[:space:]])?[^[:space:]]+\.ya?ml)'
+DETECTOR_RE='(go[[:space:]]+run[^[:cntrl:]]*\./cmd/detector-v0|(cmd/detector-v0|/detector-v0)([^[:alnum:]_]|$)).*(-{1,2}config([=[:space:]])?[^[:space:]]+\.ya?ml)?'
+COLLECTOR_RE='(go[[:space:]]+run[^[:cntrl:]]*\./cmd/collector-tail|(cmd/collector-tail|/collector-tail)([^[:alnum:]_]|$)).*(-{1,2}config([=[:space:]])?[^[:space:]]+\.ya?ml)?'
 TEE_RE='(^|[[:space:]])tee[[:space:]].*logs/(agent|worker|master-roe|detector|collector)([^[:alnum:]_]|$)'
 SUITE_MASTER_CONFIG="tmp/reliability_master.yaml"
 

@@ -3,6 +3,12 @@ set -euo pipefail
 
 command -v rg >/dev/null 2>&1 || { echo "FAIL: rg missing"; exit 1; }
 
+pkill -f 'cmd/master-roe|/master-roe' >/dev/null 2>&1 || true
+pkill -f 'cmd/master-roe-worker|/master-roe-worker' >/dev/null 2>&1 || true
+pkill -f 'cmd/detector-v0|/detector-v0' >/dev/null 2>&1 || true
+pkill -f 'cmd/collector-tail|/collector-tail' >/dev/null 2>&1 || true
+pkill -f 'cmd/agent|/agent' >/dev/null 2>&1 || true
+
 ./scripts/demo_down.sh >/dev/null 2>&1 || true
 ./scripts/demo_up.sh >/dev/null
 

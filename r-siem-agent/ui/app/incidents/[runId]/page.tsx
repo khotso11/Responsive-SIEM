@@ -2,8 +2,8 @@
 
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
-import { approveIncident, getArtifacts, getIncident, getIncidentEvents } from "@/lib/api";
-import { EventRow, Incident, StepResult } from "@/lib/types";
+import { approveIncident, getArtifacts, getIncident, getIncidentEvents, isUnauthorizedError, reissueIncident, restoreIncidentAccess, verifyIncidentUser } from "@/lib/api";
+import { EventRow, Incident, IncidentUIState, StepResult } from "@/lib/types";
 import { EmptyState, ErrorState, LaneBadge, LoadingState, StatusBadge, ValueRow, unixMsToLocal } from "@/components/ui";
 
 export default function IncidentDetailPage({ params }: { params: { runId: string } }) {
@@ -12,19 +12,30 @@ export default function IncidentDetailPage({ params }: { params: { runId: string
   const [steps, setSteps] = useState<StepResult[]>([]);
   const [events, setEvents] = useState<EventRow[]>([]);
   const [artifacts, setArtifacts] = useState<Array<{ path: string; is_dir: boolean; size: number; modified: string }>>([]);
+  const [uiState, setUIState] = useState<IncidentUIState>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [actor, setActor] = useState("khotso");
   const [approvalBusy, setApprovalBusy] = useState(false);
   const [approvalMsg, setApprovalMsg] = useState("");
+  const [newRunID, setNewRunID] = useState("");
+  const [reissueReason, setReissueReason] = useState("");
+  const [verificationMethod, setVerificationMethod] = useState("phone");
+  const [verificationReference, setVerificationReference] = useState("");
+  const [verificationNotes, setVerificationNotes] = useState("");
+  const [restoreScope, setRestoreScope] = useState<"src_ip" | "user" | "both">("both");
+  const [restoreReason, setRestoreReason] = useState("");
+  const [restoreReference, setRestoreReference] = useState("");
 
   const load = async () => {
     setLoading(true);
     setError(null);
+    setNewRunID("");
     try {
       const detail = await getIncident(runID);
       setRun(detail.run);
       setSteps(detail.steps || []);
+      setUIState(detail.ui_state || {});
       const ev = await getIncidentEvents(runID, { windowSeconds: 900 });
       setEvents(ev.items || []);
       const collected: Array<{ path: string; is_dir: boolean; size: number; modified: string }> = [];
@@ -51,6 +62,24 @@ export default function IncidentDetailPage({ params }: { params: { runId: string
     return (run.status || "").toUpperCase() === "WAITING_APPROVAL";
   }, [run]);
 
+  const requiresManualReview = useMemo(() => {
+    if (!run) return false;
+    return (run.status || "").toUpperCase() === "MANUAL_REVIEW_REQUIRED";
+  }, [run]);
+
+  const isIdentityIncident = useMemo(() => {
+    if (!run) return false;
+    const rule = (run.rule_id || "").toUpperCase();
+    const playbook = (run.playbook_id || "").toUpperCase();
+    return rule.startsWith("R-AUTH-") || playbook.startsWith("PB-AUTH-") || rule === "R-COLLECT-INVALID-USER";
+  }, [run]);
+
+  const canRunIdentityWorkflow = useMemo(() => Boolean(run?.identity_workflow_eligible), [run]);
+  const identityWorkflowReason = useMemo(
+    () => run?.identity_workflow_reason || "Identity workflow is available only after a successful auth containment run.",
+    [run]
+  );
+
   const doDecision = async (decision: "approve" | "reject") => {
     if (!run) return;
     setApprovalBusy(true);
@@ -61,6 +90,68 @@ export default function IncidentDetailPage({ params }: { params: { runId: string
       await load();
     } catch (e) {
       setApprovalMsg(`Decision failed: ${(e as Error).message || String(e)}`);
+    } finally {
+      setApprovalBusy(false);
+    }
+  };
+
+  const doReissue = async () => {
+    if (!run) return;
+    setApprovalBusy(true);
+    setApprovalMsg("");
+    try {
+      const res = await reissueIncident(run.run_id, actor, reissueReason);
+      setNewRunID(res.new_run_id || "");
+      setApprovalMsg(
+        res.new_run_id
+          ? `Fresh response trigger published on ${res.lane}. New run ${res.new_run_id} is ready.`
+          : `Fresh response trigger published on ${res.lane}. A new run will appear in the queue shortly.`
+      );
+      await load();
+    } catch (e) {
+      setApprovalMsg(`Re-issue failed: ${(e as Error).message || String(e)}`);
+    } finally {
+      setApprovalBusy(false);
+    }
+  };
+
+  const doVerifyUser = async () => {
+    if (!run || !verificationMethod.trim() || !verificationReference.trim()) return;
+    if (!canRunIdentityWorkflow) {
+      setApprovalMsg(identityWorkflowReason);
+      return;
+    }
+    setApprovalBusy(true);
+    setApprovalMsg("");
+    try {
+      await verifyIncidentUser(run.run_id, actor, verificationMethod.trim(), verificationReference.trim(), verificationNotes.trim());
+      setApprovalMsg(`User verification recorded via ${verificationMethod.trim()}`);
+      await load();
+    } catch (e) {
+      setApprovalMsg(isUnauthorizedError(e) ? "Verification failed: session expired. Please log in again." : `Verification failed: ${(e as Error).message || String(e)}`);
+    } finally {
+      setApprovalBusy(false);
+    }
+  };
+
+  const doRestoreAccess = async () => {
+    if (!run || !restoreReason.trim()) return;
+    if (!canRunIdentityWorkflow) {
+      setApprovalMsg(identityWorkflowReason);
+      return;
+    }
+    if (!uiState.verification?.verified) {
+      setApprovalMsg("Restore blocked: verify the user first.");
+      return;
+    }
+    setApprovalBusy(true);
+    setApprovalMsg("");
+    try {
+      await restoreIncidentAccess(run.run_id, actor, restoreScope, restoreReason.trim(), restoreReference.trim());
+      setApprovalMsg(`Access restore submitted for scope ${restoreScope}`);
+      await load();
+    } catch (e) {
+      setApprovalMsg(isUnauthorizedError(e) ? "Restore failed: session expired. Please log in again." : `Restore failed: ${(e as Error).message || String(e)}`);
     } finally {
       setApprovalBusy(false);
     }
@@ -89,15 +180,32 @@ export default function IncidentDetailPage({ params }: { params: { runId: string
               <div className="space-y-2">
                 <ValueRow label="run_id" value={run.run_id} />
                 <ValueRow label="status" value={<StatusBadge status={run.status} />} />
+                <ValueRow label="operator_action" value={run.operator_action} />
                 <ValueRow label="lane" value={<LaneBadge lane={run.lane} />} />
                 <ValueRow label="rule_id" value={run.rule_id} />
                 <ValueRow label="playbook_id" value={run.playbook_id} />
+                <ValueRow label="approval_policy_rule_id" value={run.approval_policy_rule_id} />
+                <ValueRow label="allowlist_rule_id" value={run.allowlist_rule_id} />
+                <ValueRow label="retention_rule_id" value={run.retention_rule_id} />
                 <ValueRow label="node_id" value={run.node_id} />
+                <ValueRow label="asset_environment" value={run.asset_environment} />
+                <ValueRow label="asset_criticality" value={run.asset_criticality} />
+                <ValueRow label="asset_owner" value={run.asset_owner} />
+                <ValueRow label="asset_team" value={run.asset_team} />
+                <ValueRow label="asset_role" value={run.asset_role} />
                 <ValueRow label="source_type" value={run.source_type} />
                 <ValueRow label="event_type" value={run.event_type} />
                 <ValueRow label="src_ip" value={run.src_ip} />
+                <ValueRow label="dst_ip" value={run.dst_ip} />
                 <ValueRow label="user" value={run.user_name} />
+                <ValueRow label="identity_display_name" value={run.identity_display_name} />
+                <ValueRow label="identity_department" value={run.identity_department} />
+                <ValueRow label="identity_manager" value={run.identity_manager} />
+                <ValueRow label="identity_privileged" value={run.identity_privileged ? "yes" : "no"} />
+                <ValueRow label="identity_service_account" value={run.identity_service_account ? "yes" : "no"} />
                 <ValueRow label="target_agent_id" value={run.target_agent_id} />
+                <ValueRow label="identity_workflow_eligible" value={run.identity_workflow_eligible ? "yes" : "no"} />
+                <ValueRow label="identity_workflow_reason" value={run.identity_workflow_reason || "-"} />
                 <ValueRow label="updated" value={unixMsToLocal(run.last_updated_at_unix_ms)} />
               </div>
             </div>
@@ -119,6 +227,121 @@ export default function IncidentDetailPage({ params }: { params: { runId: string
                     </button>
                     <button disabled={approvalBusy} className="rounded bg-rose-700 px-3 py-2 text-sm hover:bg-rose-600 disabled:opacity-50" onClick={() => doDecision("reject")}>
                       Reject
+                    </button>
+                  </div>
+                  {approvalMsg ? (
+                    <div className="space-y-2 text-xs text-ink-300">
+                      <p>{approvalMsg}</p>
+                      {newRunID ? (
+                        <p>
+                          <Link className="underline text-cyan-300" href={`/incidents/${encodeURIComponent(newRunID)}`}>
+                            Open new run
+                          </Link>
+                        </p>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </div>
+              ) : requiresManualReview ? (
+                <div className="space-y-3">
+                  <div className="rounded border border-amber-700/60 bg-amber-950/30 px-3 py-2 text-sm text-amber-100">
+                    Approval timed out. This run now requires manual review and cannot be resumed by a late approve/reject action.
+                  </div>
+                  <ValueRow label="approval_decision" value={run.approval_decision || "timeout"} />
+                  <ValueRow label="operator_action" value={run.operator_action || "manual_review_required"} />
+                  <input
+                    className="w-full rounded border border-ink-700 bg-ink-900 px-2 py-2 text-sm"
+                    value={actor}
+                    onChange={(e) => setActor(e.target.value)}
+                    placeholder="actor"
+                  />
+                  <input
+                    className="w-full rounded border border-ink-700 bg-ink-900 px-2 py-2 text-sm"
+                    value={reissueReason}
+                    onChange={(e) => setReissueReason(e.target.value)}
+                    placeholder="optional re-issue reason"
+                  />
+                  <button disabled={approvalBusy} className="rounded bg-cyan-400 px-3 py-2 text-sm text-slate-950 hover:bg-cyan-300 disabled:opacity-50" onClick={doReissue}>
+                    Re-issue Response
+                  </button>
+                  {approvalMsg ? <p className="text-xs text-ink-300">{approvalMsg}</p> : null}
+                </div>
+              ) : isIdentityIncident ? (
+                <div className="space-y-4">
+                  <div className="rounded border border-ink-800 bg-ink-900/40 px-3 py-2 text-xs text-ink-300">
+                    Use this panel to record identity verification and issue a controlled access restore after validation.
+                  </div>
+                  <div className="space-y-2 rounded border border-ink-800 p-3">
+                    <h4 className="text-sm font-semibold">Verify User</h4>
+                    {!canRunIdentityWorkflow ? (
+                      <div className="rounded border border-amber-700/40 bg-amber-950/20 px-3 py-2 text-xs text-amber-100">
+                        {identityWorkflowReason}
+                      </div>
+                    ) : uiState.verification?.verified ? (
+                      <div className="rounded border border-emerald-700/40 bg-emerald-950/20 px-3 py-2 text-xs text-emerald-100">
+                        Verified by {uiState.verification.actor || "-"} via {uiState.verification.method || "-"} at {uiState.verification.ts || "-"}
+                      </div>
+                    ) : (
+                      <div className="rounded border border-ink-800 bg-ink-900/40 px-3 py-2 text-xs text-ink-300">
+                        Record user verification before restore. Restore remains locked until verification exists.
+                      </div>
+                    )}
+                    <input
+                      className="w-full rounded border border-ink-700 bg-ink-900 px-2 py-2 text-sm"
+                      value={verificationMethod}
+                      onChange={(e) => setVerificationMethod(e.target.value)}
+                      placeholder="verification method"
+                    />
+                    <input
+                      className="w-full rounded border border-ink-700 bg-ink-900 px-2 py-2 text-sm"
+                      value={verificationReference}
+                      onChange={(e) => setVerificationReference(e.target.value)}
+                      placeholder="verification reference / ticket"
+                    />
+                    <input
+                      className="w-full rounded border border-ink-700 bg-ink-900 px-2 py-2 text-sm"
+                      value={verificationNotes}
+                      onChange={(e) => setVerificationNotes(e.target.value)}
+                      placeholder="verification notes"
+                    />
+                    <button disabled={approvalBusy || !canRunIdentityWorkflow} className="rounded border border-ink-700 px-3 py-2 text-sm hover:bg-ink-800 disabled:opacity-50" onClick={doVerifyUser}>
+                      Verify User
+                    </button>
+                  </div>
+                  <div className="space-y-2 rounded border border-ink-800 p-3">
+                    <h4 className="text-sm font-semibold">Restore Access</h4>
+                    {!canRunIdentityWorkflow ? (
+                      <div className="rounded border border-amber-700/40 bg-amber-950/20 px-3 py-2 text-xs text-amber-100">
+                        {identityWorkflowReason}
+                      </div>
+                    ) : !uiState.verification?.verified ? (
+                      <div className="rounded border border-amber-700/40 bg-amber-950/20 px-3 py-2 text-xs text-amber-100">
+                        Verify User first. Access restore is blocked until a verification record exists for this incident.
+                      </div>
+                    ) : null}
+                    <select
+                      className="w-full rounded border border-ink-700 bg-ink-900 px-2 py-2 text-sm"
+                      value={restoreScope}
+                      onChange={(e) => setRestoreScope(e.target.value as "src_ip" | "user" | "both")}
+                    >
+                      <option value="both">Restore both</option>
+                      <option value="src_ip">Restore src_ip only</option>
+                      <option value="user">Restore user only</option>
+                    </select>
+                    <input
+                      className="w-full rounded border border-ink-700 bg-ink-900 px-2 py-2 text-sm"
+                      value={restoreReference}
+                      onChange={(e) => setRestoreReference(e.target.value)}
+                      placeholder="change reference"
+                    />
+                    <input
+                      className="w-full rounded border border-ink-700 bg-ink-900 px-2 py-2 text-sm"
+                      value={restoreReason}
+                      onChange={(e) => setRestoreReason(e.target.value)}
+                      placeholder="restore reason"
+                    />
+                    <button disabled={approvalBusy || !canRunIdentityWorkflow || !uiState.verification?.verified} className="rounded bg-cyan-400 px-3 py-2 text-sm text-slate-950 hover:bg-cyan-300 disabled:opacity-50" onClick={doRestoreAccess}>
+                      Restore Access
                     </button>
                   </div>
                   {approvalMsg ? <p className="text-xs text-ink-300">{approvalMsg}</p> : null}
@@ -146,6 +369,8 @@ export default function IncidentDetailPage({ params }: { params: { runId: string
                       <ValueRow label="target_agent_id" value={s.target_agent_id} />
                       <ValueRow label="target" value={s.target} />
                       <ValueRow label="attempt" value={String(s.attempt ?? 0)} />
+                      <ValueRow label="allowlist_rule_id" value={s.allowlist_rule_id || "-"} />
+                      <ValueRow label="guardrail_rule_ids" value={s.guardrail_rule_ids?.join(", ") || "-"} />
                       <ValueRow label="finished" value={unixMsToLocal(s.finished_at_unix_ms)} />
                     </div>
                     {s.receipt ? (
@@ -170,6 +395,7 @@ export default function IncidentDetailPage({ params }: { params: { runId: string
                       <th className="p-2">Source/Event</th>
                       <th className="p-2">User</th>
                       <th className="p-2">src_ip</th>
+                      <th className="p-2">dst_ip</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -180,6 +406,7 @@ export default function IncidentDetailPage({ params }: { params: { runId: string
                         <td className="p-2">{ev.source_type} / {ev.event_type}</td>
                         <td className="p-2">{ev.user_name || "-"}</td>
                         <td className="p-2">{ev.src_ip || "-"}</td>
+                        <td className="p-2">{ev.dst_ip || "-"}</td>
                       </tr>
                     ))}
                   </tbody>

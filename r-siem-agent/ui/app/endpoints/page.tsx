@@ -1,8 +1,9 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { getEndpointEvents, getEndpointRuns, getEndpoints, postEndpointTargetedTest } from "@/lib/api";
+import { INCIDENT_MUTATED_EVENT, INCIDENTS_UPDATED_EVENT } from "@/lib/events";
 import { EndpointSummary, EventRow, Incident } from "@/lib/types";
 import { EmptyState, ErrorState, LaneBadge, LoadingState, StatusBadge, unixMsToLocal } from "@/components/ui";
 
@@ -19,6 +20,8 @@ export default function EndpointsPage() {
   const searchParams = useSearchParams();
   const [items, setItems] = useState<EndpointSummary[]>([]);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [hasLoadedOnce, setHasLoadedOnce] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selectedNode, setSelectedNode] = useState<EndpointSummary | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -31,13 +34,40 @@ export default function EndpointsPage() {
   const fromMs = useMemo(() => parseQueryTime(searchParams.get("gfrom")), [searchParams]);
   const toMs = useMemo(() => parseQueryTime(searchParams.get("gto")), [searchParams]);
 
+  const load = useCallback(async () => {
+    if (hasLoadedOnce) {
+      setRefreshing(true);
+    } else {
+      setLoading(true);
+    }
+    setError(null);
+    try {
+      const res = await getEndpoints();
+      setItems(res.items || []);
+      setHasLoadedOnce(true);
+    } catch (e) {
+      setError((e as Error).message || String(e));
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+    }
+  }, [hasLoadedOnce]);
+
   useEffect(() => {
-    setLoading(true);
-    getEndpoints()
-      .then((res) => setItems(res.items || []))
-      .catch((e) => setError(e.message || String(e)))
-      .finally(() => setLoading(false));
-  }, []);
+    void load();
+  }, [load]);
+
+  useEffect(() => {
+    const onRefresh = () => {
+      void load();
+    };
+    window.addEventListener(INCIDENTS_UPDATED_EVENT, onRefresh);
+    window.addEventListener(INCIDENT_MUTATED_EVENT, onRefresh);
+    return () => {
+      window.removeEventListener(INCIDENTS_UPDATED_EVENT, onRefresh);
+      window.removeEventListener(INCIDENT_MUTATED_EVENT, onRefresh);
+    };
+  }, [load]);
 
   const openDrawer = async (node: EndpointSummary) => {
     setSelectedNode(node);
@@ -87,14 +117,26 @@ export default function EndpointsPage() {
   const activityMax = Math.max(1, ...activity.map((x) => x.value));
 
   return (
-    <section className="space-y-4">
-      <div>
-        <h2 className="text-[18px] font-semibold">Endpoints</h2>
-        <p className="text-[13px] text-ink-300">Endpoint posture with activity rates and source distribution. Select a node to investigate.</p>
+    <section className="flex h-full min-h-0 flex-col gap-4 overflow-auto">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <h2 className="text-[18px] font-semibold">Endpoints</h2>
+          <p className="text-[13px] text-ink-300">Endpoint posture with activity rates and source distribution. Select a node to investigate.</p>
+        </div>
+        {refreshing ? (
+          <div className="rounded border border-ink-700/80 bg-ink-900/60 px-2 py-1 text-[11px] text-ink-300">
+            Refreshing...
+          </div>
+        ) : null}
       </div>
 
-      {loading ? <LoadingState /> : null}
-      {error ? <ErrorState message={error} /> : null}
+      {loading && !hasLoadedOnce ? <LoadingState /> : null}
+      {error && !items.length ? <ErrorState message={error} /> : null}
+      {error && items.length > 0 ? (
+        <div className="rounded border border-rose-900/80 bg-rose-950/30 px-3 py-2 text-sm text-rose-200">
+          {error}
+        </div>
+      ) : null}
       {!loading && !error && items.length === 0 ? <EmptyState title="No endpoint activity" /> : null}
 
       {!loading && !error && items.length > 0 ? (

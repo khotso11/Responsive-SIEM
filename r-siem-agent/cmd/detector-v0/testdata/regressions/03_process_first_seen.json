@@ -1,0 +1,27 @@
+{
+  "name": "first seen suspicious process",
+  "events": [
+    {
+      "event": {
+        "event_idem_key": "evt.reg.proc.1",
+        "observed_at_unix_ms": 1000,
+        "event_type": "process_exec",
+        "source_type": "auditd_exec",
+        "node_id": "node-a",
+        "host": "node-a",
+        "user": "alice",
+        "exec_path": "/usr/bin/nmap",
+        "comm": "nmap",
+        "cmdline": "/usr/bin/nmap --version",
+        "message": "exec=/usr/bin/nmap user=alice"
+      },
+      "expect": {
+        "matched": true,
+        "rule_id": "R-PROC-FIRST-SEEN-SUSPICIOUS",
+        "lane": "FAST",
+        "severity": "high",
+        "group_key": "node-a"
+      }
+    }
+  ]
+}

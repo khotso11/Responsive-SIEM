@@ -10,6 +10,7 @@ UI_WEB_PORT="${UI_WEB_PORT:-3100}"
 INJECT_DEMO_EVENT="${INJECT_DEMO_EVENT:-1}"
 DEMO_USER="${DEMO_USER:-demo_local}"
 DEMO_SRC_IP="${DEMO_SRC_IP:-10.99.1.31}"
+IDENTITY_DEMO_ROUTE="${IDENTITY_DEMO_ROUTE:-1}"
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -25,15 +26,38 @@ done
 echo "[0/10] Preparing local endpoint package"
 mkdir -p "$PACKAGE_DIR/bin" "$PACKAGE_DIR/pki"
 
-if [[ ! -f "$PACKAGE_DIR/bin/agent" ]]; then
-  echo "Building agent binary into $PACKAGE_DIR/bin/agent"
-  env GOCACHE="$ROOT_DIR/.cache/go-build" go build -mod=vendor -o "$PACKAGE_DIR/bin/agent" ./cmd/agent
+echo "Building agent binary into $PACKAGE_DIR/bin/agent"
+env GOCACHE="$ROOT_DIR/.cache/go-build" go build -mod=vendor -o "$PACKAGE_DIR/bin/agent" ./cmd/agent
+
+echo "Building collector-tail binary into $PACKAGE_DIR/bin/collector-tail"
+env GOCACHE="$ROOT_DIR/.cache/go-build" go build -mod=vendor -o "$PACKAGE_DIR/bin/collector-tail" ./cmd/collector-tail
+
+if [[ -f "cmd/collector-auditd/main.go" ]]; then
+  echo "Building collector-auditd binary into $PACKAGE_DIR/bin/collector-auditd"
+  env GOCACHE="$ROOT_DIR/.cache/go-build" go build -mod=vendor -o "$PACKAGE_DIR/bin/collector-auditd" ./cmd/collector-auditd
 fi
 
-if [[ ! -f "$PACKAGE_DIR/bin/collector-tail" ]]; then
-  echo "Building collector-tail binary into $PACKAGE_DIR/bin/collector-tail"
-  env GOCACHE="$ROOT_DIR/.cache/go-build" go build -mod=vendor -o "$PACKAGE_DIR/bin/collector-tail" ./cmd/collector-tail
+if [[ -f "cmd/collector-inotify/main.go" ]]; then
+  echo "Building collector-inotify binary into $PACKAGE_DIR/bin/collector-inotify"
+  env GOCACHE="$ROOT_DIR/.cache/go-build" go build -mod=vendor -o "$PACKAGE_DIR/bin/collector-inotify" ./cmd/collector-inotify
 fi
+
+if [[ -f "cmd/collector-procnet/main.go" ]]; then
+  echo "Building collector-procnet binary into $PACKAGE_DIR/bin/collector-procnet"
+  env GOCACHE="$ROOT_DIR/.cache/go-build" go build -mod=vendor -o "$PACKAGE_DIR/bin/collector-procnet" ./cmd/collector-procnet
+fi
+
+if [[ -f "cmd/collector-dns/main.go" ]]; then
+  echo "Building collector-dns binary into $PACKAGE_DIR/bin/collector-dns"
+  env GOCACHE="$ROOT_DIR/.cache/go-build" go build -mod=vendor -o "$PACKAGE_DIR/bin/collector-dns" ./cmd/collector-dns
+fi
+
+mkdir -p "$PACKAGE_DIR/configs"
+for cfg in collector-auditd.yaml collector-inotify.yaml collector-procnet.yaml collector-dns.yaml; do
+  if [[ -f "configs/$cfg" ]]; then
+    cp "configs/$cfg" "$PACKAGE_DIR/configs/$cfg"
+  fi
+done
 
 if [[ ! -f "pki/agents/${AGENT_ID}/current/agent.pem" || ! -f "pki/agents/${AGENT_ID}/current/agent-key.pem" ]]; then
   echo "Issuing endpoint cert for AGENT_ID=$AGENT_ID"
@@ -92,6 +116,34 @@ BEGIN { skip=0 }
 
 printf '\ndb:\n  enabled: true\n  dsn: "%s"\n  fail_closed: true\n  batch_size: 1\n  flush_interval_ms: 200\n' "$DB_DSN" >> tmp/master_lan_db.yaml
 
+if [[ "$IDENTITY_DEMO_ROUTE" == "1" ]]; then
+  echo "[3a/10] Switching local auth-abuse demo routing to PB-AUTH-ABUSE-CONTAIN"
+  perl -0pe '
+    s/( - id: "PB-QUARANTINE-ROLLBACK-DEMO"\n.*?selectors:\n\s+rule_ids:\s*)\["R-COLLECT-INVALID-USER"\]/${1}[]/s;
+    s/( - id: "PB-AGENT-PING-LOCALHOST"\n.*?selectors:\n\s+rule_ids:\s*)\["R-COLLECT-INVALID-USER"\]/${1}[]/s;
+    s/(
+      \Q  - id: "PB-AUTH-ABUSE-CONTAIN"\E\n
+      \Q    version: 1\E\n
+      \Q    enabled: true\E\n
+      \Q    selectors:\E\n
+      \Q      rule_ids:\E\n
+      \Q        - "R-AUTH-FAILED-PW-BURST-USER"\E\n
+      \Q        - "R-AUTH-FAILED-PW-BURST-SRCIP"\E\n
+      \Q        - "R-AUTH-USER-SRCIP-BURST"\E\n
+    )/$1        - "R-COLLECT-INVALID-USER"\n/xs
+      unless /PB-AUTH-ABUSE-CONTAIN[\s\S]*^\s*-\s+"R-COLLECT-INVALID-USER"$/m;
+  ' tmp/master_lan_db.yaml > tmp/master_lan_db.identity.tmp
+  mv tmp/master_lan_db.identity.tmp tmp/master_lan_db.yaml
+  if [[ ! -s tmp/master_lan_db.yaml ]]; then
+    echo "FAIL: generated demo master config is empty" >&2
+    exit 1
+  fi
+  if ! rg -q 'PB-AUTH-ABUSE-CONTAIN' tmp/master_lan_db.yaml; then
+    echo "FAIL: PB-AUTH-ABUSE-CONTAIN missing from generated demo master config" >&2
+    exit 1
+  fi
+fi
+
 echo "[4/10] Starting one master, one worker, one detector"
 env GOCACHE="$ROOT_DIR/.cache/go-build" go run -mod=vendor ./cmd/master-roe --config tmp/master_lan_db.yaml >> logs/master-roe.log 2>&1 &
 echo $! > .pids/master-roe.pid
@@ -109,6 +161,9 @@ if [[ -z "$DB_SINK_LINE" ]]; then
   exit 1
 fi
 echo "$DB_SINK_LINE"
+if [[ "$IDENTITY_DEMO_ROUTE" == "1" ]]; then
+  echo "IDENTITY_DEMO_ROUTE=PB-AUTH-ABUSE-CONTAIN"
+fi
 
 echo "[5/10] Re-installing local endpoint against current LAN IP"
 sudo ./scripts/deploy/linux/install_endpoint.sh \

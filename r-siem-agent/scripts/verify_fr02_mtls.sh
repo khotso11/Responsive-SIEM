@@ -30,6 +30,32 @@ need_cmd() {
   }
 }
 
+nats_reachable() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn 2>/dev/null | rg -q '(^|[[:space:]])(\*|0\.0\.0\.0|127\.0\.0\.1):4222([[:space:]]|$)|(\[::\]|::):4222'
+  else
+    timeout 2 bash -c '</dev/tcp/127.0.0.1/4222' >/dev/null 2>&1
+  fi
+}
+
+ensure_local_nats() {
+  if nats_reachable; then
+    return 0
+  fi
+
+  docker start rsiem-nats-lan >/dev/null 2>&1 || docker start nats >/dev/null 2>&1 || true
+
+  local i=0
+  while (( i < 20 )); do
+    if nats_reachable; then
+      return 0
+    fi
+    sleep 0.5
+    i=$((i + 1))
+  done
+  return 1
+}
+
 cert_fp_or_empty() {
   local cert_path="$1"
   if [[ ! -f "$cert_path" ]]; then
@@ -338,17 +364,10 @@ fi
 server_fingerprint_sha256="$(cert_fp_or_empty "configs/certs/master.pem")"
 client_fingerprint_sha256="$(cert_fp_or_empty "configs/certs/agent.pem")"
 
-if command -v ss >/dev/null 2>&1; then
-  if ! ss -ltn 2>/dev/null | rg -q '(^|[[:space:]])\*:4222([[:space:]]|$)|127\.0\.0\.1:4222'; then
-    echo "FAIL: NATS not reachable on 127.0.0.1:4222" >&2
-    exit 1
-  fi
-else
-  if ! timeout 2 bash -c '</dev/tcp/127.0.0.1/4222' >/dev/null 2>&1; then
-    echo "FAIL: NATS not reachable on 127.0.0.1:4222" >&2
-    exit 1
-  fi
-fi
+ensure_local_nats || {
+  echo "FAIL: NATS not reachable on 127.0.0.1:4222" >&2
+  exit 1
+}
 
 GOCACHE="$(pwd)/.cache/go-build" go build -mod=vendor -o "$MASTER_BIN" ./cmd/master
 GOCACHE="$(pwd)/.cache/go-build" go build -mod=vendor -o "$AGENT_BIN" ./cmd/agent

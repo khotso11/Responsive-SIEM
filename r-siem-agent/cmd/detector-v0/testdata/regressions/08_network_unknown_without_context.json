@@ -1,0 +1,31 @@
+{
+  "name": "network remains unknown without process context",
+  "events": [
+    {
+      "event": {
+        "event_idem_key": "evt.reg.unknown.net.1",
+        "observed_at_unix_ms": 1000,
+        "event_type": "network_connection",
+        "source_type": "proc_net",
+        "node_id": "node-z",
+        "host": "node-z",
+        "src_ip": "192.0.2.10",
+        "dst_ip": "93.184.216.13",
+        "dst_port": 4444,
+        "user": "unknown",
+        "message": "dst_ip=93.184.216.13 dst_port=4444"
+      },
+      "expect": {
+        "matched": true,
+        "rule_id": "R-NET-FIRST-SEEN-RISKY",
+        "lane": "FAST",
+        "severity": "high",
+        "group_key": "93.184.216.13",
+        "user": "unknown",
+        "no_exec_path": true,
+        "no_comm": true,
+        "no_cmdline": true
+      }
+    }
+  ]
+}

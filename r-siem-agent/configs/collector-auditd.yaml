@@ -1,0 +1,12 @@
+log_level: INFO
+
+jetstream:
+  url: nats://127.0.0.1:4222
+  stream: RSIEM_EVENTS
+  subject: rsiem.events.raw
+
+collector:
+  path: /var/log/audit/audit.log
+  checkpoint_path: /var/lib/rsiem/auditd.checkpoint
+  poll_ms: 500
+  source_type: auditd_exec

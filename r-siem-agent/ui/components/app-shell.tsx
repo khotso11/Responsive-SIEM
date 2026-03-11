@@ -5,7 +5,7 @@ import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Activity, BarChart3, Clock3, ListChecks, Search, ShieldCheck, UserCircle2, Zap } from "lucide-react";
 import { ReactNode, useEffect, useMemo, useState } from "react";
 import { getStreamURL, login, logout, me, setAuthToken } from "@/lib/api";
-import { emitIncidentsUpdated } from "@/lib/events";
+import { AUTH_REQUIRED_EVENT, emitIncidentsUpdated } from "@/lib/events";
 import { AuthUser } from "@/lib/types";
 
 const NAV = [
@@ -110,6 +110,17 @@ export function AppShell({ children }: { children: ReactNode }) {
       cancelled = true;
     };
   }, [searchParams]);
+
+  useEffect(() => {
+    const onAuthRequired = () => {
+      setAuthUser(null);
+      setAuthLoading(false);
+      setLoginErr("Session expired. Please log in again.");
+      setLoginPass("");
+    };
+    window.addEventListener(AUTH_REQUIRED_EVENT, onAuthRequired);
+    return () => window.removeEventListener(AUTH_REQUIRED_EVENT, onAuthRequired);
+  }, []);
 
   useEffect(() => {
     if (!live || !authUser) {
@@ -238,8 +249,8 @@ export function AppShell({ children }: { children: ReactNode }) {
   }
 
   return (
-    <div className="h-screen overflow-hidden px-4 py-4 md:px-8">
-      <div className="mx-auto flex h-full max-w-[1400px] flex-col">
+    <div className="h-screen overflow-hidden px-2 py-2 md:px-4 md:py-4">
+      <div className="flex h-full w-full min-w-0 flex-col">
       <header className="panel mb-4 shrink-0 p-4">
         <div className="mb-4 flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
           <div>
@@ -317,7 +328,7 @@ export function AppShell({ children }: { children: ReactNode }) {
         </div>
       </header>
 
-      <div className="grid min-h-0 flex-1 grid-cols-1 gap-4 md:grid-cols-[260px_1fr]">
+      <div className="grid min-h-0 flex-1 grid-cols-1 gap-4 md:grid-cols-[280px_minmax(0,1fr)]">
         <aside className="panel overflow-auto p-3">
           <nav className="space-y-1.5">
             {NAV.map((item) => {
@@ -344,7 +355,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           </nav>
         </aside>
 
-        <main className="panel min-h-0 overflow-auto p-4 md:p-5">{children}</main>
+        <main className="panel min-h-0 overflow-auto p-3 md:p-5">{children}</main>
       </div>
       </div>
     </div>

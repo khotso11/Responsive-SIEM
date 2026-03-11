@@ -72,6 +72,13 @@ if ! id "$SERVICE_USER" >/dev/null 2>&1; then
   useradd --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
 fi
 
+if getent group adm >/dev/null 2>&1; then
+  usermod -a -G adm "$SERVICE_USER" || true
+fi
+if getent group audit >/dev/null 2>&1; then
+  usermod -a -G audit "$SERVICE_USER" || true
+fi
+
 SERVICE_GROUP="$(id -gn "$SERVICE_USER")"
 
 mkdir -p "$INSTALL_DIR/bin" "$ETC_DIR/configs" "$ETC_DIR/pki" "$DATA_DIR" "$LOG_DIR"
@@ -104,6 +111,38 @@ if ! copy_first "$INSTALL_DIR/bin/collector-tail" \
   "$CONFIG_DIR/collector-tail-linux-amd64"; then
   echo "FAIL: could not find collector-tail binary in $CONFIG_DIR" >&2
   exit 1
+fi
+
+HAS_COLLECTOR_AUDITD=0
+if copy_first "$INSTALL_DIR/bin/collector-auditd" \
+  "$CONFIG_DIR/bin/collector-auditd" \
+  "$CONFIG_DIR/collector-auditd"; then
+  HAS_COLLECTOR_AUDITD=1
+  echo "Installed optional collector-auditd binary"
+fi
+
+HAS_COLLECTOR_INOTIFY=0
+if copy_first "$INSTALL_DIR/bin/collector-inotify" \
+  "$CONFIG_DIR/bin/collector-inotify" \
+  "$CONFIG_DIR/collector-inotify"; then
+  HAS_COLLECTOR_INOTIFY=1
+  echo "Installed optional collector-inotify binary"
+fi
+
+HAS_COLLECTOR_PROCNET=0
+if copy_first "$INSTALL_DIR/bin/collector-procnet" \
+  "$CONFIG_DIR/bin/collector-procnet" \
+  "$CONFIG_DIR/collector-procnet"; then
+  HAS_COLLECTOR_PROCNET=1
+  echo "Installed optional collector-procnet binary"
+fi
+
+HAS_COLLECTOR_DNS=0
+if copy_first "$INSTALL_DIR/bin/collector-dns" \
+  "$CONFIG_DIR/bin/collector-dns" \
+  "$CONFIG_DIR/collector-dns"; then
+  HAS_COLLECTOR_DNS=1
+  echo "Installed optional collector-dns binary"
 fi
 
 if copy_first "$INSTALL_DIR/bin/collector-syslog" \
@@ -182,6 +221,22 @@ tail:
   poll_ms: 200
 CFG
 
+copy_config_if_present() {
+  local name="$1"
+  if [[ -f "$CONFIG_DIR/configs/$name" ]]; then
+    cp "$CONFIG_DIR/configs/$name" "$ETC_DIR/configs/$name"
+  elif [[ -f "$ROOT_DIR/configs/$name" ]]; then
+    cp "$ROOT_DIR/configs/$name" "$ETC_DIR/configs/$name"
+  fi
+}
+
+copy_config_if_present "collector-auditd.yaml"
+copy_config_if_present "collector-inotify.yaml"
+copy_config_if_present "collector-procnet.yaml"
+copy_config_if_present "collector-dns.yaml"
+if [[ -f "$ROOT_DIR/scripts/deploy/linux/rsiem-audit-execve.rules" ]]; then
+  cp "$ROOT_DIR/scripts/deploy/linux/rsiem-audit-execve.rules" "$ETC_DIR/configs/rsiem-audit-execve.rules"
+fi
 if [[ -f "$CONFIG_DIR/configs/collector-syslog.yaml" ]]; then
   cp "$CONFIG_DIR/configs/collector-syslog.yaml" "$ETC_DIR/configs/collector-syslog.yaml"
 elif [[ -f "$ROOT_DIR/configs/collector-syslog.yaml" ]]; then
@@ -204,6 +259,18 @@ render_unit() {
 
 render_unit "$ROOT_DIR/scripts/deploy/linux/rsiem-agent.service" /etc/systemd/system/rsiem-agent.service
 render_unit "$ROOT_DIR/scripts/deploy/linux/rsiem-collector-tail.service" /etc/systemd/system/rsiem-collector-tail.service
+if [[ "$HAS_COLLECTOR_AUDITD" == "1" ]]; then
+  render_unit "$ROOT_DIR/scripts/deploy/linux/rsiem-collector-auditd.service" /etc/systemd/system/rsiem-collector-auditd.service
+fi
+if [[ "$HAS_COLLECTOR_INOTIFY" == "1" ]]; then
+  render_unit "$ROOT_DIR/scripts/deploy/linux/rsiem-collector-inotify.service" /etc/systemd/system/rsiem-collector-inotify.service
+fi
+if [[ "$HAS_COLLECTOR_PROCNET" == "1" ]]; then
+  render_unit "$ROOT_DIR/scripts/deploy/linux/rsiem-collector-procnet.service" /etc/systemd/system/rsiem-collector-procnet.service
+fi
+if [[ "$HAS_COLLECTOR_DNS" == "1" ]]; then
+  render_unit "$ROOT_DIR/scripts/deploy/linux/rsiem-collector-dns.service" /etc/systemd/system/rsiem-collector-dns.service
+fi
 
 systemctl daemon-reload
 systemctl enable --now rsiem-agent.service
@@ -214,7 +281,19 @@ PASS: linux endpoint install completed
 AGENT_ID=${AGENT_ID}
 MASTER_ADDR=${MASTER_ADDR}
 NATS_URL=${NATS_URL}
-OPTIONAL: to enable syslog collector, install collector-syslog binary and enable rsiem-collector-syslog.service (if present).
+OPTIONAL collectors:
+  systemctl enable --now rsiem-collector-auditd.service
+  systemctl enable --now rsiem-collector-inotify.service
+  systemctl enable --now rsiem-collector-procnet.service
+  systemctl enable --now rsiem-collector-dns.service
+  systemctl enable --now rsiem-collector-syslog.service (if present)
+Optional auditd execve rules:
+  if auditd is installed:
+    mkdir -p /etc/audit/rules.d
+    cp ${ETC_DIR}/configs/rsiem-audit-execve.rules /etc/audit/rules.d/rsiem-execve.rules
+    augenrules --load
+  if /etc/audit/rules.d or augenrules is missing:
+    install auditd first, then load the rule
 
 Health checks:
   systemctl status rsiem-agent --no-pager

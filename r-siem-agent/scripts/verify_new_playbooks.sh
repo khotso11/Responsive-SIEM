@@ -151,10 +151,15 @@ for item in "${playbooks[@]}"; do
   run_id="$(printf '%s\n' "$run_created_line" | sed -n 's/.*"run_id":"\([^"]*\)".*/\1/p' | head -n 1)"
   [[ -n "$run_id" ]] || fail_with_context "failed to parse run_id for ${playbook_id}"
 
-  waiting_line="$(wait_match_rg "$LOG_MASTER" "$base_master" "\"msg\":\"response_run_waiting_approval\".*\"run_id\":\"${run_id}\"" 20 || true)"
-  [[ -n "$waiting_line" ]] || fail_with_context "missing waiting_approval for ${playbook_id} run_id=${run_id}"
-
-  nats pub rsiem.response.approvals "{\"run_id\":\"${run_id}\",\"decision\":\"approve\",\"actor\":\"verify_new_playbooks\"}" >/dev/null
+  waiting_line="$(wait_match_rg "$LOG_MASTER" "$base_master" "\"msg\":\"response_run_waiting_approval\".*\"run_id\":\"${run_id}\"" 5 || true)"
+  if [[ -n "$waiting_line" ]]; then
+    nats pub rsiem.response.approvals "{\"run_id\":\"${run_id}\",\"decision\":\"approve\",\"actor\":\"verify_new_playbooks\"}" >/dev/null
+  else
+    approval_policy_line="$(wait_match_rg "$LOG_MASTER" "$base_master" "\"msg\":\"approval_policy_evaluated\".*\"run_id\":\"${run_id}\"" 10 || true)"
+    [[ -n "$approval_policy_line" ]] || fail_with_context "missing approval policy line for ${playbook_id} run_id=${run_id}"
+    printf '%s\n' "$approval_policy_line" | rg -q '"approval_required":false' \
+      || fail_with_context "missing waiting_approval for ${playbook_id} run_id=${run_id}"
+  fi
 
   run_updated_line="$(wait_match_rg "$LOG_MASTER" "$base_master" "\"msg\":\"response_run_updated\".*\"run_id\":\"${run_id}\".*\"status\":\"${expected_status}\"" 60 || true)"
   [[ -n "$run_updated_line" ]] || fail_with_context "missing terminal run_updated ${expected_status} for ${playbook_id} run_id=${run_id}"

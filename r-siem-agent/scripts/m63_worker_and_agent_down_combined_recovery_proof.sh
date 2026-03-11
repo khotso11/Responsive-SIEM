@@ -42,7 +42,19 @@ worker_logs() {
 }
 
 external_agent_pids() {
-  pgrep -af 'cmd/agent' | awk '{print $1}' || true
+  ps -eo pid=,args= | awk '
+    {
+      line=$0
+      sub(/^[[:space:]]+/, "", line)
+      if (line == "") next
+      pid=line
+      sub(/[[:space:]].*$/, "", pid)
+      cmd=line
+      sub(/^[0-9]+[[:space:]]+/, "", cmd)
+      if (cmd ~ /(^|[[:space:]])(rg|grep|pgrep|awk|sed)([[:space:]]|$)/) next
+      if (cmd ~ /cmd\/agent/ || cmd ~ /\/agent([[:space:]]|$)/) print pid
+    }
+  ' || true
 }
 
 start_agent() {

@@ -7,6 +7,7 @@ export function StatusBadge({ status }: { status?: string }) {
   if (s === "SUCCEEDED") return <span className="badge-good">SUCCEEDED</span>;
   if (s === "FAILED_SAFE") return <span className="badge-bad">FAILED_SAFE</span>;
   if (s === "WAITING_APPROVAL") return <span className="badge-warn">WAITING_APPROVAL</span>;
+  if (s === "MANUAL_REVIEW_REQUIRED") return <span className="badge-warn">MANUAL_REVIEW_REQUIRED</span>;
   if (s === "FAILED_TRANSIENT") return <span className="badge-warn">FAILED_TRANSIENT</span>;
   if (s === "RUNNING") return <span className="badge-info">RUNNING</span>;
   return <span className="badge" style={{ background: "rgba(30,42,68,0.65)", color: "#E7ECFF" }}>{s}</span>;

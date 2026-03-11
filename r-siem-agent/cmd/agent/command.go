@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +26,10 @@ const (
 	defaultCmdTimeoutMs    = 3000
 	defaultOutputLimitByte = 4096
 	safeDeniedClass        = "SAFE_DENIED"
+	defaultAuthControlRoot = "/var/lib/rsiem/auth_controls"
+	defaultScopedContainmentRoot = "/var/lib/rsiem/containment_controls"
+	defaultCommandResultRoot     = "/var/lib/rsiem/command_results"
+	defaultCommandReplySpoolRoot = "/var/lib/rsiem/command_reply_spool"
 )
 
 type commandRequest struct {
@@ -54,10 +59,37 @@ type commandResultCache struct {
 	entries map[string]*commandResultCacheEntry
 }
 
+type commandResultStore struct {
+	root string
+}
+
+type commandReplySpool struct {
+	root string
+}
+
 type commandResultCacheEntry struct {
 	reply     []byte
 	ready     chan struct{}
 	createdAt time.Time
+}
+
+type persistedCommandResult struct {
+	Version         int             `json:"version"`
+	Key             string          `json:"key"`
+	RunID           string          `json:"run_id,omitempty"`
+	StepID          string          `json:"step_id,omitempty"`
+	Reply           json.RawMessage `json:"reply"`
+	CreatedAtUnixMs int64           `json:"created_at_unix_ms"`
+}
+
+type persistedCommandReplyEnvelope struct {
+	Version         int             `json:"version"`
+	Key             string          `json:"key"`
+	RunID           string          `json:"run_id,omitempty"`
+	StepID          string          `json:"step_id,omitempty"`
+	ReplySubject    string          `json:"reply_subject"`
+	Reply           json.RawMessage `json:"reply"`
+	CreatedAtUnixMs int64           `json:"created_at_unix_ms"`
 }
 
 func newCommandResultCache(ttl time.Duration) *commandResultCache {
@@ -145,6 +177,200 @@ func (c *commandResultCache) abort(key string) {
 	}
 }
 
+func newCommandResultStore() *commandResultStore {
+	root := strings.TrimSpace(os.Getenv("RSIEM_AGENT_COMMAND_RESULT_ROOT"))
+	if root == "" {
+		root = defaultCommandResultRoot
+	}
+	return &commandResultStore{root: root}
+}
+
+func (s *commandResultStore) enabled() bool {
+	return s != nil && strings.TrimSpace(s.root) != ""
+}
+
+func (s *commandResultStore) load(key string) ([]byte, error) {
+	if !s.enabled() || strings.TrimSpace(key) == "" {
+		return nil, nil
+	}
+	data, err := os.ReadFile(s.pathFor(key))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var record persistedCommandResult
+	if err := json.Unmarshal(data, &record); err != nil {
+		return nil, err
+	}
+	if record.Key != key || len(record.Reply) == 0 {
+		return nil, nil
+	}
+	out := make([]byte, len(record.Reply))
+	copy(out, record.Reply)
+	return out, nil
+}
+
+func (s *commandResultStore) save(key, runID, stepID string, reply []byte) error {
+	if !s.enabled() || strings.TrimSpace(key) == "" || len(reply) == 0 {
+		return nil
+	}
+	if err := os.MkdirAll(s.root, 0o700); err != nil {
+		return err
+	}
+	record := persistedCommandResult{
+		Version:         1,
+		Key:             key,
+		RunID:           strings.TrimSpace(runID),
+		StepID:          strings.TrimSpace(stepID),
+		Reply:           append(json.RawMessage(nil), reply...),
+		CreatedAtUnixMs: time.Now().UnixMilli(),
+	}
+	data, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(s.root, "cmd-result-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		_ = os.Remove(tmpPath)
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, s.pathFor(key))
+}
+
+func (s *commandResultStore) pathFor(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return filepath.Join(s.root, fmt.Sprintf("%x.json", sum))
+}
+
+func newCommandReplySpool() *commandReplySpool {
+	root := strings.TrimSpace(os.Getenv("RSIEM_AGENT_COMMAND_REPLY_SPOOL_ROOT"))
+	if root == "" {
+		root = defaultCommandReplySpoolRoot
+	}
+	return &commandReplySpool{root: root}
+}
+
+func (s *commandReplySpool) enabled() bool {
+	return s != nil && strings.TrimSpace(s.root) != ""
+}
+
+func (s *commandReplySpool) enqueue(key, runID, stepID, replySubject string, reply []byte) error {
+	if !s.enabled() || strings.TrimSpace(key) == "" || strings.TrimSpace(replySubject) == "" || len(reply) == 0 {
+		return nil
+	}
+	if err := os.MkdirAll(s.root, 0o700); err != nil {
+		return err
+	}
+	record := persistedCommandReplyEnvelope{
+		Version:         1,
+		Key:             key,
+		RunID:           strings.TrimSpace(runID),
+		StepID:          strings.TrimSpace(stepID),
+		ReplySubject:    strings.TrimSpace(replySubject),
+		Reply:           append(json.RawMessage(nil), reply...),
+		CreatedAtUnixMs: time.Now().UnixMilli(),
+	}
+	data, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(s.root, "cmd-reply-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		_ = os.Remove(tmpPath)
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, s.pathFor(key))
+}
+
+func (s *commandReplySpool) flush(publish func(subject string, data []byte) error) error {
+	if !s.enabled() {
+		return nil
+	}
+	entries, err := os.ReadDir(s.root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(s.root, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		var env persistedCommandReplyEnvelope
+		if err := json.Unmarshal(data, &env); err != nil {
+			return err
+		}
+		if strings.TrimSpace(env.ReplySubject) == "" || len(env.Reply) == 0 {
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			continue
+		}
+		if err := publish(env.ReplySubject, env.Reply); err != nil {
+			return err
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *commandReplySpool) pathFor(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return filepath.Join(s.root, fmt.Sprintf("%x.json", sum))
+}
+
+func publishReply(logger *slog.Logger, spool *commandReplySpool, publish func(subject string, data []byte) error, replySubject, cacheKey, runID, stepID string, data []byte) {
+	if strings.TrimSpace(replySubject) == "" || len(data) == 0 {
+		return
+	}
+	if err := publish(replySubject, data); err != nil {
+		if logger != nil {
+			logger.LogAttrs(context.Background(), slog.LevelWarn, "agent_command_reply_publish_failed",
+				slog.String("run_id", strings.TrimSpace(runID)),
+				slog.String("step_id", strings.TrimSpace(stepID)),
+				slog.String("error", err.Error()),
+			)
+		}
+		if spoolErr := spool.enqueue(cacheKey, runID, stepID, replySubject, data); spoolErr != nil && logger != nil {
+			logger.LogAttrs(context.Background(), slog.LevelWarn, "agent_command_reply_spool_enqueue_failed",
+				slog.String("run_id", strings.TrimSpace(runID)),
+				slog.String("step_id", strings.TrimSpace(stepID)),
+				slog.String("error", spoolErr.Error()),
+			)
+		}
+	}
+}
+
 type execSpec struct {
 	Command        string
 	Args           []string
@@ -223,6 +449,51 @@ type quarantineRecord struct {
 	CreatedAtUnixMs int64  `json:"created_at_unix_ms"`
 }
 
+type authControlRecord struct {
+	Version               int    `json:"version"`
+	RunID                 string `json:"run_id"`
+	NodeID                string `json:"node_id,omitempty"`
+	UserName              string `json:"user_name,omitempty"`
+	SrcIP                 string `json:"src_ip,omitempty"`
+	Status                string `json:"status"`
+	Reason                string `json:"reason,omitempty"`
+	ContainedSrcIP        bool   `json:"contained_src_ip"`
+	ContainedUserAccess   bool   `json:"contained_user_access"`
+	RestoredSrcIP         bool   `json:"restored_src_ip"`
+	RestoredUserAccess    bool   `json:"restored_user_access"`
+	ContainedAtUnixMs     int64  `json:"contained_at_unix_ms,omitempty"`
+	ExpiresAtUnixMs       int64  `json:"expires_at_unix_ms,omitempty"`
+	Verified              bool   `json:"verified"`
+	VerifiedBy            string `json:"verified_by,omitempty"`
+	VerificationMethod    string `json:"verification_method,omitempty"`
+	VerificationReference string `json:"verification_reference,omitempty"`
+	VerificationNotes     string `json:"verification_notes,omitempty"`
+	VerifiedAtUnixMs      int64  `json:"verified_at_unix_ms,omitempty"`
+	RestoredAtUnixMs      int64  `json:"restored_at_unix_ms,omitempty"`
+	LastUpdatedAtUnixMs   int64  `json:"last_updated_at_unix_ms,omitempty"`
+}
+
+type scopedContainmentRecord struct {
+	Version             int    `json:"version"`
+	RunID               string `json:"run_id"`
+	Kind                string `json:"kind"`
+	NodeID              string `json:"node_id,omitempty"`
+	DstIP               string `json:"dst_ip,omitempty"`
+	ExecPath            string `json:"exec_path,omitempty"`
+	Comm                string `json:"comm,omitempty"`
+	Cmdline             string `json:"cmdline,omitempty"`
+	ExecSHA256          string `json:"exec_sha256,omitempty"`
+	SignerHint          string `json:"signer_hint,omitempty"`
+	Reason              string `json:"reason,omitempty"`
+	Status              string `json:"status"`
+	Contained           bool   `json:"contained"`
+	Restored            bool   `json:"restored"`
+	ContainedAtUnixMs   int64  `json:"contained_at_unix_ms,omitempty"`
+	ExpiresAtUnixMs     int64  `json:"expires_at_unix_ms,omitempty"`
+	RestoredAtUnixMs    int64  `json:"restored_at_unix_ms,omitempty"`
+	LastUpdatedAtUnixMs int64  `json:"last_updated_at_unix_ms,omitempty"`
+}
+
 type safeDeniedError struct {
 	reason string
 }
@@ -263,6 +534,15 @@ func newCommandExecutor(logger *slog.Logger, policy quarantinePolicy) *commandEx
 			"uname":                          {Command: "uname", Args: []string{"-a"}},
 			"quarantine_move":                {},
 			"quarantine_restore":             {},
+			"auth_contain_src_ip":            {},
+			"auth_contain_user_access":       {},
+			"auth_mark_user_verified":        {},
+			"auth_restore_src_ip":            {},
+			"auth_restore_user_access":       {},
+			"contain_destination_ip":         {},
+			"restore_destination_ip":         {},
+			"contain_process_exec":           {},
+			"restore_process_exec":           {},
 			"contain_bruteforce_ip":          {},
 			"lockdown_privesc":               {},
 			"halt_lateral_movement":          {},
@@ -370,6 +650,34 @@ func (e *commandExecutor) handle(ctx context.Context, req commandRequest) comman
 		return reply
 	}
 
+	if isAuthControlCommand(actionKey) {
+		reply := e.executeAuthControlCommand(req, actionKey)
+		e.logger.LogAttrs(context.Background(), slog.LevelInfo, "agent_command_exec_done",
+			slog.String("run_id", runID),
+			slog.String("step_id", stepID),
+			slog.String("command_id", actionKey),
+			slog.Int("exit_code", reply.ExitCode),
+			slog.Int64("duration_ms", reply.DurationMs),
+			slog.Bool("stdout_truncated", reply.TruncatedStdout),
+			slog.Bool("stderr_truncated", reply.TruncatedStderr),
+		)
+		return reply
+	}
+
+	if isScopedContainmentCommand(actionKey) {
+		reply := e.executeScopedContainmentCommand(req, actionKey)
+		e.logger.LogAttrs(context.Background(), slog.LevelInfo, "agent_command_exec_done",
+			slog.String("run_id", runID),
+			slog.String("step_id", stepID),
+			slog.String("command_id", actionKey),
+			slog.Int("exit_code", reply.ExitCode),
+			slog.Int64("duration_ms", reply.DurationMs),
+			slog.Bool("stdout_truncated", reply.TruncatedStdout),
+			slog.Bool("stderr_truncated", reply.TruncatedStderr),
+		)
+		return reply
+	}
+
 	if category, ok := markerCommandCategory(actionKey); ok {
 		reply := e.executeMarkerCommand(req, actionKey, category)
 		e.logger.LogAttrs(context.Background(), slog.LevelInfo, "agent_command_exec_done",
@@ -474,11 +782,36 @@ func runCommandListener(ctx context.Context, logger *slog.Logger, natsURL string
 
 	executor := newCommandExecutor(logger, policy)
 	cache := newCommandResultCache(2 * time.Minute)
+	store := newCommandResultStore()
+	replySpool := newCommandReplySpool()
+	publishFn := func(subject string, data []byte) error {
+		if err := nc.Publish(subject, data); err != nil {
+			return err
+		}
+		return nc.Flush()
+	}
 	localAgentID = strings.TrimSpace(localAgentID)
 	subjects := []string{agentCommandSubject}
 	if localAgentID != "" {
 		subjects = append(subjects, agentCommandSubject+"."+localAgentID)
 	}
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := replySpool.flush(publishFn); err != nil && logger != nil {
+					logger.LogAttrs(context.Background(), slog.LevelDebug, "agent_command_reply_spool_flush_retry",
+						slog.String("error", err.Error()),
+					)
+				}
+			}
+		}
+	}()
+
 	handler := func(msg *nats.Msg) {
 		if msg.Reply == "" {
 			return
@@ -495,17 +828,28 @@ func runCommandListener(ctx context.Context, logger *slog.Logger, natsURL string
 		if strings.TrimSpace(req.RunID) != "" && strings.TrimSpace(req.StepID) != "" {
 			cacheKey = strings.TrimSpace(req.RunID) + "|" + strings.TrimSpace(req.StepID)
 		}
+		if persistedReply, err := store.load(cacheKey); err != nil {
+			logger.LogAttrs(context.Background(), slog.LevelWarn, "agent_command_result_store_load_failed",
+				slog.String("run_id", strings.TrimSpace(req.RunID)),
+				slog.String("step_id", strings.TrimSpace(req.StepID)),
+				slog.String("error", err.Error()),
+			)
+		} else if len(persistedReply) > 0 {
+			cache.finish(cacheKey, persistedReply)
+			publishReply(logger, replySpool, publishFn, msg.Reply, cacheKey, req.RunID, req.StepID, persistedReply)
+			return
+		}
 		cachedReply, wait, execute := cache.begin(cacheKey)
 		if !execute {
 			if cachedReply != nil {
-				_ = nc.Publish(msg.Reply, cachedReply)
+				publishReply(logger, replySpool, publishFn, msg.Reply, cacheKey, req.RunID, req.StepID, cachedReply)
 				return
 			}
 			if wait != nil {
 				<-wait
 				cachedReply = cache.lookup(cacheKey)
 				if cachedReply != nil {
-					_ = nc.Publish(msg.Reply, cachedReply)
+					publishReply(logger, replySpool, publishFn, msg.Reply, cacheKey, req.RunID, req.StepID, cachedReply)
 				}
 				return
 			}
@@ -516,8 +860,15 @@ func runCommandListener(ctx context.Context, logger *slog.Logger, natsURL string
 			cache.abort(cacheKey)
 			return
 		}
+		if err := store.save(cacheKey, req.RunID, req.StepID, data); err != nil {
+			logger.LogAttrs(context.Background(), slog.LevelWarn, "agent_command_result_store_save_failed",
+				slog.String("run_id", strings.TrimSpace(req.RunID)),
+				slog.String("step_id", strings.TrimSpace(req.StepID)),
+				slog.String("error", err.Error()),
+			)
+		}
 		cache.finish(cacheKey, data)
-		_ = nc.Publish(msg.Reply, data)
+		publishReply(logger, replySpool, publishFn, msg.Reply, cacheKey, req.RunID, req.StepID, data)
 	}
 	subs := make([]*nats.Subscription, 0, len(subjects))
 	for _, subject := range subjects {
@@ -840,6 +1191,514 @@ func markerCommandCategory(commandID string) (string, bool) {
 	}
 }
 
+func isAuthControlCommand(commandID string) bool {
+	switch commandID {
+	case "auth_contain_src_ip", "auth_contain_user_access", "auth_mark_user_verified", "auth_restore_src_ip", "auth_restore_user_access":
+		return true
+	default:
+		return false
+	}
+}
+
+func isScopedContainmentCommand(commandID string) bool {
+	switch commandID {
+	case "contain_destination_ip", "restore_destination_ip", "contain_process_exec", "restore_process_exec":
+		return true
+	default:
+		return false
+	}
+}
+
+func authControlRoot() string {
+	val := strings.TrimSpace(os.Getenv("RSIEM_AGENT_AUTH_CONTROL_ROOT"))
+	if val == "" {
+		return defaultAuthControlRoot
+	}
+	return val
+}
+
+func scopedContainmentRoot() string {
+	val := strings.TrimSpace(os.Getenv("RSIEM_AGENT_SCOPED_CONTAINMENT_ROOT"))
+	if val == "" {
+		return defaultScopedContainmentRoot
+	}
+	return val
+}
+
+func (e *commandExecutor) executeAuthControlCommand(req commandRequest, commandID string) commandReply {
+	start := time.Now()
+	runID := strings.TrimSpace(req.RunID)
+	if runID == "" || runID != filepath.Base(runID) || strings.Contains(runID, string(filepath.Separator)) {
+		return commandReply{
+			Status:     "error",
+			ExitCode:   3,
+			DurationMs: time.Since(start).Milliseconds(),
+			Stderr:     "safe_denied:invalid_run_id",
+			ErrorClass: safeDeniedClass,
+		}
+	}
+
+	root, err := ensureResolvedDirectoryAllowAbs(authControlRoot(), "", true)
+	if err != nil {
+		return commandReply{
+			Status:     "error",
+			ExitCode:   3,
+			DurationMs: time.Since(start).Milliseconds(),
+			Stderr:     "safe_denied:invalid_auth_control_root",
+			ErrorClass: safeDeniedClass,
+		}
+	}
+
+	nowMs := time.Now().UnixMilli()
+	record, recordPath, err := loadOrFindAuthControlRecord(root, req, commandID)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return commandReply{
+			Status:     "error",
+			ExitCode:   3,
+			DurationMs: time.Since(start).Milliseconds(),
+			Stderr:     err.Error(),
+			ErrorClass: safeDeniedClass,
+		}
+	}
+	if recordPath == "" {
+		recordPath = filepath.Join(root, runID+".json")
+	}
+	if record.RunID == "" {
+		record = authControlRecord{
+			Version: 1,
+			RunID:   runID,
+			NodeID:  strings.TrimSpace(stringParam(req.Params, "node_id")),
+			UserName: strings.TrimSpace(
+				chooseFirstNonEmpty(
+					stringParam(req.Params, "user_name"),
+					stringParam(req.Params, "user"),
+				),
+			),
+			SrcIP: strings.TrimSpace(stringParam(req.Params, "src_ip")),
+		}
+	}
+	if record.NodeID == "" {
+		record.NodeID = strings.TrimSpace(stringParam(req.Params, "node_id"))
+	}
+	if record.UserName == "" {
+		record.UserName = strings.TrimSpace(chooseFirstNonEmpty(stringParam(req.Params, "user_name"), stringParam(req.Params, "user")))
+	}
+	if record.SrcIP == "" {
+		record.SrcIP = strings.TrimSpace(stringParam(req.Params, "src_ip"))
+	}
+
+	switch commandID {
+	case "auth_contain_src_ip":
+		if record.SrcIP == "" {
+			record.SrcIP = strings.TrimSpace(req.Target)
+		}
+		if record.SrcIP == "" || net.ParseIP(record.SrcIP) == nil {
+			return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:invalid_src_ip", ErrorClass: safeDeniedClass}
+		}
+		durationMs, set, err := intParam(req.Params, "duration_ms")
+		if err != nil || (set && durationMs <= 0) {
+			return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:invalid_duration_ms", ErrorClass: safeDeniedClass}
+		}
+		if !set {
+			durationMs = 900000
+		}
+		record.ContainedSrcIP = true
+		record.Status = "contained"
+		record.Reason = chooseFirstNonEmpty(stringParam(req.Params, "reason"), record.Reason)
+		if record.ContainedAtUnixMs == 0 {
+			record.ContainedAtUnixMs = nowMs
+		}
+		record.ExpiresAtUnixMs = nowMs + durationMs
+	case "auth_contain_user_access":
+		if record.UserName == "" {
+			return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:missing_user_name", ErrorClass: safeDeniedClass}
+		}
+		durationMs, set, err := intParam(req.Params, "duration_ms")
+		if err != nil || (set && durationMs <= 0) {
+			return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:invalid_duration_ms", ErrorClass: safeDeniedClass}
+		}
+		if !set {
+			durationMs = 900000
+		}
+		record.ContainedUserAccess = true
+		record.Status = "contained"
+		record.Reason = chooseFirstNonEmpty(stringParam(req.Params, "reason"), record.Reason)
+		if record.ContainedAtUnixMs == 0 {
+			record.ContainedAtUnixMs = nowMs
+		}
+		record.ExpiresAtUnixMs = nowMs + durationMs
+	case "auth_mark_user_verified":
+		if record.RunID == "" {
+			return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:containment_record_missing", ErrorClass: safeDeniedClass}
+		}
+		method := strings.TrimSpace(stringParam(req.Params, "verification_method"))
+		ref := strings.TrimSpace(stringParam(req.Params, "verification_reference"))
+		if method == "" {
+			return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:missing_verification_method", ErrorClass: safeDeniedClass}
+		}
+		if ref == "" {
+			return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:missing_verification_reference", ErrorClass: safeDeniedClass}
+		}
+		record.Verified = true
+		record.VerifiedBy = chooseFirstNonEmpty(stringParam(req.Params, "verified_by"), stringParam(req.Params, "actor"), record.VerifiedBy)
+		record.VerificationMethod = method
+		record.VerificationReference = ref
+		record.VerificationNotes = chooseFirstNonEmpty(stringParam(req.Params, "notes"), record.VerificationNotes)
+		record.VerifiedAtUnixMs = nowMs
+		if record.Status == "" {
+			record.Status = "verified"
+		}
+	case "auth_restore_src_ip":
+		if record.RunID == "" {
+			return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:containment_record_missing", ErrorClass: safeDeniedClass}
+		}
+		if !record.Verified {
+			return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:verification_required", ErrorClass: safeDeniedClass}
+		}
+		if !record.ContainedSrcIP {
+			return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:src_ip_not_contained", ErrorClass: safeDeniedClass}
+		}
+		record.RestoredSrcIP = true
+	case "auth_restore_user_access":
+		if record.RunID == "" {
+			return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:containment_record_missing", ErrorClass: safeDeniedClass}
+		}
+		if !record.Verified {
+			return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:verification_required", ErrorClass: safeDeniedClass}
+		}
+		if !record.ContainedUserAccess {
+			return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:user_access_not_contained", ErrorClass: safeDeniedClass}
+		}
+		record.RestoredUserAccess = true
+	}
+
+	if (record.ContainedSrcIP && record.RestoredSrcIP || !record.ContainedSrcIP) &&
+		(record.ContainedUserAccess && record.RestoredUserAccess || !record.ContainedUserAccess) &&
+		(record.RestoredSrcIP || record.RestoredUserAccess) {
+		record.Status = "restored"
+		record.RestoredAtUnixMs = nowMs
+	} else if record.Verified && record.Status == "contained" {
+		record.Status = "verified"
+	}
+	record.LastUpdatedAtUnixMs = nowMs
+
+	if err := writeAuthControlRecord(recordPath, record); err != nil {
+		return commandReply{
+			Status:     "error",
+			ExitCode:   1,
+			DurationMs: time.Since(start).Milliseconds(),
+			Stderr:     err.Error(),
+			ErrorClass: "exec_failed",
+		}
+	}
+	return commandReply{
+		Status:     "ok",
+		ExitCode:   0,
+		DurationMs: time.Since(start).Milliseconds(),
+		Stdout:     recordPath,
+	}
+}
+
+func loadOrFindAuthControlRecord(root string, req commandRequest, commandID string) (authControlRecord, string, error) {
+	containmentRunID := strings.TrimSpace(stringParam(req.Params, "containment_run_id"))
+	if containmentRunID == "" {
+		containmentRunID = strings.TrimSpace(req.RunID)
+	}
+	if containmentRunID != "" && containmentRunID == filepath.Base(containmentRunID) && !strings.Contains(containmentRunID, string(filepath.Separator)) {
+		path := filepath.Join(root, containmentRunID+".json")
+		rec, err := readAuthControlRecord(path)
+		if err == nil {
+			return rec, path, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return authControlRecord{}, "", err
+		}
+		if strings.HasPrefix(commandID, "auth_contain_") {
+			return authControlRecord{}, path, os.ErrNotExist
+		}
+	}
+
+	userName := strings.TrimSpace(chooseFirstNonEmpty(stringParam(req.Params, "user_name"), stringParam(req.Params, "user")))
+	srcIP := strings.TrimSpace(stringParam(req.Params, "src_ip"))
+	if srcIP == "" {
+		srcIP = strings.TrimSpace(req.Target)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return authControlRecord{}, "", os.ErrNotExist
+		}
+		return authControlRecord{}, "", err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(root, entry.Name())
+		rec, err := readAuthControlRecord(path)
+		if err != nil {
+			continue
+		}
+		if rec.Status == "restored" {
+			continue
+		}
+		if userName != "" && rec.UserName == userName {
+			return rec, path, nil
+		}
+		if srcIP != "" && rec.SrcIP == srcIP {
+			return rec, path, nil
+		}
+	}
+	return authControlRecord{}, "", os.ErrNotExist
+}
+
+func readAuthControlRecord(path string) (authControlRecord, error) {
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return authControlRecord{}, denySafe("auth_control_symlink_not_allowed")
+		}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return authControlRecord{}, err
+	}
+	var rec authControlRecord
+	if err := json.Unmarshal(data, &rec); err != nil {
+		return authControlRecord{}, denySafe("auth_control_record_invalid")
+	}
+	return rec, nil
+}
+
+func writeAuthControlRecord(path string, rec authControlRecord) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return denySafe("auth_control_symlink_not_allowed")
+		}
+	}
+	data, err := json.MarshalIndent(rec, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
+}
+
+func (e *commandExecutor) executeScopedContainmentCommand(req commandRequest, commandID string) commandReply {
+	start := time.Now()
+	runID := strings.TrimSpace(req.RunID)
+	if runID == "" || runID != filepath.Base(runID) || strings.Contains(runID, string(filepath.Separator)) {
+		return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:invalid_run_id", ErrorClass: safeDeniedClass}
+	}
+	root, err := ensureResolvedDirectoryAllowAbs(scopedContainmentRoot(), "", true)
+	if err != nil {
+		return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:invalid_scoped_containment_root", ErrorClass: safeDeniedClass}
+	}
+	nowMs := time.Now().UnixMilli()
+	record, recordPath, err := loadOrFindScopedContainmentRecord(root, req, commandID)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: err.Error(), ErrorClass: safeDeniedClass}
+	}
+	if recordPath == "" {
+		recordPath = filepath.Join(root, runID+".json")
+	}
+	if record.RunID == "" {
+		record = scopedContainmentRecord{
+			Version:    1,
+			RunID:      runID,
+			NodeID:     strings.TrimSpace(stringParam(req.Params, "node_id")),
+			DstIP:      strings.TrimSpace(stringParam(req.Params, "dst_ip")),
+			ExecPath:   strings.TrimSpace(stringParam(req.Params, "exec_path")),
+			Comm:       strings.TrimSpace(stringParam(req.Params, "comm")),
+			Cmdline:    strings.TrimSpace(stringParam(req.Params, "cmdline")),
+			ExecSHA256: strings.TrimSpace(stringParam(req.Params, "exec_sha256")),
+			SignerHint: strings.TrimSpace(stringParam(req.Params, "signer_hint")),
+		}
+	}
+	if record.NodeID == "" {
+		record.NodeID = strings.TrimSpace(stringParam(req.Params, "node_id"))
+	}
+	if record.DstIP == "" {
+		record.DstIP = strings.TrimSpace(chooseFirstNonEmpty(stringParam(req.Params, "dst_ip"), req.Target))
+	}
+	if record.ExecPath == "" {
+		record.ExecPath = strings.TrimSpace(stringParam(req.Params, "exec_path"))
+	}
+	if record.Comm == "" {
+		record.Comm = strings.TrimSpace(stringParam(req.Params, "comm"))
+	}
+	if record.Cmdline == "" {
+		record.Cmdline = strings.TrimSpace(stringParam(req.Params, "cmdline"))
+	}
+	if record.ExecSHA256 == "" {
+		record.ExecSHA256 = strings.TrimSpace(stringParam(req.Params, "exec_sha256"))
+	}
+	if record.SignerHint == "" {
+		record.SignerHint = strings.TrimSpace(stringParam(req.Params, "signer_hint"))
+	}
+
+	switch commandID {
+	case "contain_destination_ip":
+		record.Kind = "destination_ip"
+		if record.DstIP == "" || net.ParseIP(record.DstIP) == nil {
+			return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:invalid_dst_ip", ErrorClass: safeDeniedClass}
+		}
+		durationMs, set, err := intParam(req.Params, "duration_ms")
+		if err != nil || (set && durationMs <= 0) {
+			return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:invalid_duration_ms", ErrorClass: safeDeniedClass}
+		}
+		if !set {
+			durationMs = 900000
+		}
+		record.Contained = true
+		record.Status = "contained"
+		record.Reason = chooseFirstNonEmpty(stringParam(req.Params, "reason"), record.Reason)
+		if record.ContainedAtUnixMs == 0 {
+			record.ContainedAtUnixMs = nowMs
+		}
+		record.ExpiresAtUnixMs = nowMs + durationMs
+	case "contain_process_exec":
+		record.Kind = "process_exec"
+		if record.ExecPath == "" && record.Comm == "" {
+			return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:missing_exec_identity", ErrorClass: safeDeniedClass}
+		}
+		durationMs, set, err := intParam(req.Params, "duration_ms")
+		if err != nil || (set && durationMs <= 0) {
+			return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:invalid_duration_ms", ErrorClass: safeDeniedClass}
+		}
+		if !set {
+			durationMs = 900000
+		}
+		record.Contained = true
+		record.Status = "contained"
+		record.Reason = chooseFirstNonEmpty(stringParam(req.Params, "reason"), record.Reason)
+		if record.ContainedAtUnixMs == 0 {
+			record.ContainedAtUnixMs = nowMs
+		}
+		record.ExpiresAtUnixMs = nowMs + durationMs
+	case "restore_destination_ip":
+		if record.RunID == "" {
+			return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:containment_record_missing", ErrorClass: safeDeniedClass}
+		}
+		if record.Kind != "destination_ip" {
+			return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:containment_kind_mismatch", ErrorClass: safeDeniedClass}
+		}
+		if !record.Contained || record.DstIP == "" {
+			return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:destination_not_contained", ErrorClass: safeDeniedClass}
+		}
+		record.Restored = true
+		record.Status = "restored"
+		record.RestoredAtUnixMs = nowMs
+	case "restore_process_exec":
+		if record.RunID == "" {
+			return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:containment_record_missing", ErrorClass: safeDeniedClass}
+		}
+		if record.Kind != "process_exec" {
+			return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:containment_kind_mismatch", ErrorClass: safeDeniedClass}
+		}
+		if !record.Contained || (record.ExecPath == "" && record.Comm == "") {
+			return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:process_not_contained", ErrorClass: safeDeniedClass}
+		}
+		record.Restored = true
+		record.Status = "restored"
+		record.RestoredAtUnixMs = nowMs
+	}
+	record.LastUpdatedAtUnixMs = nowMs
+	if err := writeScopedContainmentRecord(recordPath, record); err != nil {
+		return commandReply{Status: "error", ExitCode: 1, DurationMs: time.Since(start).Milliseconds(), Stderr: err.Error(), ErrorClass: "exec_failed"}
+	}
+	return commandReply{Status: "ok", ExitCode: 0, DurationMs: time.Since(start).Milliseconds(), Stdout: recordPath}
+}
+
+func loadOrFindScopedContainmentRecord(root string, req commandRequest, commandID string) (scopedContainmentRecord, string, error) {
+	containmentRunID := strings.TrimSpace(stringParam(req.Params, "containment_run_id"))
+	if containmentRunID == "" {
+		containmentRunID = strings.TrimSpace(req.RunID)
+	}
+	if containmentRunID != "" && containmentRunID == filepath.Base(containmentRunID) && !strings.Contains(containmentRunID, string(filepath.Separator)) {
+		path := filepath.Join(root, containmentRunID+".json")
+		rec, err := readScopedContainmentRecord(path)
+		if err == nil {
+			return rec, path, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return scopedContainmentRecord{}, "", err
+		}
+		if strings.HasPrefix(commandID, "contain_") {
+			return scopedContainmentRecord{}, path, os.ErrNotExist
+		}
+	}
+	dstIP := strings.TrimSpace(chooseFirstNonEmpty(stringParam(req.Params, "dst_ip"), req.Target))
+	execPath := strings.TrimSpace(stringParam(req.Params, "exec_path"))
+	comm := strings.TrimSpace(stringParam(req.Params, "comm"))
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return scopedContainmentRecord{}, "", os.ErrNotExist
+		}
+		return scopedContainmentRecord{}, "", err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(root, entry.Name())
+		rec, err := readScopedContainmentRecord(path)
+		if err != nil || rec.Status == "restored" {
+			continue
+		}
+		if dstIP != "" && rec.DstIP == dstIP {
+			return rec, path, nil
+		}
+		if execPath != "" && rec.ExecPath == execPath {
+			return rec, path, nil
+		}
+		if comm != "" && rec.Comm == comm {
+			return rec, path, nil
+		}
+	}
+	return scopedContainmentRecord{}, "", os.ErrNotExist
+}
+
+func readScopedContainmentRecord(path string) (scopedContainmentRecord, error) {
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return scopedContainmentRecord{}, denySafe("containment_symlink_not_allowed")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return scopedContainmentRecord{}, err
+	}
+	var rec scopedContainmentRecord
+	if err := json.Unmarshal(data, &rec); err != nil {
+		return scopedContainmentRecord{}, denySafe("containment_record_invalid")
+	}
+	return rec, nil
+}
+
+func writeScopedContainmentRecord(path string, rec scopedContainmentRecord) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return denySafe("containment_symlink_not_allowed")
+	}
+	data, err := json.MarshalIndent(rec, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
+}
+
+func chooseFirstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
 func (e *commandExecutor) executeMarkerCommand(req commandRequest, commandID, category string) commandReply {
 	start := time.Now()
 	runID := strings.TrimSpace(req.RunID)
@@ -1111,7 +1970,11 @@ func resolveRegularFilePath(path string) (string, error) {
 }
 
 func ensureResolvedDirectory(raw, wd string) (string, error) {
-	path, err := normalizeUserPath(raw, wd, true)
+	return ensureResolvedDirectoryAllowAbs(raw, wd, false)
+}
+
+func ensureResolvedDirectoryAllowAbs(raw, wd string, allowAbs bool) (string, error) {
+	path, err := normalizeUserPath(raw, wd, allowAbs)
 	if err != nil {
 		return "", err
 	}

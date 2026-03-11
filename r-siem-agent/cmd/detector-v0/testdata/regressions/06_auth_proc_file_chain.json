@@ -1,0 +1,60 @@
+{
+  "name": "auth process file chain",
+  "events": [
+    {
+      "event": {
+        "event_idem_key": "evt.reg.chain.auth",
+        "observed_at_unix_ms": 1000,
+        "event_type": "auth_failed",
+        "node_id": "node-a",
+        "host": "node-a",
+        "src_ip": "10.0.0.8",
+        "user": "alice",
+        "message": "Failed password for invalid user alice from 10.0.0.8 port 22 ssh2"
+      },
+      "expect": {
+        "matched": true,
+        "rule_id": "R-COLLECT-INVALID-USER"
+      }
+    },
+    {
+      "event": {
+        "event_idem_key": "evt.reg.chain.proc",
+        "observed_at_unix_ms": 2000,
+        "event_type": "process_exec",
+        "source_type": "auditd_exec",
+        "node_id": "node-a",
+        "host": "node-a",
+        "user": "alice",
+        "exec_path": "/usr/bin/nmap",
+        "comm": "nmap",
+        "cmdline": "/usr/bin/nmap --version",
+        "message": "exec=/usr/bin/nmap user=alice"
+      },
+      "expect": {
+        "matched": true,
+        "rule_id": "R-PROC-FIRST-SEEN-SUSPICIOUS"
+      }
+    },
+    {
+      "event": {
+        "event_idem_key": "evt.reg.chain.file",
+        "observed_at_unix_ms": 3000,
+        "event_type": "file_change",
+        "source_type": "inotify",
+        "node_id": "node-a",
+        "host": "node-a",
+        "src_ip": "127.0.0.1",
+        "file_path": "/etc/sudoers",
+        "message": "FILE path=/etc/sudoers action=modify"
+      },
+      "expect": {
+        "matched": true,
+        "rule_id": "R-AUTH-PROC-FILE-CHAIN",
+        "lane": "FAST",
+        "severity": "critical",
+        "group_key": "node-a"
+      }
+    }
+  ]
+}

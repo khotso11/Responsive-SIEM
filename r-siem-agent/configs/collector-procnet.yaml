@@ -1,0 +1,11 @@
+log_level: INFO
+
+jetstream:
+  url: nats://127.0.0.1:4222
+  stream: RSIEM_EVENTS
+  subject: rsiem.events.raw
+
+collector:
+  poll_ms: 1000
+  source_type: proc_net
+  include_loopback: false

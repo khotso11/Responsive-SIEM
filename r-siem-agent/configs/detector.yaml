@@ -13,3 +13,30 @@ cooldown:
   bucket: RSIEM_DETECT_COOLDOWN
 
 cooldown_ms: 60000
+
+baseline:
+  process_first_seen_ttl_ms: 604800000
+  network_first_seen_ttl_ms: 604800000
+
+network:
+  # Known benign public destination that is noisy in this environment.
+  benign_destination_ips:
+    - 192.2.42.182
+  known_bad_destination_ips: []
+  risky_ports:
+    - 22
+    - 23
+    - 3389
+    - 4444
+    - 5555
+  repeat_threshold: 3
+  repeat_window_ms: 30000
+
+dns:
+  known_bad_domains: []
+  suspicious_tlds:
+    - .top
+    - .xyz
+    - .zip
+    - .mov
+    - .cam

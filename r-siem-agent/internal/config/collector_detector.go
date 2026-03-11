@@ -26,9 +26,12 @@ type CollectorConfig struct {
 
 // CollectorJetStreamConfig configures JetStream for collector-tail.
 type CollectorJetStreamConfig struct {
-	URL     string `yaml:"url"`
-	Stream  string `yaml:"stream"`
-	Subject string `yaml:"subject"`
+	URL              string `yaml:"url"`
+	Stream           string `yaml:"stream"`
+	Subject          string `yaml:"subject"`
+	OfflineSpoolPath string `yaml:"offline_spool_path"`
+	OfflineSpoolFsync *bool `yaml:"offline_spool_fsync"`
+	RetryMs          int    `yaml:"retry_ms"`
 }
 
 // CollectorTailConfig configures tailing behavior.
@@ -45,6 +48,9 @@ type DetectorConfig struct {
 	Dedupe     DetectorDedupeConfig    `yaml:"dedupe"`
 	Cooldown   DetectorCooldownConfig  `yaml:"cooldown"`
 	CooldownMs int                     `yaml:"cooldown_ms"`
+	Baseline   DetectorBaselineConfig  `yaml:"baseline"`
+	Network    DetectorNetworkConfig   `yaml:"network"`
+	DNS        DetectorDNSConfig       `yaml:"dns"`
 }
 
 // DetectorJetStreamConfig configures JetStream for detector-v0.
@@ -63,6 +69,27 @@ type DetectorDedupeConfig struct {
 // DetectorCooldownConfig configures detector cooldown KV.
 type DetectorCooldownConfig struct {
 	Bucket string `yaml:"bucket"`
+}
+
+// DetectorNetworkConfig tunes network-connection alert selectivity.
+type DetectorNetworkConfig struct {
+	BenignDestinationIPs   []string `yaml:"benign_destination_ips"`
+	KnownBadDestinationIPs []string `yaml:"known_bad_destination_ips"`
+	RiskyPorts             []int    `yaml:"risky_ports"`
+	RepeatThreshold        int      `yaml:"repeat_threshold"`
+	RepeatWindowMs         int      `yaml:"repeat_window_ms"`
+}
+
+// DetectorBaselineConfig tunes in-memory first-seen tracking.
+type DetectorBaselineConfig struct {
+	ProcessFirstSeenTTLms int `yaml:"process_first_seen_ttl_ms"`
+	NetworkFirstSeenTTLms int `yaml:"network_first_seen_ttl_ms"`
+}
+
+// DetectorDNSConfig tunes DNS detection selectivity.
+type DetectorDNSConfig struct {
+	KnownBadDomains []string `yaml:"known_bad_domains"`
+	SuspiciousTLDs  []string `yaml:"suspicious_tlds"`
 }
 
 // LoadCollector reads and validates the collector configuration from disk.
@@ -120,6 +147,9 @@ func applyCollectorDefaults(c *CollectorConfig) {
 	if strings.TrimSpace(c.JetStream.Subject) == "" {
 		c.JetStream.Subject = defaultEventsSubject
 	}
+	if c.JetStream.RetryMs <= 0 {
+		c.JetStream.RetryMs = 2000
+	}
 
 	if strings.TrimSpace(c.Tail.Path) == "" {
 		c.Tail.Path = "tmp/demo.log"
@@ -174,6 +204,24 @@ func applyDetectorDefaults(c *DetectorConfig) {
 	}
 	if c.CooldownMs <= 0 {
 		c.CooldownMs = defaultDetectorCooldownMs
+	}
+	if len(c.Network.RiskyPorts) == 0 {
+		c.Network.RiskyPorts = []int{22, 23, 3389, 4444, 5555}
+	}
+	if c.Network.RepeatThreshold <= 0 {
+		c.Network.RepeatThreshold = 3
+	}
+	if c.Network.RepeatWindowMs <= 0 {
+		c.Network.RepeatWindowMs = 30000
+	}
+	if c.Baseline.ProcessFirstSeenTTLms <= 0 {
+		c.Baseline.ProcessFirstSeenTTLms = 7 * 24 * 60 * 60 * 1000
+	}
+	if c.Baseline.NetworkFirstSeenTTLms <= 0 {
+		c.Baseline.NetworkFirstSeenTTLms = 7 * 24 * 60 * 60 * 1000
+	}
+	if len(c.DNS.SuspiciousTLDs) == 0 {
+		c.DNS.SuspiciousTLDs = []string{".top", ".xyz", ".zip", ".mov", ".cam"}
 	}
 }
 

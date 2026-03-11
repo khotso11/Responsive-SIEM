@@ -14,6 +14,7 @@ UI_WEB_HOST="${UI_WEB_HOST:-127.0.0.1}"
 UI_WEB_PORT="${UI_WEB_PORT:-3000}"
 UI_API_KEY="${UI_API_KEY:-dev-ui-key}"
 UI_API_BASE="http://${UI_API_ADDR}"
+UI_DEV_DIST_DIR="${UI_DEV_DIST_DIR:-.next-dev}"
 
 cleanup_stale_ui_procs() {
   pkill -x ui-api >/dev/null 2>&1 || true
@@ -21,6 +22,16 @@ cleanup_stale_ui_procs() {
   pkill -f 'cmd/ui-api --addr 127.0.0.1:8090' >/dev/null 2>&1 || true
   pkill -f 'next dev --hostname 127.0.0.1 --port 3000' >/dev/null 2>&1 || true
   pkill -f 'next dev --hostname 127.0.0.1 --port 3100' >/dev/null 2>&1 || true
+}
+
+prepare_ui_dev_cache() {
+  local dist_path="ui/${UI_DEV_DIST_DIR}"
+  if [[ -d "$dist_path" ]]; then
+    local stale_dir
+    stale_dir="/tmp/rsiem-ui-next-$(date +%s)"
+    mv "$dist_path" "$stale_dir"
+    echo "Moved stale ${dist_path} to $stale_dir"
+  fi
 }
 
 start_if_needed() {
@@ -49,6 +60,7 @@ start_if_needed() {
 }
 
 cleanup_stale_ui_procs
+prepare_ui_dev_cache
 
 start_if_needed "ui-api" ".pids/ui-api.pid" "logs/ui-api.log" env \
   UI_API_KEY="$UI_API_KEY" \
@@ -64,6 +76,7 @@ fi
 start_if_needed "ui-web" ".pids/ui-web.pid" "logs/ui-web.log" env \
   NEXT_PUBLIC_UI_API_BASE="$UI_API_BASE" \
   NEXT_PUBLIC_UI_API_KEY="$UI_API_KEY" \
+  RSIEM_UI_DIST_DIR="$UI_DEV_DIST_DIR" \
   npm --prefix ui run dev -- --hostname "$UI_WEB_HOST" --port "$UI_WEB_PORT"
 
 echo "PASS: FR-06 UI services started"

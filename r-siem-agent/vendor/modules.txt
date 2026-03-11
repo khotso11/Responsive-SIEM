@@ -20,6 +20,8 @@ github.com/nats-io/nkeys
 github.com/nats-io/nuid
 # golang.org/x/crypto v0.43.0
 ## explicit; go 1.24.0
+golang.org/x/crypto/bcrypt
+golang.org/x/crypto/blowfish
 golang.org/x/crypto/blake2b
 golang.org/x/crypto/curve25519
 golang.org/x/crypto/ed25519

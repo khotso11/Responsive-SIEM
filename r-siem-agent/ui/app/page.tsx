@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import {
   approveIncident,
+  downloadSOCOperationsReport,
   getAudit,
   getDashboardIncidentsSeries,
   getDashboardLanes,
@@ -48,6 +49,28 @@ function parseRange(windowQ: string | null): string {
   return "24h";
 }
 
+function seriesBucketForRange(range: string): string {
+  switch (range) {
+    case "15m":
+      return "1m";
+    case "1h":
+      return "5m";
+    case "7d":
+      return "6h";
+    case "24h":
+    default:
+      return "1h";
+  }
+}
+
+function seriesLabelForRange(range: string, tsUnixMs: number): string {
+  const date = new Date(tsUnixMs);
+  if (range === "7d") {
+    return `${date.toLocaleDateString([], { month: "2-digit", day: "2-digit" })} ${date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+  }
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
 function parseQueryTime(v: string | null): number | undefined {
   if (!v) return undefined;
   const n = Number(v);
@@ -63,6 +86,22 @@ function statusBadge(status: string): string {
   if (s === "warning") return "badge-warn";
   if (s === "critical") return "badge-bad";
   return "badge-info";
+}
+
+function policyBadge(reason?: string): string {
+  const value = (reason || "").toLowerCase();
+  if (!value) return "";
+  if (value.includes("missing_identity_context")) return "Identity context required";
+  if (value.includes("privileged_identity")) return "Privileged identity review";
+  if (value.includes("local_source")) return "Local source review";
+  if (value.includes("irreversible")) return "Irreversible action";
+  if (value.includes("degraded")) return "Degraded queue";
+  if (value.includes("confidence_below_threshold")) return "Low confidence review";
+  if (value.includes("auto_within_bounds")) return "Auto within bounds";
+  if (value.includes("auto_below_high")) return "Auto below high";
+  if (value.includes("auto_below_critical")) return "Auto below critical";
+  if (value.includes("required")) return "Manual approval";
+  return reason || "";
 }
 
 function isValidLatLon(lat: unknown, lon: unknown): lat is number {
@@ -174,6 +213,8 @@ export default function DashboardPage() {
   const range = parseRange(searchParams.get("grange"));
 
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [hasLoadedOnce, setHasLoadedOnce] = useState(false);
   const [error, setError] = useState("");
   const [summary, setSummary] = useState<DashboardSummary | null>(null);
   const [series, setSeries] = useState<DashboardIncidentPoint[]>([]);
@@ -206,12 +247,16 @@ export default function DashboardPage() {
   const toMs = useMemo(() => parseQueryTime(searchParams.get("gto")), [searchParams]);
 
   const load = useCallback(async () => {
-    setLoading(true);
+    if (hasLoadedOnce) {
+      setRefreshing(true);
+    } else {
+      setLoading(true);
+    }
     setError("");
     try {
       const [s, i, sev, lane, t, inc, audit, geo] = await Promise.all([
         getDashboardSummary("24h"),
-        getDashboardIncidentsSeries(range, range === "15m" ? "5m" : "1h"),
+        getDashboardIncidentsSeries(range, seriesBucketForRange(range)),
         getDashboardSeverity(range),
         getDashboardLanes(range),
         getDashboardTopEntities(range === "7d" ? "24h" : "1h"),
@@ -228,12 +273,14 @@ export default function DashboardPage() {
       setAuditItems(audit.items || []);
       setGeoEndpoints(geo.endpoints || []);
       setGeoGeneratedAt(geo.generated_at || "");
+      setHasLoadedOnce(true);
     } catch (e) {
       setError((e as Error).message);
     } finally {
       setLoading(false);
+      setRefreshing(false);
     }
-  }, [range]);
+  }, [hasLoadedOnce, range]);
 
   useEffect(() => {
     let cancelled = false;
@@ -274,11 +321,11 @@ export default function DashboardPage() {
   }, []);
 
   const trendBars = useMemo(() => {
-    return series.slice(-24).map((p) => ({
-      label: new Date(p.ts_unix_ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+    return series.map((p) => ({
+      label: seriesLabelForRange(range, p.ts_unix_ms),
       value: p.count
     }));
-  }, [series]);
+  }, [range, series]);
   const locatedEndpoints = useMemo(() => geoEndpoints.filter(isLocatedEndpoint), [geoEndpoints]);
   const unlocated = useMemo(() => geoEndpoints.filter((x) => !isLocatedEndpoint(x)), [geoEndpoints]);
   const activeEndpointsCount = useMemo(() => geoEndpoints.filter((x) => x.status === "active").length, [geoEndpoints]);
@@ -341,14 +388,36 @@ export default function DashboardPage() {
   return (
     <section className="flex h-full min-h-0 flex-col gap-4 overflow-auto">
       <div>
-        <h2 className="text-[18px] font-semibold">Dashboard</h2>
-        <p className="text-[13px] text-ink-300">Geo posture, live incidents, entity spotlight, and response pressure in one view.</p>
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <h2 className="text-[18px] font-semibold">Dashboard</h2>
+            <p className="text-[13px] text-ink-300">Geo posture, live incidents, entity spotlight, and response pressure in one view.</p>
+          </div>
+          <div className="flex items-center gap-2">
+            <button className="btn-secondary px-2 py-1 text-xs" onClick={() => void downloadSOCOperationsReport(range, "pdf")}>
+              SOC PDF
+            </button>
+            <button className="btn-secondary px-2 py-1 text-xs" onClick={() => void downloadSOCOperationsReport(range, "html")}>
+              SOC HTML
+            </button>
+            {refreshing ? (
+              <div className="rounded border border-ink-700/80 bg-ink-900/60 px-2 py-1 text-[11px] text-ink-300">
+                Refreshing...
+              </div>
+            ) : null}
+          </div>
+        </div>
       </div>
 
-      {loading ? <LoadingState /> : null}
-      {error ? <ErrorState message={error} /> : null}
+      {loading && !hasLoadedOnce ? <LoadingState /> : null}
+      {error && !summary ? <ErrorState message={error} /> : null}
+      {error && summary ? (
+        <div className="rounded border border-rose-900/80 bg-rose-950/30 px-3 py-2 text-sm text-rose-200">
+          {error}
+        </div>
+      ) : null}
 
-      {!loading && !error && summary ? (
+      {summary ? (
         <>
           <div className="panel-elevated flex min-h-[560px] flex-col overflow-hidden border-ink-700/80">
             <div className="flex items-center justify-between border-b border-ink-700/80 px-4 py-3">
@@ -483,7 +552,32 @@ export default function DashboardPage() {
                       <div>{run.playbook_id || "-"}</div>
                       <div>{run.node_id || "-"}</div>
                       <div>{unixMsToLocal(run.last_updated_at_unix_ms)}</div>
+                      <div className="col-span-2 flex items-baseline gap-1 overflow-hidden text-[11px]">
+                        <span className="shrink-0 text-ink-500">net:</span>
+                        <span className="truncate font-mono text-ink-200">
+                          {run.src_ip || "-"}{run.dst_ip ? ` -> ${run.dst_ip}` : ""}
+                        </span>
+                      </div>
+                      {(run.comm || run.exec_path) ? (
+                        <div className="col-span-2 flex items-baseline gap-1 overflow-hidden text-[11px]">
+                          <span className="shrink-0 text-ink-500">proc:</span>
+                          <span className="truncate font-mono text-ink-200">
+                            {run.comm || run.exec_path}
+                            {run.comm && run.exec_path ? ` (${run.exec_path})` : ""}
+                          </span>
+                        </div>
+                      ) : null}
                     </div>
+                    {policyBadge(run.approval_policy_reason) ? (
+                      <div className="mt-2">
+                        <span className="rounded-full border border-ink-700 bg-ink-800/70 px-2 py-0.5 text-[11px] text-ink-200">
+                          {policyBadge(run.approval_policy_reason)}
+                        </span>
+                        <span className="ml-2 text-[11px] text-ink-400">
+                          conf {run.confidence_score ?? "-"} | {run.playbook_reversibility || "mixed"}
+                        </span>
+                      </div>
+                    ) : null}
                     <div className="mt-2 flex flex-wrap gap-2">
                       <button className="btn-secondary px-2 py-1 text-xs" onClick={() => { setSelectedRunID(run.run_id); setDrawerOpen(true); }}>Open</button>
                       {run.status?.toUpperCase() === "WAITING_APPROVAL" ? (
@@ -520,7 +614,7 @@ export default function DashboardPage() {
               <div className="mb-3 grid grid-cols-1 gap-4 md:grid-cols-2">
                 <MiniBars data={lanes.map((l) => ({ label: l.lane, value: l.count }))} colorClass="bg-cyan-400" />
                 <div>
-                  <div className="mb-1 text-xs text-ink-300">Last 60m density</div>
+                  <div className="mb-1 text-xs text-ink-300">Window density ({range})</div>
                   <div className="flex items-end gap-1 rounded border border-ink-700/70 bg-ink-900/40 p-2">
                     {trendBars.length === 0 ? <span className="text-xs text-ink-400">No timeline data</span> : null}
                     {trendBars.map((b) => {

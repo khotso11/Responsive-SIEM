@@ -150,9 +150,9 @@ if [[ -z "$approval_received_line" ]]; then
   exit 1
 fi
 
-not_needed_line="$(wait_in_tail "\"msg\":\"approval_not_needed\".*\"run_id\":\"${RUN_ID}\".*\"status\":\"FAILED_SAFE\"" "$LOG_MASTER" "$base_master" 20 || true)"
+not_needed_line="$(wait_in_tail "\"msg\":\"approval_not_needed\".*\"run_id\":\"${RUN_ID}\".*\"status\":\"MANUAL_REVIEW_REQUIRED\"" "$LOG_MASTER" "$base_master" 20 || true)"
 if [[ -z "$not_needed_line" ]]; then
-  echo "FAIL: approval_not_needed status FAILED_SAFE not observed after late approval run_id=${RUN_ID}" >&2
+  echo "FAIL: approval_not_needed status MANUAL_REVIEW_REQUIRED not observed after late approval run_id=${RUN_ID}" >&2
   debug_recent "\"msg\":\"approval_not_needed\".*\"run_id\":\"${RUN_ID}\"|\"msg\":\"approval_received\".*\"run_id\":\"${RUN_ID}\"" "$LOG_MASTER"
   exit 1
 fi

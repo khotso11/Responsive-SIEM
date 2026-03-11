@@ -19,8 +19,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/nats-io/nats.go"
 )
 
 const maxBytesPerPoll = uint64(1 << 20) // 1 MiB per poll to bound backlog
@@ -29,19 +27,24 @@ var (
 	ipv4FromPattern = regexp.MustCompile(`(?i)\bfrom\s+(\d{1,3}(?:\.\d{1,3}){3})\b`)
 	ipv4SrcPattern  = regexp.MustCompile(`(?i)\bsrc[=: ]+(\d{1,3}(?:\.\d{1,3}){3})\b`)
 	userPattern     = regexp.MustCompile(`(?i)\buser(?:name)?[=: ]+([a-z0-9._-]+)\b`)
+	ruserPattern    = regexp.MustCompile(`(?i)\bruser[=: ]+([a-z0-9._-]+)\b`)
+	lognamePattern  = regexp.MustCompile(`(?i)\blogname[=: ]+([a-z0-9._-]+)\b`)
 	hostPattern     = regexp.MustCompile(`(?i)\bhost[=: ]+([a-z0-9._-]+)\b`)
 	nodePattern     = regexp.MustCompile(`(?i)\bnode[=: ]+([a-z0-9._-]+)\b`)
 	procExecPattern = regexp.MustCompile(`(?i)^PROC\s+exec="?([^"\s]+)"?\s+user=([a-z0-9._-]+)\s+src=(\d{1,3}(?:\.\d{1,3}){3})\s+ts=([0-9]{9,13})(?:\s+node=([a-z0-9._-]+))?$`)
 	fileChgPattern  = regexp.MustCompile(`(?i)^FILE\s+path="?([^"\s]+)"?\s+action=([a-z0-9._-]+)\s+user=([a-z0-9._-]+)\s+src=(\d{1,3}(?:\.\d{1,3}){3})\s+ts=([0-9]{9,13})(?:\s+node=([a-z0-9._-]+))?$`)
 	authFailedA     = regexp.MustCompile(`(?i)^FAILED login user=([a-z0-9._-]+)\s+src=(\d{1,3}(?:\.\d{1,3}){3})\s+ts=([0-9]{9,13})$`)
 	sshdFailed      = regexp.MustCompile(`(?i)Failed password for(?: invalid user)? ([a-z0-9._-]+) from (\d{1,3}(?:\.\d{1,3}){3})`)
+	pamAuthFailed   = regexp.MustCompile(`(?i)pam_[a-z0-9_]+\([^)]*:auth\): authentication failure;`)
+	sudoIncorrect   = regexp.MustCompile(`(?i)\bsudo: [0-9]+ incorrect password attempts?\b`)
+	suFailed        = regexp.MustCompile(`(?i)^.*FAILED SU \(to [^)]+\)\s+([a-z0-9._-]+)\s+on\s+`)
 	explicitTSPat   = regexp.MustCompile(`\bts=([0-9]{9,13})\b`)
 )
 
 type Collector struct {
 	cfg    Config
 	logger *slog.Logger
-	js     nats.JetStreamContext
+	pub    publisher
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -53,14 +56,18 @@ type Collector struct {
 	lastOffset atomic.Uint64
 }
 
-func New(cfg Config, logger *slog.Logger, js nats.JetStreamContext) *Collector {
+type publisher interface {
+	Publish(ctx context.Context, eventID string, data []byte) (bool, error)
+}
+
+func New(cfg Config, logger *slog.Logger, pub publisher) *Collector {
 	cfg.applyDefaults()
-	return &Collector{cfg: cfg, logger: logger, js: js}
+	return &Collector{cfg: cfg, logger: logger, pub: pub}
 }
 
 func (c *Collector) Start(ctx context.Context) error {
-	if c.js == nil {
-		return fmt.Errorf("jetstream required")
+	if c.pub == nil {
+		return fmt.Errorf("publisher required")
 	}
 	if strings.TrimSpace(c.cfg.Path) == "" {
 		return fmt.Errorf("path required")
@@ -300,12 +307,21 @@ func (c *Collector) publishLine(ctx context.Context, line string, offset uint64)
 		return "", false, err
 	}
 
-	if _, err := c.js.Publish(c.cfg.Subject, data, nats.MsgId(eventID)); err != nil {
+	queued, err := c.pub.Publish(ctx, eventID, data)
+	if err != nil {
 		c.setError(err)
 		c.errors.Add(1)
 		c.logger.Error("collector_tail_publish_failed", slog.String("error", err.Error()))
 		time.Sleep(c.cfg.PollInterval)
 		return "", false, err
+	}
+	if queued {
+		c.logger.LogAttrs(context.Background(), slog.LevelWarn, "collector_event_spooled",
+			slog.String("event_idem_key", eventID),
+			slog.String("event_type", meta.EventType),
+			slog.String("src_ip", meta.SrcIP),
+			slog.String("user", meta.User),
+		)
 	}
 	c.published.Add(1)
 	c.logger.LogAttrs(context.Background(), slog.LevelInfo, "collector_event_published",
@@ -464,7 +480,38 @@ func extractAuthMetadata(line string) (eventType, srcIP, user string, tsUnix int
 		return
 	}
 
+	if pamAuthFailed.MatchString(line) || sudoIncorrect.MatchString(line) {
+		eventType = "auth_failed"
+		user = extractLocalAuthUser(line)
+		if user == "" {
+			user = "unknown"
+		}
+		srcIP = "127.0.0.1"
+		tsUnix = deriveTimestamp(line)
+		return
+	}
+
+	if m := suFailed.FindStringSubmatch(line); len(m) == 2 {
+		eventType = "auth_failed"
+		user = strings.TrimSpace(m[1])
+		if user == "" {
+			user = "unknown"
+		}
+		srcIP = "127.0.0.1"
+		tsUnix = deriveTimestamp(line)
+		return
+	}
+
 	return "", "", "", 0
+}
+
+func extractLocalAuthUser(line string) string {
+	for _, pattern := range []*regexp.Regexp{ruserPattern, lognamePattern, userPattern} {
+		if m := pattern.FindStringSubmatch(line); len(m) == 2 {
+			return strings.TrimSpace(m[1])
+		}
+	}
+	return ""
 }
 
 func deriveTimestamp(line string) int64 {

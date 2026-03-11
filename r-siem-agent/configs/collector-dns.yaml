@@ -1,0 +1,12 @@
+log_level: INFO
+
+jetstream:
+  url: nats://127.0.0.1:4222
+  stream: RSIEM_EVENTS
+  subject: rsiem.events.raw
+
+collector:
+  interface: any
+  source_type: dns_packet
+  coalesce_window_ms: 400
+  suppress_loopback_stub: true

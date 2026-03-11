@@ -84,12 +84,12 @@ while (( elapsed < max_wait )); do
     fi
   fi
 
-  failed_safe="$(rg -n "\"run_id\":\"${RUN_ID}\"" "$LOG_MASTER" | rg '"msg":"approval_not_needed"' | rg '"status":"FAILED_SAFE"' | tail -n 1 || true)"
-  if [[ -n "$failed_safe" ]]; then
-    line="${failed_safe%%:*}"
+  manual_review="$(rg -n "\"run_id\":\"${RUN_ID}\"" "$LOG_MASTER" | rg '"msg":"approval_not_needed"' | rg '"status":"MANUAL_REVIEW_REQUIRED"' | tail -n 1 || true)"
+  if [[ -n "$manual_review" ]]; then
+    line="${manual_review%%:*}"
     if [[ "$line" =~ ^[0-9]+$ ]] && (( line > baseline_fail_state )); then
-      echo "$failed_safe"
-      echo "PASS: FAILED_SAFE observed event_idem_key=${EVENT_ID} trigger_idem_key=${TRIGGER_IDEM_KEY} run_id=${RUN_ID}"
+      echo "$manual_review"
+      echo "PASS: MANUAL_REVIEW_REQUIRED observed event_idem_key=${EVENT_ID} trigger_idem_key=${TRIGGER_IDEM_KEY} run_id=${RUN_ID}"
       exit 0
     fi
   fi
@@ -102,5 +102,5 @@ while (( elapsed < max_wait )); do
   elapsed=$((elapsed + 1))
 done
 
-echo "FAIL: timeout waiting for approval timeout/FAILED_SAFE for run_id=${RUN_ID}" >&2
+echo "FAIL: timeout waiting for approval timeout/manual-review transition for run_id=${RUN_ID}" >&2
 exit 1

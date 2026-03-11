@@ -1,0 +1,50 @@
+{
+  "name": "sequence process to network",
+  "events": [
+    {
+      "event": {
+        "event_idem_key": "evt.reg.seq.proc",
+        "observed_at_unix_ms": 1000,
+        "event_type": "process_exec",
+        "source_type": "auditd_exec",
+        "node_id": "node-a",
+        "host": "node-a",
+        "user": "alice",
+        "exec_path": "/usr/bin/nmap",
+        "comm": "nmap",
+        "cmdline": "/usr/bin/nmap --version",
+        "message": "exec=/usr/bin/nmap user=alice"
+      },
+      "expect": {
+        "matched": true,
+        "rule_id": "R-PROC-FIRST-SEEN-SUSPICIOUS"
+      }
+    },
+    {
+      "event": {
+        "event_idem_key": "evt.reg.seq.net",
+        "observed_at_unix_ms": 2000,
+        "event_type": "network_connection",
+        "source_type": "proc_net",
+        "node_id": "node-a",
+        "host": "node-a",
+        "src_ip": "192.0.2.10",
+        "dst_ip": "93.184.216.13",
+        "dst_port": 4444,
+        "user": "unknown",
+        "message": "dst_ip=93.184.216.13 dst_port=4444"
+      },
+      "expect": {
+        "matched": true,
+        "rule_id": "R-SEQ-PROCESS-TO-NET",
+        "lane": "FAST",
+        "severity": "high",
+        "group_key": "node-a",
+        "user": "alice",
+        "exec_path": "/usr/bin/nmap",
+        "comm": "nmap",
+        "cmdline": "/usr/bin/nmap --version"
+      }
+    }
+  ]
+}

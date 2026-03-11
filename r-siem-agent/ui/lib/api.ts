@@ -12,10 +12,18 @@ import {
   SearchResponse,
   StepResult
 } from "@/lib/types";
+import { emitAuthRequired } from "@/lib/events";
 
 const API_BASE = process.env.NEXT_PUBLIC_UI_API_BASE || "http://127.0.0.1:8090";
 const API_KEY = process.env.NEXT_PUBLIC_UI_API_KEY || "dev-ui-key";
 const TOKEN_KEY = "rsiem_ui_token";
+
+export class UnauthorizedError extends Error {
+  constructor(message = "Session expired. Please log in again.") {
+    super(message);
+    this.name = "UnauthorizedError";
+  }
+}
 
 function authToken(): string {
   if (typeof window === "undefined") return "";
@@ -47,11 +55,27 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
     cache: "no-store"
   });
 
+  if (res.status === 401) {
+    setAuthToken("");
+    emitAuthRequired({ reason: "unauthorized" });
+    let text = "";
+    try {
+      text = await res.text();
+    } catch {
+      text = "";
+    }
+    throw new UnauthorizedError(text ? `Session expired. ${text}` : "Session expired. Please log in again.");
+  }
+
   if (!res.ok) {
     const text = await res.text();
     throw new Error(`${res.status} ${res.statusText}: ${text}`);
   }
   return (await res.json()) as T;
+}
+
+export function isUnauthorizedError(err: unknown): boolean {
+  return err instanceof UnauthorizedError || (err instanceof Error && err.name === "UnauthorizedError");
 }
 
 export async function login(username: string, password: string): Promise<{ ok: boolean; user: AuthUser; token: string }> {
@@ -110,6 +134,54 @@ export async function getIncident(runId: string): Promise<IncidentDetailResponse
   return apiFetch(`/api/incidents/${encodeURIComponent(runId)}`);
 }
 
+export async function downloadIncidentReport(runId: string, format: "json" | "html" | "pdf"): Promise<void> {
+  const headers = new Headers();
+  const token = authToken();
+  if (token) {
+    headers.set("Authorization", `Bearer ${token}`);
+  }
+  const res = await fetch(`${API_BASE}/api/incidents/${encodeURIComponent(runId)}/report?format=${encodeURIComponent(format)}`, {
+    method: "GET",
+    headers,
+    cache: "no-store"
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`${res.status} ${res.statusText}: ${text}`);
+  }
+  const blob = await res.blob();
+  const url = window.URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `incident_report_${runId}.${format}`;
+  anchor.click();
+  window.URL.revokeObjectURL(url);
+}
+
+export async function downloadSOCOperationsReport(reportWindow: string, format: "json" | "html" | "pdf"): Promise<void> {
+  const headers = new Headers();
+  const token = authToken();
+  if (token) {
+    headers.set("Authorization", `Bearer ${token}`);
+  }
+  const res = await fetch(`${API_BASE}/api/reports/soc/operations?window=${encodeURIComponent(reportWindow)}&format=${encodeURIComponent(format)}`, {
+    method: "GET",
+    headers,
+    cache: "no-store"
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`${res.status} ${res.statusText}: ${text}`);
+  }
+  const blob = await res.blob();
+  const url = window.URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `soc_operations_report_${reportWindow}.${format}`;
+  anchor.click();
+  window.URL.revokeObjectURL(url);
+}
+
 export async function getIncidentEvents(
   runId: string,
   opts?: { windowSeconds?: number; from?: number; to?: number; userName?: string; srcIP?: string; nodeID?: string; limit?: number }
@@ -136,6 +208,53 @@ export async function rejectIncident(runId: string, actor: string): Promise<{ ok
   return apiFetch(`/api/incidents/${encodeURIComponent(runId)}/reject`, {
     method: "POST",
     body: JSON.stringify({ actor })
+  });
+}
+
+export async function reissueIncident(
+  runId: string,
+  actor: string,
+  reason?: string
+): Promise<{ ok: boolean; previous_run_id: string; new_run_id?: string; trigger_idem_key: string; alert_key: string; lane: string }> {
+  return apiFetch(`/api/incidents/${encodeURIComponent(runId)}/reissue`, {
+    method: "POST",
+    body: JSON.stringify({ actor, reason })
+  });
+}
+
+export async function verifyIncidentUser(
+  runId: string,
+  actor: string,
+  verificationMethod: string,
+  verificationReference: string,
+  notes?: string
+): Promise<{ ok: boolean; run_id: string; actor: string; verification_method: string; verification_reference: string; status: string }> {
+  return apiFetch(`/api/incidents/${encodeURIComponent(runId)}/verify-user`, {
+    method: "POST",
+    body: JSON.stringify({
+      actor,
+      verification_method: verificationMethod,
+      verification_reference: verificationReference,
+      notes: notes || ""
+    })
+  });
+}
+
+export async function restoreIncidentAccess(
+  runId: string,
+  actor: string,
+  scope: "src_ip" | "user" | "both",
+  reason: string,
+  changeReference?: string
+): Promise<{ ok: boolean; run_id: string; actor: string; scope: string; reason: string; change_reference?: string; status: string }> {
+  return apiFetch(`/api/incidents/${encodeURIComponent(runId)}/restore-access`, {
+    method: "POST",
+    body: JSON.stringify({
+      actor,
+      scope,
+      reason,
+      change_reference: changeReference || ""
+    })
   });
 }
 
@@ -227,6 +346,24 @@ export async function disableUser(username: string): Promise<{ ok: boolean; user
   return apiFetch(`/api/users/${encodeURIComponent(username)}/disable`, {
     method: "POST",
     body: JSON.stringify({})
+  });
+}
+
+export async function deleteUser(username: string): Promise<{ ok: boolean; username: string; deleted: boolean }> {
+  return apiFetch(`/api/users/${encodeURIComponent(username)}/delete`, {
+    method: "POST",
+    body: JSON.stringify({})
+  });
+}
+
+export async function purgeDemoTestIncidents(payload?: {
+  older_than_days?: number;
+  dry_run?: boolean;
+  actor?: string;
+}): Promise<{ ok: boolean; dry_run: boolean; count: number; items: Incident[]; older_than?: number; actor?: string }> {
+  return apiFetch("/api/admin/incidents/purge_demo_test", {
+    method: "POST",
+    body: JSON.stringify(payload || {})
   });
 }
 

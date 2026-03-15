@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -10,26 +11,26 @@ func TestApplyIncidentRetentionPolicyUsesServiceAccountRule(t *testing.T) {
 	a := &app{
 		retentionRules: []retentionRule{
 			{
-				ID: "operational_service_account",
-				ServiceAccount: boolPtr(true),
-				Class: "operational_service_account",
+				ID:               "operational_service_account",
+				ServiceAccount:   boolPtr(true),
+				Class:            "operational_service_account",
 				ArchiveAfterDays: 30,
-				PurgeAfterDays: 365,
+				PurgeAfterDays:   365,
 			},
 			{
-				ID: "operational_standard",
-				Class: "operational_standard",
+				ID:               "operational_standard",
+				Class:            "operational_standard",
 				ArchiveAfterDays: 30,
-				PurgeAfterDays: 180,
+				PurgeAfterDays:   180,
 			},
 		},
 	}
 	run := incident{
-		RunID: "svc-run",
-		Status: "SUCCEEDED",
-		User: "svc_telegraf",
+		RunID:                  "svc-run",
+		Status:                 "SUCCEEDED",
+		User:                   "svc_telegraf",
 		IdentityServiceAccount: true,
-		LastUpdatedAtUnixMs: 1_000,
+		LastUpdatedAtUnixMs:    1_000,
 	}
 	got := a.applyIncidentRetentionPolicy(run, 2_000)
 	if got.RetentionRuleID != "operational_service_account" {
@@ -44,26 +45,26 @@ func TestApplyIncidentRetentionPolicyDoesNotTreatUnknownAsServiceAccount(t *test
 	a := &app{
 		retentionRules: []retentionRule{
 			{
-				ID: "operational_service_account",
-				ServiceAccount: boolPtr(true),
-				Class: "operational_service_account",
+				ID:               "operational_service_account",
+				ServiceAccount:   boolPtr(true),
+				Class:            "operational_service_account",
 				ArchiveAfterDays: 30,
-				PurgeAfterDays: 365,
+				PurgeAfterDays:   365,
 			},
 			{
-				ID: "operational_standard",
-				Class: "operational_standard",
+				ID:               "operational_standard",
+				Class:            "operational_standard",
 				ArchiveAfterDays: 30,
-				PurgeAfterDays: 180,
+				PurgeAfterDays:   180,
 			},
 		},
 	}
 	run := incident{
-		RunID: "unknown-user-run",
-		Status: "SUCCEEDED",
-		User: "unknown",
+		RunID:                  "unknown-user-run",
+		Status:                 "SUCCEEDED",
+		User:                   "unknown",
 		IdentityServiceAccount: true,
-		LastUpdatedAtUnixMs: 1_000,
+		LastUpdatedAtUnixMs:    1_000,
 	}
 	got := a.applyIncidentRetentionPolicy(run, 2_000)
 	if got.RetentionRuleID != "operational_standard" {
@@ -84,30 +85,30 @@ func TestApplyIncidentRetentionPolicyRecomputesStaleRetentionClass(t *testing.T)
 	a := &app{
 		retentionRules: []retentionRule{
 			{
-				ID: "operational_service_account",
-				ServiceAccount: boolPtr(true),
-				Class: "operational_service_account",
+				ID:               "operational_service_account",
+				ServiceAccount:   boolPtr(true),
+				Class:            "operational_service_account",
 				ArchiveAfterDays: 30,
-				PurgeAfterDays: 365,
+				PurgeAfterDays:   365,
 			},
 			{
-				ID: "operational_standard",
-				Class: "operational_standard",
+				ID:               "operational_standard",
+				Class:            "operational_standard",
 				ArchiveAfterDays: 30,
-				PurgeAfterDays: 180,
+				PurgeAfterDays:   180,
 			},
 		},
 	}
 	run := incident{
-		RunID: "stale-retention-run",
-		Status: "SUCCEEDED",
-		User: "unknown",
+		RunID:                  "stale-retention-run",
+		Status:                 "SUCCEEDED",
+		User:                   "unknown",
 		IdentityServiceAccount: true,
-		RetentionRuleID: "operational_service_account",
-		RetentionClass: "operational_service_account",
-		ArchiveAfterDays: 30,
-		PurgeAfterDays: 365,
-		LastUpdatedAtUnixMs: 1_000,
+		RetentionRuleID:        "operational_service_account",
+		RetentionClass:         "operational_service_account",
+		ArchiveAfterDays:       30,
+		PurgeAfterDays:         365,
+		LastUpdatedAtUnixMs:    1_000,
 	}
 	got := a.applyIncidentRetentionPolicy(run, 2_000)
 	if got.RetentionRuleID != "operational_standard" {
@@ -125,24 +126,24 @@ func TestApplyIncidentRetentionPolicyUsesCriticalAssetRule(t *testing.T) {
 	a := &app{
 		retentionRules: []retentionRule{
 			{
-				ID: "operational_critical_asset",
+				ID:                 "operational_critical_asset",
 				AssetCriticalityIn: []string{"critical"},
-				Class: "operational_critical_asset",
-				ArchiveAfterDays: 30,
-				PurgeAfterDays: 365,
+				Class:              "operational_critical_asset",
+				ArchiveAfterDays:   30,
+				PurgeAfterDays:     365,
 			},
 			{
-				ID: "operational_standard",
-				Class: "operational_standard",
+				ID:               "operational_standard",
+				Class:            "operational_standard",
 				ArchiveAfterDays: 30,
-				PurgeAfterDays: 180,
+				PurgeAfterDays:   180,
 			},
 		},
 	}
 	run := incident{
-		RunID: "critical-run",
-		Status: "FAILED_SAFE",
-		AssetCriticality: "critical",
+		RunID:               "critical-run",
+		Status:              "FAILED_SAFE",
+		AssetCriticality:    "critical",
 		LastUpdatedAtUnixMs: 1_000,
 	}
 	got := a.applyIncidentRetentionPolicy(run, 2_000)
@@ -238,6 +239,44 @@ func TestLoadDashboardHintsParsesAssetAndIdentityInventory(t *testing.T) {
 	}
 }
 
+func TestParseAuditLogKeepsCorroborationEvents(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "master.log")
+	content := []byte("{\"time\":\"2026-03-15T09:31:15Z\",\"msg\":\"response_run_corroborated\",\"run_id\":\"run-1\",\"source_type\":\"auditd_connect\",\"dst_ip\":\"172.30.50.13\",\"dst_port\":5985}\n")
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+	entries := parseAuditLog(path, "master")
+	if len(entries) != 1 {
+		t.Fatalf("entries=%d, want 1", len(entries))
+	}
+	if entries[0].Msg != "response_run_corroborated" {
+		t.Fatalf("msg=%q, want response_run_corroborated", entries[0].Msg)
+	}
+}
+
+func TestLoadIncidentAnnotationsReturnsCorroborationForRun(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "master.log")
+	content := []byte("" +
+		"{\"time\":\"2026-03-15T09:31:15Z\",\"msg\":\"response_run_corroborated\",\"run_id\":\"run-1\",\"source_type\":\"auditd_connect\",\"dst_ip\":\"172.30.50.13\",\"dst_port\":5985}\n" +
+		"{\"time\":\"2026-03-15T09:31:16Z\",\"msg\":\"response_run_corroborated\",\"run_id\":\"run-2\",\"source_type\":\"auditd_connect\",\"dst_ip\":\"172.30.50.14\",\"dst_port\":3389}\n")
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+	a := &app{cfg: serverConfig{MasterLogPath: path}}
+	annotations := a.loadIncidentAnnotations("run-1")
+	if len(annotations) != 1 {
+		t.Fatalf("annotations=%d, want 1", len(annotations))
+	}
+	if annotations[0].RunID != "run-1" {
+		t.Fatalf("run_id=%q, want run-1", annotations[0].RunID)
+	}
+	if annotations[0].Msg != "response_run_corroborated" {
+		t.Fatalf("msg=%q, want response_run_corroborated", annotations[0].Msg)
+	}
+}
+
 func TestEnrichIncidentFromInventoryUsesNodeAndUserFallback(t *testing.T) {
 	a := &app{
 		defaultAssetEnv: "lab",
@@ -304,5 +343,59 @@ func TestDeriveIncidentConfidenceUsesEvidenceFactors(t *testing.T) {
 	}
 	if bare >= 80 {
 		t.Fatalf("bare confidence=%d, want less than old hardcoded-high default", bare)
+	}
+}
+
+func TestBuildRunObservablesIncludesHashesDomainsAndURLs(t *testing.T) {
+	run := incident{
+		SrcIP:      "10.0.0.8",
+		DstIP:      "104.18.32.47",
+		ExecSHA256: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+		FileSHA256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		DNSName:    "api.example.com",
+		Target:     "https://portal.example.com/login",
+		Cmdline:    `curl https://download.example.net/tool.sh`,
+	}
+
+	obs := buildRunObservables(run)
+	var got []string
+	for _, item := range obs {
+		got = append(got, string(item.Kind)+":"+item.Value)
+	}
+
+	want := []string{
+		"ip:104.18.32.47",
+		"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		"domain:api.example.com",
+		"url:https://portal.example.com/login",
+		"domain:portal.example.com",
+		"url:https://download.example.net/tool.sh",
+		"domain:download.example.net",
+	}
+	for _, candidate := range want {
+		if !slices.Contains(got, candidate) {
+			t.Fatalf("missing observable %q in %v", candidate, got)
+		}
+	}
+	for _, item := range got {
+		if item == "ip:10.0.0.8" {
+			t.Fatalf("unexpected private IP observable in %v", got)
+		}
+	}
+}
+
+func TestBuildRunObservablesRejectsInvalidHashesAndDomains(t *testing.T) {
+	run := incident{
+		ExecSHA256: "not-a-hash",
+		FileSHA256: "short",
+		DNSName:    "172.30.50.14",
+		Target:     "not a url",
+		Cmdline:    "echo example",
+	}
+
+	obs := buildRunObservables(run)
+	if len(obs) != 0 {
+		t.Fatalf("observables=%v, want empty for invalid inputs", obs)
 	}
 }

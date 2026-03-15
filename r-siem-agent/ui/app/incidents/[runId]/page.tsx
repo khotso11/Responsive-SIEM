@@ -166,6 +166,24 @@ export default function IncidentDetailPage({ params }: { params: { runId: string
           </div>
           <h2 className="text-lg font-semibold">Incident Detail</h2>
         </div>
+        <div className="flex flex-wrap gap-2">
+          <Link
+            className="rounded border border-cyan-700/60 bg-cyan-950/40 px-3 py-2 text-sm text-cyan-100 hover:bg-cyan-900/40"
+            href={`/incidents?open_run_id=${encodeURIComponent(runID)}&open_tab=evidence`}
+          >
+            Open Investigation Workspace
+          </Link>
+          <Link
+            className="rounded border border-ink-700 bg-ink-900 px-3 py-2 text-sm text-ink-100 hover:bg-ink-800"
+            href="/incidents"
+          >
+            Back to Queue
+          </Link>
+        </div>
+      </div>
+
+      <div className="rounded-lg border border-ink-700 bg-ink-900/30 px-4 py-3 text-sm text-ink-200">
+        VirusTotal and other provider intelligence are rendered in the investigation workspace evidence view.
       </div>
 
       {loading ? <LoadingState /> : null}

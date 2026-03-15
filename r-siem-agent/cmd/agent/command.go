@@ -21,16 +21,19 @@ import (
 )
 
 const (
-	agentCommandSubject    = "rsiem.agent.command"
-	defaultAgentNatsURL    = "nats://127.0.0.1:4222"
-	defaultCmdTimeoutMs    = 3000
-	defaultOutputLimitByte = 4096
-	safeDeniedClass        = "SAFE_DENIED"
-	defaultAuthControlRoot = "/var/lib/rsiem/auth_controls"
+	agentCommandSubject          = "rsiem.agent.command"
+	defaultAgentNatsURL          = "nats://127.0.0.1:4222"
+	defaultCmdTimeoutMs          = 3000
+	defaultOutputLimitByte       = 4096
+	safeDeniedClass              = "SAFE_DENIED"
+	defaultAuthControlRoot       = "/var/lib/rsiem/auth_controls"
 	defaultScopedContainmentRoot = "/var/lib/rsiem/containment_controls"
 	defaultCommandResultRoot     = "/var/lib/rsiem/command_results"
 	defaultCommandReplySpoolRoot = "/var/lib/rsiem/command_reply_spool"
+	defaultResponseActionRoot    = "/var/lib/rsiem/response_actions"
 )
+
+var execLookPath = exec.LookPath
 
 type commandRequest struct {
 	RunID         string         `json:"run_id"`
@@ -494,6 +497,21 @@ type scopedContainmentRecord struct {
 	LastUpdatedAtUnixMs int64  `json:"last_updated_at_unix_ms,omitempty"`
 }
 
+type lateralContainmentRecord struct {
+	Version             int      `json:"version"`
+	RunID               string   `json:"run_id"`
+	StepID              string   `json:"step_id,omitempty"`
+	NodeID              string   `json:"node_id,omitempty"`
+	ProtocolFamily      string   `json:"protocol_family,omitempty"`
+	Reason              string   `json:"reason,omitempty"`
+	Mode                string   `json:"mode"`
+	Backend             string   `json:"backend,omitempty"`
+	Targets             []string `json:"targets,omitempty"`
+	ContainedAtUnixMs   int64    `json:"contained_at_unix_ms,omitempty"`
+	ExpiresAtUnixMs     int64    `json:"expires_at_unix_ms,omitempty"`
+	LastUpdatedAtUnixMs int64    `json:"last_updated_at_unix_ms,omitempty"`
+}
+
 type safeDeniedError struct {
 	reason string
 }
@@ -666,6 +684,20 @@ func (e *commandExecutor) handle(ctx context.Context, req commandRequest) comman
 
 	if isScopedContainmentCommand(actionKey) {
 		reply := e.executeScopedContainmentCommand(req, actionKey)
+		e.logger.LogAttrs(context.Background(), slog.LevelInfo, "agent_command_exec_done",
+			slog.String("run_id", runID),
+			slog.String("step_id", stepID),
+			slog.String("command_id", actionKey),
+			slog.Int("exit_code", reply.ExitCode),
+			slog.Int64("duration_ms", reply.DurationMs),
+			slog.Bool("stdout_truncated", reply.TruncatedStdout),
+			slog.Bool("stderr_truncated", reply.TruncatedStderr),
+		)
+		return reply
+	}
+
+	if actionKey == "halt_lateral_movement" {
+		reply := e.executeLateralMovementCommand(ctx, req)
 		e.logger.LogAttrs(context.Background(), slog.LevelInfo, "agent_command_exec_done",
 			slog.String("run_id", runID),
 			slog.String("step_id", stepID),
@@ -1225,6 +1257,25 @@ func scopedContainmentRoot() string {
 	return val
 }
 
+func responseActionRoot() string {
+	val := strings.TrimSpace(os.Getenv("RSIEM_AGENT_RESPONSE_ACTION_ROOT"))
+	if val == "" {
+		return defaultResponseActionRoot
+	}
+	return val
+}
+
+func lateralControlMode() string {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("RSIEM_AGENT_LATERAL_CONTROL_MODE"))) {
+	case "", "marker":
+		return "marker"
+	case "firewall":
+		return "firewall"
+	default:
+		return "marker"
+	}
+}
+
 func (e *commandExecutor) executeAuthControlCommand(req commandRequest, commandID string) commandReply {
 	start := time.Now()
 	runID := strings.TrimSpace(req.RunID)
@@ -1690,6 +1741,20 @@ func writeScopedContainmentRecord(path string, rec scopedContainmentRecord) erro
 	return os.WriteFile(path, data, 0o600)
 }
 
+func writeLateralContainmentRecord(path string, rec lateralContainmentRecord) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return denySafe("lateral_containment_symlink_not_allowed")
+	}
+	data, err := json.MarshalIndent(rec, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
+}
+
 func chooseFirstNonEmpty(values ...string) string {
 	for _, v := range values {
 		if strings.TrimSpace(v) != "" {
@@ -1697,6 +1762,262 @@ func chooseFirstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func splitCSVValues(input string) []string {
+	fields := strings.FieldsFunc(strings.TrimSpace(input), func(r rune) bool {
+		return r == ',' || r == ';' || r == ' ' || r == '\n' || r == '\t'
+	})
+	out := make([]string, 0, len(fields))
+	for _, field := range fields {
+		field = strings.TrimSpace(field)
+		if field == "" {
+			continue
+		}
+		out = append(out, field)
+	}
+	return out
+}
+
+func uniqueValidPrivateIPs(values []string) ([]string, error) {
+	out := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, raw := range values {
+		ip := net.ParseIP(strings.TrimSpace(raw))
+		if ip == nil {
+			return nil, denySafe("invalid_lateral_target")
+		}
+		if !ip.IsPrivate() {
+			return nil, denySafe("lateral_target_not_private")
+		}
+		canonical := ip.String()
+		if _, ok := seen[canonical]; ok {
+			continue
+		}
+		seen[canonical] = struct{}{}
+		out = append(out, canonical)
+	}
+	return out, nil
+}
+
+func nftTimeoutString(durationMs int64) string {
+	if durationMs <= 0 {
+		durationMs = 900000
+	}
+	seconds := (durationMs + 999) / 1000
+	switch {
+	case seconds%3600 == 0:
+		return fmt.Sprintf("%dh", seconds/3600)
+	case seconds%60 == 0:
+		return fmt.Sprintf("%dm", seconds/60)
+	default:
+		return fmt.Sprintf("%ds", seconds)
+	}
+}
+
+func ignorableNFTError(result execResult, fragments ...string) bool {
+	if result.Err == nil {
+		return false
+	}
+	text := result.Stderr + "\n" + result.Stdout
+	for _, fragment := range fragments {
+		if strings.Contains(text, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *commandExecutor) runFirewallSpec(ctx context.Context, spec execSpec) execResult {
+	if e.runner != nil {
+		return e.runner.Run(ctx, spec)
+	}
+	return osExecRunner{outputLimit: e.outputLimit}.Run(ctx, spec)
+}
+
+func (e *commandExecutor) ensureNFTBase(ctx context.Context, nftBin string) error {
+	createTable := e.runFirewallSpec(ctx, execSpec{Command: nftBin, Args: []string{"add", "table", "inet", "rsiem_contain"}})
+	if createTable.Err != nil && !ignorableNFTError(createTable, "File exists") {
+		return fmt.Errorf("nft add table: %w", createTable.Err)
+	}
+
+	createSetV4 := e.runFirewallSpec(ctx, execSpec{Command: nftBin, Args: []string{"add", "set", "inet", "rsiem_contain", "lateral_block_v4", "{ type ipv4_addr; flags timeout; }"}})
+	if createSetV4.Err != nil && !ignorableNFTError(createSetV4, "File exists") {
+		return fmt.Errorf("nft add set lateral_block_v4: %w", createSetV4.Err)
+	}
+
+	createSetV6 := e.runFirewallSpec(ctx, execSpec{Command: nftBin, Args: []string{"add", "set", "inet", "rsiem_contain", "lateral_block_v6", "{ type ipv6_addr; flags timeout; }"}})
+	if createSetV6.Err != nil && !ignorableNFTError(createSetV6, "File exists") {
+		return fmt.Errorf("nft add set lateral_block_v6: %w", createSetV6.Err)
+	}
+
+	createChain := e.runFirewallSpec(ctx, execSpec{Command: nftBin, Args: []string{"add", "chain", "inet", "rsiem_contain", "rsiem_output", "{ type filter hook output priority 0; policy accept; }"}})
+	if createChain.Err != nil && !ignorableNFTError(createChain, "File exists") {
+		return fmt.Errorf("nft add chain rsiem_output: %w", createChain.Err)
+	}
+
+	listChain := e.runFirewallSpec(ctx, execSpec{Command: nftBin, Args: []string{"list", "chain", "inet", "rsiem_contain", "rsiem_output"}})
+	if listChain.Err != nil {
+		return fmt.Errorf("nft list chain rsiem_output: %w", listChain.Err)
+	}
+	chainText := listChain.Stdout + "\n" + listChain.Stderr
+	if !strings.Contains(chainText, "@lateral_block_v4") {
+		addRuleV4 := e.runFirewallSpec(ctx, execSpec{Command: nftBin, Args: []string{"add", "rule", "inet", "rsiem_contain", "rsiem_output", "ip", "daddr", "@lateral_block_v4", "drop"}})
+		if addRuleV4.Err != nil && !ignorableNFTError(addRuleV4, "File exists") {
+			return fmt.Errorf("nft add rule v4: %w", addRuleV4.Err)
+		}
+	}
+	if !strings.Contains(chainText, "@lateral_block_v6") {
+		addRuleV6 := e.runFirewallSpec(ctx, execSpec{Command: nftBin, Args: []string{"add", "rule", "inet", "rsiem_contain", "rsiem_output", "ip6", "daddr", "@lateral_block_v6", "drop"}})
+		if addRuleV6.Err != nil && !ignorableNFTError(addRuleV6, "File exists") {
+			return fmt.Errorf("nft add rule v6: %w", addRuleV6.Err)
+		}
+	}
+	return nil
+}
+
+func (e *commandExecutor) applyLateralFirewallTargets(ctx context.Context, nftBin string, targets []string, durationMs int64) error {
+	timeoutValue := nftTimeoutString(durationMs)
+	for _, target := range targets {
+		ip := net.ParseIP(target)
+		if ip == nil {
+			return denySafe("invalid_lateral_target")
+		}
+		setName := "lateral_block_v6"
+		if ip.To4() != nil {
+			setName = "lateral_block_v4"
+		}
+		deleteResult := e.runFirewallSpec(ctx, execSpec{Command: nftBin, Args: []string{"delete", "element", "inet", "rsiem_contain", setName, fmt.Sprintf("{ %s }", target)}})
+		if deleteResult.Err != nil && !ignorableNFTError(deleteResult, "No such file or directory", "No such element") {
+			return fmt.Errorf("nft delete element %s %s: %w", setName, target, deleteResult.Err)
+		}
+		addResult := e.runFirewallSpec(ctx, execSpec{Command: nftBin, Args: []string{"add", "element", "inet", "rsiem_contain", setName, fmt.Sprintf("{ %s timeout %s }", target, timeoutValue)}})
+		if addResult.Err != nil && !ignorableNFTError(addResult, "File exists") {
+			return fmt.Errorf("nft add element %s %s: %w", setName, target, addResult.Err)
+		}
+	}
+	return nil
+}
+
+func (e *commandExecutor) lateralTargetsFromRequest(req commandRequest) ([]string, error) {
+	candidates := make([]string, 0, 8)
+	candidates = append(candidates, splitCSVValues(stringParam(req.Params, "top_destinations"))...)
+	if dstIP := strings.TrimSpace(stringParam(req.Params, "dst_ip")); dstIP != "" {
+		candidates = append(candidates, dstIP)
+	}
+	if target := strings.TrimSpace(req.Target); target != "" && net.ParseIP(target) != nil {
+		candidates = append(candidates, target)
+	}
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	return uniqueValidPrivateIPs(candidates)
+}
+
+func (e *commandExecutor) executeLateralMovementCommand(ctx context.Context, req commandRequest) commandReply {
+	start := time.Now()
+	runID := strings.TrimSpace(req.RunID)
+	stepID := strings.TrimSpace(req.StepID)
+	if runID == "" || runID != filepath.Base(runID) || strings.Contains(runID, string(filepath.Separator)) {
+		return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:invalid_run_id", ErrorClass: safeDeniedClass}
+	}
+
+	targets, err := e.lateralTargetsFromRequest(req)
+	if err != nil {
+		return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: err.Error(), ErrorClass: safeDeniedClass}
+	}
+
+	mode := lateralControlMode()
+	if mode == "marker" || len(targets) == 0 {
+		reply := e.executeMarkerCommand(req, "halt_lateral_movement", "lateral")
+		if reply.Status == "ok" && len(targets) == 0 {
+			reply.Stdout = strings.TrimSpace(reply.Stdout + "\nmode=marker reason=no_scoped_targets")
+		}
+		return reply
+	}
+
+	nftBin, err := execLookPath("nft")
+	if err != nil {
+		return commandReply{
+			Status:     "error",
+			ExitCode:   1,
+			DurationMs: time.Since(start).Milliseconds(),
+			Stderr:     "nft_not_found",
+			ErrorClass: "exec_failed",
+		}
+	}
+
+	durationMs, set, err := intParam(req.Params, "duration_ms")
+	if err != nil || (set && durationMs <= 0) {
+		return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:invalid_duration_ms", ErrorClass: safeDeniedClass}
+	}
+	if !set {
+		durationMs = 900000
+	}
+
+	cmdCtx, cancel := context.WithTimeout(ctx, e.timeout)
+	defer cancel()
+	if err := e.ensureNFTBase(cmdCtx, nftBin); err != nil {
+		return commandReply{
+			Status:     "error",
+			ExitCode:   1,
+			DurationMs: time.Since(start).Milliseconds(),
+			Stderr:     err.Error(),
+			ErrorClass: "exec_failed",
+		}
+	}
+	if err := e.applyLateralFirewallTargets(cmdCtx, nftBin, targets, int64(durationMs)); err != nil {
+		return commandReply{
+			Status:     "error",
+			ExitCode:   1,
+			DurationMs: time.Since(start).Milliseconds(),
+			Stderr:     err.Error(),
+			ErrorClass: "exec_failed",
+		}
+	}
+
+	root, err := ensureResolvedDirectoryAllowAbs(responseActionRoot(), "", true)
+	if err != nil {
+		return commandReply{
+			Status:     "error",
+			ExitCode:   3,
+			DurationMs: time.Since(start).Milliseconds(),
+			Stderr:     "safe_denied:invalid_response_action_root",
+			ErrorClass: safeDeniedClass,
+		}
+	}
+	statePath := filepath.Join(root, "lateral", runID, "state.json")
+	nowMs := time.Now().UnixMilli()
+	record := lateralContainmentRecord{
+		Version:             1,
+		RunID:               runID,
+		StepID:              stepID,
+		NodeID:              strings.TrimSpace(stringParam(req.Params, "node_id")),
+		ProtocolFamily:      strings.TrimSpace(stringParam(req.Params, "protocol_family")),
+		Reason:              strings.TrimSpace(stringParam(req.Params, "reason")),
+		Mode:                mode,
+		Backend:             "nft",
+		Targets:             append([]string(nil), targets...),
+		ContainedAtUnixMs:   nowMs,
+		ExpiresAtUnixMs:     nowMs + int64(durationMs),
+		LastUpdatedAtUnixMs: nowMs,
+	}
+	if err := writeLateralContainmentRecord(statePath, record); err != nil {
+		return commandReply{
+			Status:     "error",
+			ExitCode:   1,
+			DurationMs: time.Since(start).Milliseconds(),
+			Stderr:     err.Error(),
+			ErrorClass: "exec_failed",
+		}
+	}
+
+	return commandReply{
+		Status:     "ok",
+		ExitCode:   0,
+		DurationMs: time.Since(start).Milliseconds(),
+		Stdout:     statePath,
+	}
 }
 
 func (e *commandExecutor) executeMarkerCommand(req commandRequest, commandID, category string) commandReply {
@@ -1742,7 +2063,17 @@ func (e *commandExecutor) executeMarkerCommand(req commandRequest, commandID, ca
 			ErrorClass: safeDeniedClass,
 		}
 	}
-	markerDir := filepath.Join("tmp", "response_actions", category, runID)
+	root, err := ensureResolvedDirectoryAllowAbs(responseActionRoot(), "", true)
+	if err != nil {
+		return commandReply{
+			Status:     "error",
+			ExitCode:   3,
+			DurationMs: time.Since(start).Milliseconds(),
+			Stderr:     "safe_denied:invalid_response_action_root",
+			ErrorClass: safeDeniedClass,
+		}
+	}
+	markerDir := filepath.Join(root, category, runID)
 	if err := os.MkdirAll(markerDir, 0o755); err != nil {
 		return commandReply{
 			Status:     "error",

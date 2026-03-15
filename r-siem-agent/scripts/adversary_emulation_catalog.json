@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "scenarios": [
+    {
+      "id": "t1110_auth_abuse_burst",
+      "technique_id": "T1110",
+      "technique_name": "Brute Force",
+      "tactic": "Credential Access",
+      "description": "Repeated failed-password attempts from one source IP trigger auth abuse containment.",
+      "expected_rule_id": "R-AUTH-FAILED-PW-BURST-SRCIP",
+      "expected_playbook_id": "PB-AUTH-ABUSE-CONTAIN",
+      "expected_terminal_status": "SUCCEEDED",
+      "auto_approve": true,
+      "artifact_kind": "auth_control"
+    },
+    {
+      "id": "t1046_first_seen_process",
+      "technique_id": "T1046",
+      "technique_name": "Network Service Scanning",
+      "tactic": "Discovery",
+      "description": "A first-seen suspicious process execution is contained on the endpoint.",
+      "expected_rule_id": "R-PROC-FIRST-SEEN-SUSPICIOUS",
+      "expected_playbook_id": "PB-PROC-FIRST-SEEN-CONTAIN",
+      "expected_terminal_status": "SUCCEEDED",
+      "auto_approve": true,
+      "artifact_kind": "containment_control"
+    },
+    {
+      "id": "t1071_004_dns_suspicious",
+      "technique_id": "T1071.004",
+      "technique_name": "Application Layer Protocol: DNS",
+      "tactic": "Command and Control",
+      "description": "A suspicious DNS query triggers the DNS notification playbook.",
+      "expected_rule_id": "R-DNS-SUSPICIOUS-QUERY",
+      "expected_playbook_id": "PB-DNS-SUSPICIOUS-QUERY-NOTIFY",
+      "expected_terminal_status": "SUCCEEDED",
+      "auto_approve": false,
+      "artifact_kind": "none"
+    },
+    {
+      "id": "t1565_001_sensitive_file_change",
+      "technique_id": "T1565.001",
+      "technique_name": "Stored Data Manipulation",
+      "tactic": "Impact",
+      "description": "A sensitive file change under /etc triggers file-change notification.",
+      "expected_rule_id": "R-FILE-SENSITIVE-CHANGE",
+      "expected_playbook_id": "PB-FILE-SENSITIVE-CHANGE-NOTIFY",
+      "expected_terminal_status": "SUCCEEDED",
+      "auto_approve": false,
+      "artifact_kind": "none"
+    },
+    {
+      "id": "t1071_001_first_seen_risky_destination",
+      "technique_id": "T1071.001",
+      "technique_name": "Application Layer Protocol: Web Protocols",
+      "tactic": "Command and Control",
+      "description": "A first-seen risky destination is contained by destination IP.",
+      "expected_rule_id": "R-NET-FIRST-SEEN-RISKY",
+      "expected_playbook_id": "PB-NET-FIRST-SEEN-CONTAIN",
+      "expected_terminal_status": "SUCCEEDED",
+      "auto_approve": true,
+      "artifact_kind": "containment_control"
+    }
+  ]
+}

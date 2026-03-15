@@ -240,6 +240,8 @@ func (c *agentCommandStubConnector) OptionalParams() []string {
 		"name",
 		"args",
 		"target",
+		"top_destinations",
+		"protocol_family",
 		"force",
 		"src_path",
 		"quarantine_dir",

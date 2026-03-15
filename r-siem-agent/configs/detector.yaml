@@ -32,6 +32,72 @@ network:
   repeat_threshold: 3
   repeat_window_ms: 30000
 
+internal_scan:
+  enabled: true
+  window_ms: 60000
+  internal_cidrs:
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+  allowlist:
+    users:
+      - admin
+      - admin-Khotso
+      - root
+      - svc-backup
+      - svc-monitor
+    nodes:
+      - scanner-appliance-01
+      - backup-server-01
+      - admin-jump-01
+    exec_path_prefixes:
+      - /usr/bin/nmap
+      - /usr/bin/ldapsearch
+      - /usr/bin/smbclient
+      - /usr/bin/rpcclient
+      - /usr/bin/dig
+      - /usr/bin/nslookup
+      - /opt/admin-tools/
+    comm_prefixes:
+      - nmap
+      - ldapsearch
+      - smbclient
+      - rpcclient
+      - dig
+      - nslookup
+  smb:
+    ports: [445]
+    unique_targets_threshold: 5
+    confidence_score: 90
+  rpc:
+    ports: [135]
+    unique_targets_threshold: 5
+    confidence_score: 88
+  ldap:
+    ports: [389, 636, 3268, 3269]
+    unique_targets_threshold: 5
+    confidence_score: 88
+  dns:
+    ports: [53]
+    unique_targets_threshold: 8
+    confidence_score: 82
+  ftp:
+    ports: [21]
+    unique_targets_threshold: 4
+    confidence_score: 86
+  rdp:
+    ports: [3389]
+    unique_targets_threshold: 4
+    confidence_score: 90
+  winrm:
+    ports: [5985, 5986]
+    unique_targets_threshold: 4
+    confidence_score: 88
+  ssh:
+    ports: [22]
+    unique_targets_threshold: 5
+    confidence_score: 86
+
 dns:
   known_bad_domains: []
   suspicious_tlds:

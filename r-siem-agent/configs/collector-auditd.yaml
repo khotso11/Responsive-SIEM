@@ -10,3 +10,7 @@ collector:
   checkpoint_path: /var/lib/rsiem/auditd.checkpoint
   poll_ms: 500
   source_type: auditd_exec
+  connect_source_type: auditd_connect
+  recent_context_root: /var/lib/rsiem/recent_context
+  exec_context_max_age_ms: 120000
+  file_access_context_max_age_ms: 30000

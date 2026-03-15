@@ -9,6 +9,7 @@ import {
   Incident,
   IncidentDetailResponse,
   IncidentListResponse,
+  InvestigationResponse,
   SearchResponse,
   StepResult
 } from "@/lib/types";
@@ -293,6 +294,17 @@ export async function getEndpointEvents(nodeID: string, query = ""): Promise<{ i
 
 export async function getEndpointRuns(nodeID: string, limit = 50): Promise<{ items: Incident[]; count: number; source: string }> {
   return apiFetch(`/api/endpoints/${encodeURIComponent(nodeID)}/runs?limit=${limit}`);
+}
+
+export async function getInvestigation(runId: string): Promise<InvestigationResponse> {
+  return apiFetch(`/api/incidents/${encodeURIComponent(runId)}/investigation`);
+}
+
+export async function refreshInvestigation(runId: string): Promise<{ ok: boolean; job_id: string; observables: number }> {
+  return apiFetch(`/api/incidents/${encodeURIComponent(runId)}/investigation/refresh`, {
+    method: "POST",
+    body: JSON.stringify({})
+  });
 }
 
 export async function postEndpointTargetedTest(

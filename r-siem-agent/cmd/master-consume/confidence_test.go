@@ -48,3 +48,29 @@ func TestDeriveConfidenceUnknownNetworkStaysLowerThanAttributedProcess(t *testin
 		t.Fatalf("network unknown confidence=%d, want less than process attributed=%d", networkUnknown, processAttributed)
 	}
 }
+
+func TestDeriveConfidenceAuditdConnectScoresHigherThanProcNet(t *testing.T) {
+	procNet := deriveConfidence("trigger", "high", "FAST", 1, &NormalizedRecord{
+		Fields: map[string]any{
+			"source_type": "proc_net",
+			"user":        "khotso",
+			"exec_path":   "/usr/bin/nmap",
+			"comm":        "nmap",
+			"cmdline":     "/usr/bin/nmap -Pn -n",
+			"dst_ip":      "172.30.50.14",
+		},
+	})
+	auditdConnect := deriveConfidence("trigger", "high", "FAST", 1, &NormalizedRecord{
+		Fields: map[string]any{
+			"source_type": "auditd_connect",
+			"user":        "khotso",
+			"exec_path":   "/usr/bin/nmap",
+			"comm":        "nmap",
+			"cmdline":     "/usr/bin/nmap -Pn -n",
+			"dst_ip":      "172.30.50.14",
+		},
+	})
+	if auditdConnect <= procNet {
+		t.Fatalf("auditd_connect confidence=%d, want greater than proc_net=%d", auditdConnect, procNet)
+	}
+}

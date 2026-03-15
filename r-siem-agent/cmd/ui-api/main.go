@@ -17,10 +17,12 @@ import (
 	"html"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -33,36 +35,41 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"r-siem-agent/internal/config"
+	"r-siem-agent/internal/investigation"
 	"r-siem-agent/internal/logging"
 	"r-siem-agent/internal/roe/trigger"
 )
 
 const (
-	defaultAPIAddr         = "127.0.0.1:8090"
-	defaultRunsPath        = "exports/roe_runs.jsonl"
-	defaultStepsPath       = "exports/roe_steps.jsonl"
-	defaultMasterLogPath   = "logs/master-roe.log"
-	defaultUIAPILogPath    = "logs/ui-api.log"
-	defaultArtifactsRoot   = "demo_artifacts"
-	defaultRetainedRoot    = "retained"
-	defaultAPIKey          = "dev-ui-key"
-	defaultApprovalsSubj   = "rsiem.response.approvals"
-	defaultNATSURL         = "nats://127.0.0.1:4222"
-	defaultMasterConfig    = "configs/master.yaml"
-	defaultStepFastSubject = "rsiem.response.steps.fast"
-	defaultAgentCommandSub = "rsiem.agent.command"
-	defaultUsersPath       = "configs/ui_users.json"
-	defaultGeoEndpoints    = "configs/ui_geo_endpoints.json"
-	defaultUIStatePath     = "retained/ui_state/ui_actions.jsonl"
-	defaultUIStateDir      = "ui_state"
-	defaultArtifactLimit   = 200
-	maxArtifactPageLimit   = 1000
-	maxArtifactScanEntries = 50000
-	maxListLimit           = 2000
-	maxArtifactListEntries = 1000
-	defaultApprovalTimeout = int64(60000)
-	sessionTTL             = 12 * time.Hour
+	defaultAPIAddr           = "127.0.0.1:8090"
+	defaultRunsPath          = "exports/roe_runs.jsonl"
+	defaultStepsPath         = "exports/roe_steps.jsonl"
+	defaultMasterLogPath     = "logs/master-roe.log"
+	defaultUIAPILogPath      = "logs/ui-api.log"
+	defaultInotifyLogPath    = "/var/log/rsiem/collector-inotify.log"
+	defaultArtifactsRoot     = "demo_artifacts"
+	defaultRetainedRoot      = "retained"
+	defaultAPIKey            = "dev-ui-key"
+	defaultApprovalsSubj     = "rsiem.response.approvals"
+	defaultNATSURL           = "nats://127.0.0.1:4222"
+	defaultMasterConfig      = "configs/master.yaml"
+	defaultStepFastSubject   = "rsiem.response.steps.fast"
+	defaultInvestigationSubj = "rsiem.investigation.enrich.requested"
+	defaultAgentCommandSub   = "rsiem.agent.command"
+	defaultUsersPath         = "configs/ui_users.json"
+	defaultGeoEndpoints      = "configs/ui_geo_endpoints.json"
+	defaultUIStatePath       = "retained/ui_state/ui_actions.jsonl"
+	defaultUIStateDir        = "ui_state"
+	defaultArtifactLimit     = 200
+	maxArtifactPageLimit     = 1000
+	maxArtifactScanEntries   = 50000
+	maxListLimit             = 2000
+	maxArtifactListEntries   = 1000
+	defaultApprovalTimeout   = int64(60000)
+	sessionTTL               = 12 * time.Hour
 )
+
+var observableURLPattern = regexp.MustCompile(`https?://[^\s"'<>]+`)
 
 type masterROEConfig struct {
 	ROE struct {
@@ -74,23 +81,24 @@ type masterROEConfig struct {
 }
 
 type serverConfig struct {
-	Addr          string
-	MasterConfig  string
-	RunsPath      string
-	StepsPath     string
-	MasterLogPath string
-	UIAPILogPath  string
-	APIKey        string
-	ArtifactsRoot string
-	RetainedRoot  string
-	DBDSN         string
-	NATSURL       string
-	ApprovalsSubj string
-	UsersPath     string
-	GeoConfigPath string
-	UIStatePath   string
-	UIStateDir    string
-	SessionSecret string
+	Addr           string
+	MasterConfig   string
+	RunsPath       string
+	StepsPath      string
+	MasterLogPath  string
+	UIAPILogPath   string
+	InotifyLogPath string
+	APIKey         string
+	ArtifactsRoot  string
+	RetainedRoot   string
+	DBDSN          string
+	NATSURL        string
+	ApprovalsSubj  string
+	UsersPath      string
+	GeoConfigPath  string
+	UIStatePath    string
+	UIStateDir     string
+	SessionSecret  string
 }
 
 type app struct {
@@ -312,67 +320,130 @@ func (a *app) requestAgentCommand(subject string, req agentCommandRequest, timeo
 }
 
 type incident struct {
-	RunID                    string `json:"run_id"`
-	TriggerIdemKey           string `json:"trigger_idem_key,omitempty"`
-	AlertKey                 string `json:"alert_key,omitempty"`
-	Status                   string `json:"status"`
-	RuleID                   string `json:"rule_id,omitempty"`
-	PlaybookID               string `json:"playbook_id,omitempty"`
-	PlaybookVersion          string `json:"playbook_version,omitempty"`
-	Severity                 string `json:"severity,omitempty"`
-	ConfidenceScore          int    `json:"confidence_score,omitempty"`
-	Lane                     string `json:"lane,omitempty"`
-	NodeID                   string `json:"node_id,omitempty"`
-	AssetEnvironment         string `json:"asset_environment,omitempty"`
-	AssetCriticality         string `json:"asset_criticality,omitempty"`
-	AssetOwner               string `json:"asset_owner,omitempty"`
-	AssetTeam                string `json:"asset_team,omitempty"`
-	AssetRole                string `json:"asset_role,omitempty"`
-	SourceType               string `json:"source_type,omitempty"`
-	EventType                string `json:"event_type,omitempty"`
-	SrcIP                    string `json:"src_ip,omitempty"`
-	DstIP                    string `json:"dst_ip,omitempty"`
-	User                     string `json:"user_name,omitempty"`
-	ExecPath                 string `json:"exec_path,omitempty"`
-	Comm                     string `json:"comm,omitempty"`
-	Cmdline                  string `json:"cmdline,omitempty"`
-	IdentityDisplayName      string `json:"identity_display_name,omitempty"`
-	IdentityDepartment       string `json:"identity_department,omitempty"`
-	IdentityManager          string `json:"identity_manager,omitempty"`
-	IdentityPrivileged       bool   `json:"identity_privileged,omitempty"`
-	IdentityServiceAccount   bool   `json:"identity_service_account,omitempty"`
-	Target                   string `json:"target,omitempty"`
-	TargetAgentID            string `json:"target_agent_id,omitempty"`
-	Actor                    string `json:"actor,omitempty"`
-	EventIdemKey             string `json:"event_idem_key,omitempty"`
-	StepTotal                int    `json:"step_total,omitempty"`
-	StepSucceededCount       int    `json:"step_succeeded_count,omitempty"`
-	StepFailedSafeCount      int    `json:"step_failed_safe_count,omitempty"`
-	StepFailedTransient      int    `json:"step_failed_transient_count,omitempty"`
-	FailedSafeReason         string `json:"failed_safe_reason,omitempty"`
-	OperatorAction           string `json:"operator_action,omitempty"`
-	ApprovalPolicyMode       string `json:"approval_policy_mode,omitempty"`
-	ApprovalPolicyRuleID     string `json:"approval_policy_rule_id,omitempty"`
-	AllowlistRuleID          string `json:"allowlist_rule_id,omitempty"`
-	ApprovalPolicyReason     string `json:"approval_policy_reason,omitempty"`
-	PlaybookReversibility    string `json:"playbook_reversibility,omitempty"`
-	ApprovalDecision         string `json:"approval_decision,omitempty"`
-	ApprovalActor            string `json:"approval_actor,omitempty"`
-	ApprovalRequestedAtMs    int64  `json:"approval_requested_at_unix_ms,omitempty"`
-	ApprovalTimeoutMs        int64  `json:"approval_timeout_ms,omitempty"`
-	LastUpdatedAtUnixMs      int64  `json:"last_updated_at_unix_ms,omitempty"`
-	LifecycleState           string `json:"lifecycle_state,omitempty"`
-	EnvironmentClass         string `json:"environment_class,omitempty"`
-	RetentionClass           string `json:"retention_class,omitempty"`
-	RetentionRuleID          string `json:"retention_rule_id,omitempty"`
-	ArchiveAfterDays         int    `json:"archive_after_days,omitempty"`
-	PurgeAfterDays           int    `json:"purge_after_days,omitempty"`
-	AgeDays                  int    `json:"age_days,omitempty"`
-	Archived                 bool   `json:"archived,omitempty"`
-	PurgeEligible            bool   `json:"purge_eligible,omitempty"`
-	IdentityWorkflowEligible bool   `json:"identity_workflow_eligible,omitempty"`
-	IdentityWorkflowReason   string `json:"identity_workflow_reason,omitempty"`
-	Source                   string `json:"source"`
+	RunID                    string   `json:"run_id"`
+	TriggerIdemKey           string   `json:"trigger_idem_key,omitempty"`
+	AlertKey                 string   `json:"alert_key,omitempty"`
+	Status                   string   `json:"status"`
+	RuleID                   string   `json:"rule_id,omitempty"`
+	PlaybookID               string   `json:"playbook_id,omitempty"`
+	PlaybookVersion          string   `json:"playbook_version,omitempty"`
+	Severity                 string   `json:"severity,omitempty"`
+	ConfidenceScore          int      `json:"confidence_score,omitempty"`
+	Lane                     string   `json:"lane,omitempty"`
+	NodeID                   string   `json:"node_id,omitempty"`
+	AssetEnvironment         string   `json:"asset_environment,omitempty"`
+	AssetCriticality         string   `json:"asset_criticality,omitempty"`
+	AssetOwner               string   `json:"asset_owner,omitempty"`
+	AssetTeam                string   `json:"asset_team,omitempty"`
+	AssetRole                string   `json:"asset_role,omitempty"`
+	SourceType               string   `json:"source_type,omitempty"`
+	EventType                string   `json:"event_type,omitempty"`
+	SrcIP                    string   `json:"src_ip,omitempty"`
+	DstIP                    string   `json:"dst_ip,omitempty"`
+	DstPort                  int      `json:"dst_port,omitempty"`
+	ProtocolFamily           string   `json:"protocol_family,omitempty"`
+	ScanFanout               int      `json:"scan_fanout,omitempty"`
+	TopDestinations          []string `json:"top_destinations,omitempty"`
+	User                     string   `json:"user_name,omitempty"`
+	AttributionSource        string   `json:"attribution_source,omitempty"`
+	ExecPath                 string   `json:"exec_path,omitempty"`
+	Comm                     string   `json:"comm,omitempty"`
+	Cmdline                  string   `json:"cmdline,omitempty"`
+	FileSHA256               string   `json:"file_sha256,omitempty"`
+	ExecSHA256               string   `json:"exec_sha256,omitempty"`
+	DNSName                  string   `json:"dns_name,omitempty"`
+	IdentityDisplayName      string   `json:"identity_display_name,omitempty"`
+	IdentityDepartment       string   `json:"identity_department,omitempty"`
+	IdentityManager          string   `json:"identity_manager,omitempty"`
+	IdentityPrivileged       bool     `json:"identity_privileged,omitempty"`
+	IdentityServiceAccount   bool     `json:"identity_service_account,omitempty"`
+	Target                   string   `json:"target,omitempty"`
+	TargetAgentID            string   `json:"target_agent_id,omitempty"`
+	Actor                    string   `json:"actor,omitempty"`
+	EventIdemKey             string   `json:"event_idem_key,omitempty"`
+	StepTotal                int      `json:"step_total,omitempty"`
+	StepSucceededCount       int      `json:"step_succeeded_count,omitempty"`
+	StepFailedSafeCount      int      `json:"step_failed_safe_count,omitempty"`
+	StepFailedTransient      int      `json:"step_failed_transient_count,omitempty"`
+	FailedSafeReason         string   `json:"failed_safe_reason,omitempty"`
+	OperatorAction           string   `json:"operator_action,omitempty"`
+	ApprovalPolicyMode       string   `json:"approval_policy_mode,omitempty"`
+	ApprovalPolicyRuleID     string   `json:"approval_policy_rule_id,omitempty"`
+	AllowlistRuleID          string   `json:"allowlist_rule_id,omitempty"`
+	ApprovalPolicyReason     string   `json:"approval_policy_reason,omitempty"`
+	PlaybookReversibility    string   `json:"playbook_reversibility,omitempty"`
+	ApprovalDecision         string   `json:"approval_decision,omitempty"`
+	ApprovalActor            string   `json:"approval_actor,omitempty"`
+	ApprovalRequestedAtMs    int64    `json:"approval_requested_at_unix_ms,omitempty"`
+	ApprovalTimeoutMs        int64    `json:"approval_timeout_ms,omitempty"`
+	LastUpdatedAtUnixMs      int64    `json:"last_updated_at_unix_ms,omitempty"`
+	LifecycleState           string   `json:"lifecycle_state,omitempty"`
+	EnvironmentClass         string   `json:"environment_class,omitempty"`
+	RetentionClass           string   `json:"retention_class,omitempty"`
+	RetentionRuleID          string   `json:"retention_rule_id,omitempty"`
+	ArchiveAfterDays         int      `json:"archive_after_days,omitempty"`
+	PurgeAfterDays           int      `json:"purge_after_days,omitempty"`
+	AgeDays                  int      `json:"age_days,omitempty"`
+	Archived                 bool     `json:"archived,omitempty"`
+	PurgeEligible            bool     `json:"purge_eligible,omitempty"`
+	IdentityWorkflowEligible bool     `json:"identity_workflow_eligible,omitempty"`
+	IdentityWorkflowReason   string   `json:"identity_workflow_reason,omitempty"`
+	Source                   string   `json:"source"`
+}
+
+type investigationObservable struct {
+	Kind            string `json:"kind"`
+	Value           string `json:"value"`
+	Role            string `json:"role"`
+	Source          string `json:"source"`
+	CreatedAtUnixMs int64  `json:"created_at_unix_ms"`
+}
+
+type investigationProviderResult struct {
+	ObservableKind  string         `json:"observable_kind"`
+	ObservableValue string         `json:"observable_value"`
+	Provider        string         `json:"provider"`
+	Status          string         `json:"status"`
+	Verdict         string         `json:"verdict"`
+	Score           int            `json:"score"`
+	Summary         string         `json:"summary"`
+	EvidenceURL     string         `json:"evidence_url"`
+	FetchedAtUnixMs int64          `json:"fetched_at_unix_ms"`
+	ExpiresAtUnixMs int64          `json:"expires_at_unix_ms"`
+	Data            map[string]any `json:"data"`
+}
+
+type investigationProviderSummary struct {
+	Provider        string `json:"provider"`
+	Status          string `json:"status"`
+	Verdict         string `json:"verdict"`
+	Score           int    `json:"score"`
+	Summary         string `json:"summary"`
+	Attempts        int    `json:"attempts"`
+	LatencyMs       int64  `json:"latency_ms"`
+	HTTPStatus      int    `json:"http_status"`
+	ErrorClass      string `json:"error_class"`
+	FetchedAtUnixMs int64  `json:"fetched_at_unix_ms"`
+}
+
+type investigationJob struct {
+	JobID             string `json:"job_id"`
+	RunID             string `json:"run_id"`
+	Status            string `json:"status"`
+	RequestedBy       string `json:"requested_by"`
+	RequestedAtUnixMs int64  `json:"requested_at_unix_ms"`
+	CompletedAtUnixMs int64  `json:"completed_at_unix_ms,omitempty"`
+	Refresh           bool   `json:"refresh"`
+	ErrorText         string `json:"error_text"`
+}
+
+type investigationResponse struct {
+	RunID       string                         `json:"run_id"`
+	Observables []investigationObservable      `json:"observables"`
+	Enrichments []investigationProviderResult  `json:"enrichments"`
+	Summaries   []investigationProviderSummary `json:"summaries"`
+	Jobs        []investigationJob             `json:"jobs"`
+	Source      string                         `json:"source"`
 }
 
 type stepResult struct {
@@ -409,10 +480,17 @@ type createdMeta struct {
 	EventType              string
 	SrcIP                  string
 	DstIP                  string
+	DstPort                int
+	ProtocolFamily         string
+	ScanFanout             int
+	TopDestinations        []string
 	User                   string
 	ExecPath               string
 	Comm                   string
 	Cmdline                string
+	FileSHA256             string
+	ExecSHA256             string
+	DNSName                string
 	IdentityDisplayName    string
 	IdentityDepartment     string
 	IdentityManager        string
@@ -420,6 +498,11 @@ type createdMeta struct {
 	IdentityServiceAccount bool
 	TargetAgentID          string
 	EventIdemKey           string
+}
+
+type inotifyAttribution struct {
+	User              string
+	AttributionSource string
 }
 
 type eventRow struct {
@@ -639,6 +722,9 @@ func main() {
 			pErr := db.PingContext(ctx)
 			cancel()
 			if pErr == nil {
+				if sErr := ensureInvestigationSchema(context.Background(), db); sErr != nil {
+					logger.Warn("ui_api_db_schema_unavailable", slog.String("error", sErr.Error()))
+				}
 				a.db = db
 				logger.Info("ui_api_db_connected", slog.String("dsn", cfg.DBDSN))
 			} else {
@@ -672,6 +758,8 @@ func main() {
 	mux.HandleFunc("POST /api/incidents/{run_id}/restore-access", a.withAuthRole(a.handleIncidentRestoreAccess, "analyst"))
 	mux.HandleFunc("POST /api/incidents/{run_id}/assign", a.withAuthRole(a.handleIncidentAssign, "analyst"))
 	mux.HandleFunc("POST /api/incidents/{run_id}/notes", a.withAuthRole(a.handleIncidentNotes, "analyst"))
+	mux.HandleFunc("GET /api/incidents/{run_id}/investigation", a.withAuthRole(a.handleInvestigation, "analyst"))
+	mux.HandleFunc("POST /api/incidents/{run_id}/investigation/refresh", a.withAuthRole(a.handleInvestigationRefresh, "analyst"))
 	mux.HandleFunc("POST /api/incidents/{run_id}/review", a.withAuthRole(a.handleIncidentMarkReviewed, "analyst"))
 	mux.HandleFunc("GET /api/incidents/{run_id}/events", a.withAuthRole(a.handleIncidentEvents, "analyst"))
 	mux.HandleFunc("GET /api/incidents/{run_id}/report", a.withAuthRole(a.handleIncidentReport, "analyst"))
@@ -718,6 +806,58 @@ func loadROESettings(path string) (approvalsSubject string, natsURL string) {
 		return "", ""
 	}
 	return strings.TrimSpace(cfg.ROE.Jetstream.SubjectApprovals), strings.TrimSpace(cfg.ROE.Jetstream.URL)
+}
+
+func ensureInvestigationSchema(ctx context.Context, db *sql.DB) error {
+	const schemaSQL = `
+CREATE TABLE IF NOT EXISTS incident_observables (
+  id BIGSERIAL PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  observable_kind TEXT NOT NULL,
+  observable_value TEXT NOT NULL,
+  observable_role TEXT NOT NULL,
+  observable_source TEXT NOT NULL,
+  created_at_unix_ms BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS incident_observables_run_idx
+  ON incident_observables(run_id);
+CREATE INDEX IF NOT EXISTS incident_observables_value_idx
+  ON incident_observables(observable_kind, observable_value);
+
+CREATE TABLE IF NOT EXISTS observable_enrichments (
+  id BIGSERIAL PRIMARY KEY,
+  observable_kind TEXT NOT NULL,
+  observable_value TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  status TEXT NOT NULL,
+  provider_verdict TEXT NOT NULL,
+  provider_score INT NOT NULL,
+  summary TEXT NOT NULL,
+  evidence_url TEXT NOT NULL,
+  data_json JSONB NOT NULL,
+  fetched_at_unix_ms BIGINT NOT NULL,
+  expires_at_unix_ms BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS observable_enrichments_lookup_idx
+  ON observable_enrichments(observable_kind, observable_value, provider);
+CREATE UNIQUE INDEX IF NOT EXISTS observable_enrichments_uq
+  ON observable_enrichments(observable_kind, observable_value, provider);
+
+CREATE TABLE IF NOT EXISTS enrichment_jobs (
+  job_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  requested_by TEXT NOT NULL,
+  requested_at_unix_ms BIGINT NOT NULL,
+  completed_at_unix_ms BIGINT NULL,
+  refresh BOOLEAN NOT NULL DEFAULT FALSE,
+  error_text TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS enrichment_jobs_run_idx
+  ON enrichment_jobs(run_id);
+`
+	_, err := db.ExecContext(ctx, schemaSQL)
+	return err
 }
 
 func normalizeInventoryKey(v string) string {
@@ -1303,10 +1443,11 @@ func (a *app) handleIncidentDetail(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"run":      found,
-		"steps":    steps,
-		"ui_state": a.loadUIStateForRun(runID),
-		"source":   "exports",
+		"run":         found,
+		"steps":       steps,
+		"ui_state":    a.loadUIStateForRun(runID),
+		"annotations": a.loadIncidentAnnotations(runID),
+		"source":      "exports",
 	})
 }
 
@@ -1449,10 +1590,23 @@ func enrichIncidentFromCreatedMeta(run incident, meta createdMeta) incident {
 	run.EventType = chooseNonEmpty(meta.EventType, run.EventType)
 	run.SrcIP = chooseNonEmpty(meta.SrcIP, run.SrcIP)
 	run.DstIP = chooseNonEmpty(meta.DstIP, run.DstIP)
+	if run.DstPort == 0 {
+		run.DstPort = meta.DstPort
+	}
+	run.ProtocolFamily = chooseNonEmpty(meta.ProtocolFamily, run.ProtocolFamily)
+	if run.ScanFanout == 0 {
+		run.ScanFanout = meta.ScanFanout
+	}
+	if len(run.TopDestinations) == 0 && len(meta.TopDestinations) > 0 {
+		run.TopDestinations = append([]string(nil), meta.TopDestinations...)
+	}
 	run.User = chooseNonEmpty(meta.User, run.User)
 	run.ExecPath = chooseNonEmpty(meta.ExecPath, run.ExecPath)
 	run.Comm = chooseNonEmpty(meta.Comm, run.Comm)
 	run.Cmdline = chooseNonEmpty(meta.Cmdline, run.Cmdline)
+	run.FileSHA256 = chooseNonEmpty(meta.FileSHA256, run.FileSHA256)
+	run.ExecSHA256 = chooseNonEmpty(meta.ExecSHA256, run.ExecSHA256)
+	run.DNSName = chooseNonEmpty(meta.DNSName, run.DNSName)
 	run.IdentityDisplayName = chooseNonEmpty(meta.IdentityDisplayName, run.IdentityDisplayName)
 	run.IdentityDepartment = chooseNonEmpty(meta.IdentityDepartment, run.IdentityDepartment)
 	run.IdentityManager = chooseNonEmpty(meta.IdentityManager, run.IdentityManager)
@@ -2291,6 +2445,443 @@ func (a *app) handleIncidentReport(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "format must be json, html, or pdf"})
 	}
+}
+
+func (a *app) handleInvestigation(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	runID := strings.TrimSpace(r.PathValue("run_id"))
+	if runID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing run_id"})
+		return
+	}
+	if a.db == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "db unavailable"})
+		return
+	}
+
+	resp, err := a.loadInvestigation(ctx, runID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (a *app) handleInvestigationRefresh(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	runID := strings.TrimSpace(r.PathValue("run_id"))
+	if runID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing run_id"})
+		return
+	}
+	if a.db == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "db unavailable"})
+		return
+	}
+	if a.nc == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "nats unavailable"})
+		return
+	}
+
+	runs, _, _ := a.loadState()
+	var run *incident
+	for i := range runs {
+		if runs[i].RunID == runID {
+			rcopy := runs[i]
+			run = &rcopy
+			break
+		}
+	}
+	if run == nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "run not found"})
+		return
+	}
+
+	// Build observables from run context and dedupe with existing DB rows.
+	fresh := dedupeInvestigationObservables(buildRunObservables(*run))
+	existing := map[string]struct{}{}
+	rows, _ := a.db.QueryContext(ctx, `SELECT observable_kind, observable_value FROM incident_observables WHERE run_id=$1`, runID)
+	if rows != nil {
+		defer rows.Close()
+		for rows.Next() {
+			var k, v string
+			if err := rows.Scan(&k, &v); err == nil {
+				existing[k+"|"+v] = struct{}{}
+			}
+		}
+	}
+
+	trimmed := make([]investigation.Observable, 0, len(fresh))
+	nowMs := time.Now().UnixMilli()
+	for _, o := range fresh {
+		key := string(o.Kind) + "|" + o.Value
+		if _, ok := existing[key]; ok {
+			continue
+		}
+		trimmed = append(trimmed, o)
+		_, _ = a.db.ExecContext(ctx, `
+INSERT INTO incident_observables (run_id, observable_kind, observable_value, observable_role, observable_source, created_at_unix_ms)
+VALUES ($1,$2,$3,$4,$5,$6)
+ON CONFLICT DO NOTHING;
+`, runID, string(o.Kind), o.Value, o.Role, o.Source, nowMs)
+	}
+
+	// Prepare job payload for enricher.
+	rc := roleFromRequest(r)
+	jobID := strings.ReplaceAll(nats.NewInbox(), "INBOX.", "enrich.")
+	payload := map[string]any{
+		"job_id":       jobID,
+		"run_id":       runID,
+		"observables":  trimmed,
+		"requested_by": rc.Username,
+		"refresh":      true,
+	}
+	data, _ := json.Marshal(payload)
+	if err := a.nc.Publish(defaultInvestigationSubj, data); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	_, _ = a.db.ExecContext(ctx, `
+INSERT INTO enrichment_jobs (job_id, run_id, status, requested_by, requested_at_unix_ms, refresh)
+VALUES ($1,$2,'requested',$3,EXTRACT(EPOCH FROM now())*1000,$4)
+ON CONFLICT (job_id) DO NOTHING;
+`, jobID, runID, rc.Username, true)
+
+	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "job_id": jobID, "observables": len(trimmed)})
+}
+
+func (a *app) loadInvestigation(ctx context.Context, runID string) (investigationResponse, error) {
+	resp := investigationResponse{RunID: runID, Observables: []investigationObservable{}, Enrichments: []investigationProviderResult{}, Summaries: []investigationProviderSummary{}, Jobs: []investigationJob{}, Source: "db"}
+	rows, err := a.db.QueryContext(ctx, `
+SELECT observable_kind, observable_value, observable_role, observable_source, created_at_unix_ms
+FROM incident_observables
+WHERE run_id=$1
+ORDER BY created_at_unix_ms ASC, observable_value
+`, runID)
+	if err != nil {
+		return resp, err
+	}
+	defer rows.Close()
+	seenObservables := make(map[string]struct{})
+	for rows.Next() {
+		var k, v, role, src string
+		var created int64
+		if err := rows.Scan(&k, &v, &role, &src, &created); err == nil {
+			key := strings.Join([]string{k, v, role, src}, "|")
+			if _, ok := seenObservables[key]; ok {
+				continue
+			}
+			seenObservables[key] = struct{}{}
+			resp.Observables = append(resp.Observables, investigationObservable{
+				Kind:            k,
+				Value:           v,
+				Role:            role,
+				Source:          src,
+				CreatedAtUnixMs: created,
+			})
+		}
+	}
+
+	enrRows, err := a.db.QueryContext(ctx, `
+SELECT observable_kind, observable_value, provider, status, provider_verdict, provider_score, summary, evidence_url, data_json, fetched_at_unix_ms, expires_at_unix_ms
+FROM observable_enrichments
+WHERE (observable_kind, observable_value) IN (
+  SELECT observable_kind, observable_value FROM incident_observables WHERE run_id=$1
+)
+ORDER BY fetched_at_unix_ms DESC
+`, runID)
+	if err == nil {
+		defer enrRows.Close()
+		for enrRows.Next() {
+			var k, v, p, status, verdict, summary, evidence string
+			var score int
+			var fetched, expires int64
+			var data json.RawMessage
+			if err := enrRows.Scan(&k, &v, &p, &status, &verdict, &score, &summary, &evidence, &data, &fetched, &expires); err == nil {
+				var m map[string]any
+				_ = json.Unmarshal(data, &m)
+				resp.Enrichments = append(resp.Enrichments, investigationProviderResult{
+					ObservableKind:  k,
+					ObservableValue: v,
+					Provider:        p,
+					Status:          status,
+					Verdict:         verdict,
+					Score:           score,
+					Summary:         summary,
+					EvidenceURL:     evidence,
+					FetchedAtUnixMs: fetched,
+					ExpiresAtUnixMs: expires,
+					Data:            m,
+				})
+			}
+		}
+	}
+	resp.Summaries = buildInvestigationProviderSummaries(resp.Enrichments)
+
+	jobRows, err := a.db.QueryContext(ctx, `
+SELECT job_id, run_id, status, requested_by, requested_at_unix_ms, COALESCE(completed_at_unix_ms,0), refresh, error_text
+FROM enrichment_jobs
+WHERE run_id=$1
+ORDER BY requested_at_unix_ms DESC
+LIMIT 50
+`, runID)
+	if err == nil {
+		defer jobRows.Close()
+		for jobRows.Next() {
+			var j investigationJob
+			if err := jobRows.Scan(&j.JobID, &j.RunID, &j.Status, &j.RequestedBy, &j.RequestedAtUnixMs, &j.CompletedAtUnixMs, &j.Refresh, &j.ErrorText); err == nil {
+				resp.Jobs = append(resp.Jobs, j)
+			}
+		}
+	}
+	return resp, nil
+}
+
+func buildInvestigationProviderSummaries(in []investigationProviderResult) []investigationProviderSummary {
+	if len(in) == 0 {
+		return []investigationProviderSummary{}
+	}
+	out := make([]investigationProviderSummary, 0, len(in))
+	seen := make(map[string]struct{}, len(in))
+	for _, item := range in {
+		if _, ok := seen[item.Provider]; ok {
+			continue
+		}
+		seen[item.Provider] = struct{}{}
+		attempts, latencyMs, httpStatus, errorClass := requestMetricsFromMap(item.Data)
+		out = append(out, investigationProviderSummary{
+			Provider:        item.Provider,
+			Status:          item.Status,
+			Verdict:         item.Verdict,
+			Score:           item.Score,
+			Summary:         item.Summary,
+			Attempts:        attempts,
+			LatencyMs:       latencyMs,
+			HTTPStatus:      httpStatus,
+			ErrorClass:      errorClass,
+			FetchedAtUnixMs: item.FetchedAtUnixMs,
+		})
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].FetchedAtUnixMs == out[j].FetchedAtUnixMs {
+			return out[i].Provider < out[j].Provider
+		}
+		return out[i].FetchedAtUnixMs > out[j].FetchedAtUnixMs
+	})
+	return out
+}
+
+func requestMetricsFromMap(data map[string]any) (attempts int, latencyMs int64, httpStatus int, errorClass string) {
+	raw, ok := data["_request"]
+	if !ok {
+		return 0, 0, 0, ""
+	}
+	req, ok := raw.(map[string]any)
+	if !ok {
+		return 0, 0, 0, ""
+	}
+	return intAny(req["attempts"]), int64Any(req["latency_ms"]), intAny(req["http_status"]), stringAny(req["error_class"])
+}
+
+func intAny(v any) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	default:
+		return 0
+	}
+}
+
+func int64Any(v any) int64 {
+	switch n := v.(type) {
+	case int:
+		return int64(n)
+	case int64:
+		return n
+	case float64:
+		return int64(n)
+	default:
+		return 0
+	}
+}
+
+func stringAny(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
+}
+
+func buildRunObservables(run incident) []investigation.Observable {
+	obs := []investigation.Observable{}
+	if isPublicIP(run.SrcIP) {
+		obs = append(obs, investigation.Observable{Kind: investigation.ObservableIP, Value: run.SrcIP, Role: "src_ip", Source: "incident.run.src_ip"})
+	}
+	if isPublicIP(run.DstIP) {
+		obs = append(obs, investigation.Observable{Kind: investigation.ObservableIP, Value: run.DstIP, Role: "dst_ip", Source: "incident.run.dst_ip"})
+	}
+	if hash := normalizeSHA256Observable(run.ExecSHA256); hash != "" {
+		obs = append(obs, investigation.Observable{Kind: investigation.ObservableSHA256, Value: hash, Role: "exec_sha256", Source: "incident.run.exec_sha256"})
+	}
+	if hash := normalizeSHA256Observable(run.FileSHA256); hash != "" {
+		obs = append(obs, investigation.Observable{Kind: investigation.ObservableSHA256, Value: hash, Role: "file_sha256", Source: "incident.run.file_sha256"})
+	}
+	for _, rawURL := range extractRunObservableURLs(run.Target, run.Cmdline) {
+		obs = append(obs, investigation.Observable{Kind: investigation.ObservableURL, Value: rawURL, Role: "url", Source: "incident.run.url"})
+		if host := extractDomainFromURL(rawURL); host != "" {
+			obs = append(obs, investigation.Observable{Kind: investigation.ObservableDomain, Value: host, Role: "domain", Source: "incident.run.url_host"})
+		}
+	}
+	for _, domain := range extractRunObservableDomains(run.DNSName, run.Target) {
+		obs = append(obs, investigation.Observable{Kind: investigation.ObservableDomain, Value: domain, Role: "domain", Source: "incident.run.domain"})
+	}
+	return obs
+}
+
+func normalizeSHA256Observable(raw string) string {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	if len(s) != 64 {
+		return ""
+	}
+	if _, err := hex.DecodeString(s); err != nil {
+		return ""
+	}
+	return s
+}
+
+func extractRunObservableURLs(values ...string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	var out []string
+	for _, raw := range values {
+		for _, match := range observableURLPattern.FindAllString(raw, -1) {
+			if normalized := normalizeURLObservable(match); normalized != "" {
+				out = append(out, normalized)
+			}
+		}
+		if normalized := normalizeURLObservable(raw); normalized != "" {
+			out = append(out, normalized)
+		}
+	}
+	return dedupeStrings(out)
+}
+
+func normalizeURLObservable(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	s = strings.TrimRight(s, ".,;:!?)>]}'\"")
+	u, err := url.ParseRequestURI(s)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	u.Fragment = ""
+	return u.String()
+}
+
+func extractRunObservableDomains(values ...string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	var out []string
+	for _, raw := range values {
+		if normalized := normalizeDomainObservable(raw); normalized != "" {
+			out = append(out, normalized)
+		}
+	}
+	return dedupeStrings(out)
+}
+
+func extractDomainFromURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return normalizeDomainObservable(u.Hostname())
+}
+
+func normalizeDomainObservable(raw string) string {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	if s == "" {
+		return ""
+	}
+	s = strings.Trim(s, "[](){}<>,;:!?'\"")
+	if strings.Contains(s, "://") {
+		u, err := url.Parse(s)
+		if err != nil {
+			return ""
+		}
+		s = strings.ToLower(strings.TrimSpace(u.Hostname()))
+	}
+	s = strings.TrimSuffix(s, ".")
+	if s == "" || net.ParseIP(s) != nil || !strings.Contains(s, ".") {
+		return ""
+	}
+	labels := strings.Split(s, ".")
+	for _, label := range labels {
+		if label == "" || strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return ""
+		}
+		for _, ch := range label {
+			if (ch < 'a' || ch > 'z') && (ch < '0' || ch > '9') && ch != '-' {
+				return ""
+			}
+		}
+	}
+	return s
+}
+
+func dedupeStrings(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, item := range in {
+		if item == "" {
+			continue
+		}
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		out = append(out, item)
+	}
+	return out
+}
+
+func dedupeInvestigationObservables(in []investigation.Observable) []investigation.Observable {
+	if len(in) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(in))
+	out := make([]investigation.Observable, 0, len(in))
+	for _, obs := range in {
+		key := strings.Join([]string{string(obs.Kind), obs.Value, obs.Role, obs.Source}, "|")
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, obs)
+	}
+	return out
+}
+
+func isPublicIP(ip string) bool {
+	p := net.ParseIP(strings.TrimSpace(ip))
+	if p == nil {
+		return false
+	}
+	if p.IsLoopback() || p.IsLinkLocalUnicast() || p.IsLinkLocalMulticast() || p.IsPrivate() {
+		return false
+	}
+	return true
 }
 
 func defaultSOCBucket(windowMs int64) int64 {
@@ -4317,6 +4908,9 @@ func (a *app) loadState() ([]incident, map[string][]stepResult, map[string]creat
 		r.ExecPath = chooseNonEmpty(strVal(obj["exec_path"]), r.ExecPath)
 		r.Comm = chooseNonEmpty(strVal(obj["comm"]), r.Comm)
 		r.Cmdline = chooseNonEmpty(strVal(obj["cmdline"]), r.Cmdline)
+		r.FileSHA256 = chooseNonEmpty(strVal(obj["file_sha256"]), r.FileSHA256)
+		r.ExecSHA256 = chooseNonEmpty(strVal(obj["exec_sha256"]), r.ExecSHA256)
+		r.DNSName = chooseNonEmpty(strVal(obj["dns_name"]), r.DNSName)
 		r.IdentityDisplayName = chooseNonEmpty(strVal(obj["identity_display_name"]), r.IdentityDisplayName)
 		r.IdentityDepartment = chooseNonEmpty(strVal(obj["identity_department"]), r.IdentityDepartment)
 		r.IdentityManager = chooseNonEmpty(strVal(obj["identity_manager"]), r.IdentityManager)
@@ -4417,10 +5011,17 @@ func (a *app) loadState() ([]incident, map[string][]stepResult, map[string]creat
 				EventType:              strVal(obj["event_type"]),
 				SrcIP:                  strVal(obj["src_ip"]),
 				DstIP:                  strVal(obj["dst_ip"]),
+				DstPort:                intVal(obj["dst_port"], 0),
+				ProtocolFamily:         strVal(obj["protocol_family"]),
+				ScanFanout:             intVal(obj["scan_fanout"], 0),
+				TopDestinations:        stringSliceVal(obj["top_destinations"]),
 				User:                   chooseNonEmpty(strVal(obj["user"]), strVal(obj["user_name"])),
 				ExecPath:               strVal(obj["exec_path"]),
 				Comm:                   strVal(obj["comm"]),
 				Cmdline:                strVal(obj["cmdline"]),
+				FileSHA256:             strVal(obj["file_sha256"]),
+				ExecSHA256:             strVal(obj["exec_sha256"]),
+				DNSName:                strVal(obj["dns_name"]),
 				IdentityDisplayName:    strVal(obj["identity_display_name"]),
 				IdentityDepartment:     strVal(obj["identity_department"]),
 				IdentityManager:        strVal(obj["identity_manager"]),
@@ -4447,11 +5048,20 @@ func (a *app) loadState() ([]incident, map[string][]stepResult, map[string]creat
 			r.EventType = chooseNonEmpty(strVal(obj["event_type"]), r.EventType)
 			r.SrcIP = chooseNonEmpty(strVal(obj["src_ip"]), r.SrcIP)
 			r.DstIP = chooseNonEmpty(strVal(obj["dst_ip"]), r.DstIP)
+			r.DstPort = intVal(obj["dst_port"], r.DstPort)
+			r.ProtocolFamily = chooseNonEmpty(strVal(obj["protocol_family"]), r.ProtocolFamily)
+			r.ScanFanout = intVal(obj["scan_fanout"], r.ScanFanout)
+			if topDestinations := stringSliceVal(obj["top_destinations"]); len(topDestinations) > 0 {
+				r.TopDestinations = topDestinations
+			}
 			r.User = chooseNonEmpty(strVal(obj["user_name"]), r.User)
 			r.User = chooseNonEmpty(strVal(obj["user"]), r.User)
 			r.ExecPath = chooseNonEmpty(strVal(obj["exec_path"]), r.ExecPath)
 			r.Comm = chooseNonEmpty(strVal(obj["comm"]), r.Comm)
 			r.Cmdline = chooseNonEmpty(strVal(obj["cmdline"]), r.Cmdline)
+			r.FileSHA256 = chooseNonEmpty(strVal(obj["file_sha256"]), r.FileSHA256)
+			r.ExecSHA256 = chooseNonEmpty(strVal(obj["exec_sha256"]), r.ExecSHA256)
+			r.DNSName = chooseNonEmpty(strVal(obj["dns_name"]), r.DNSName)
 			r.IdentityDisplayName = chooseNonEmpty(strVal(obj["identity_display_name"]), r.IdentityDisplayName)
 			r.IdentityDepartment = chooseNonEmpty(strVal(obj["identity_department"]), r.IdentityDepartment)
 			r.IdentityManager = chooseNonEmpty(strVal(obj["identity_manager"]), r.IdentityManager)
@@ -4564,11 +5174,20 @@ func (a *app) loadState() ([]incident, map[string][]stepResult, map[string]creat
 			r.EventType = chooseNonEmpty(strVal(obj["event_type"]), r.EventType)
 			r.SrcIP = chooseNonEmpty(strVal(obj["src_ip"]), r.SrcIP)
 			r.DstIP = chooseNonEmpty(strVal(obj["dst_ip"]), r.DstIP)
+			r.DstPort = intVal(obj["dst_port"], r.DstPort)
+			r.ProtocolFamily = chooseNonEmpty(strVal(obj["protocol_family"]), r.ProtocolFamily)
+			r.ScanFanout = intVal(obj["scan_fanout"], r.ScanFanout)
+			if topDestinations := stringSliceVal(obj["top_destinations"]); len(topDestinations) > 0 {
+				r.TopDestinations = topDestinations
+			}
 			r.User = chooseNonEmpty(strVal(obj["user_name"]), r.User)
 			r.User = chooseNonEmpty(strVal(obj["user"]), r.User)
 			r.ExecPath = chooseNonEmpty(strVal(obj["exec_path"]), r.ExecPath)
 			r.Comm = chooseNonEmpty(strVal(obj["comm"]), r.Comm)
 			r.Cmdline = chooseNonEmpty(strVal(obj["cmdline"]), r.Cmdline)
+			r.FileSHA256 = chooseNonEmpty(strVal(obj["file_sha256"]), r.FileSHA256)
+			r.ExecSHA256 = chooseNonEmpty(strVal(obj["exec_sha256"]), r.ExecSHA256)
+			r.DNSName = chooseNonEmpty(strVal(obj["dns_name"]), r.DNSName)
 			r.IdentityDisplayName = chooseNonEmpty(strVal(obj["identity_display_name"]), r.IdentityDisplayName)
 			r.IdentityDepartment = chooseNonEmpty(strVal(obj["identity_department"]), r.IdentityDepartment)
 			r.IdentityManager = chooseNonEmpty(strVal(obj["identity_manager"]), r.IdentityManager)
@@ -5121,6 +5740,37 @@ func (a *app) parseUIStateAudit() []auditEntry {
 	return entries
 }
 
+func (a *app) loadIncidentAnnotations(runID string) []auditEntry {
+	annotations := make([]auditEntry, 0, 8)
+	_ = scanJSONLines(a.cfg.MasterLogPath, func(obj map[string]any) {
+		if strVal(obj["run_id"]) != runID {
+			return
+		}
+		if strVal(obj["msg"]) != "response_run_corroborated" {
+			return
+		}
+		details := map[string]any{}
+		for k, v := range obj {
+			switch k {
+			case "time", "msg", "run_id", "actor", "decision", "status":
+			default:
+				details[k] = v
+			}
+		}
+		annotations = append(annotations, auditEntry{
+			TS:      strVal(obj["time"]),
+			Msg:     strVal(obj["msg"]),
+			RunID:   runID,
+			Details: details,
+			Source:  "master",
+		})
+	})
+	sort.SliceStable(annotations, func(i, j int) bool {
+		return annotations[i].TS > annotations[j].TS
+	})
+	return annotations
+}
+
 func (a *app) loadPurgedRunIDs() map[string]struct{} {
 	out := map[string]struct{}{}
 	_ = scanJSONLines(a.purgedIncidentsStatePath(), func(obj map[string]any) {
@@ -5180,7 +5830,7 @@ func parseAuditLog(path string, source string) []auditEntry {
 		}
 		keep := false
 		switch msg {
-		case "approval_received", "approval_approved", "approval_denied", "approval_timed_out", "response_run_manual_review_required", "response_run_partial_completion", "ui_approval_published", "ui_user_upserted", "ui_user_disabled", "ui_user_deleted", "identity_verification_completed", "identity_verification_failed_safe", "identity_verification_failed", "auth_access_restored", "auth_restore_failed_safe", "auth_access_restore_failed":
+		case "approval_received", "approval_approved", "approval_denied", "approval_timed_out", "response_run_manual_review_required", "response_run_partial_completion", "response_run_corroborated", "ui_approval_published", "ui_user_upserted", "ui_user_disabled", "ui_user_deleted", "identity_verification_completed", "identity_verification_failed_safe", "identity_verification_failed", "auth_access_restored", "auth_restore_failed_safe", "auth_access_restore_failed":
 			keep = true
 		case "response_run_updated":
 			status := strings.ToUpper(strVal(obj["status"]))

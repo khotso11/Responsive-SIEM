@@ -81,7 +81,7 @@ start_process() {
 
 start_process "master-roe" "$MASTER_PID_FILE" "$MASTER_LOG" go run -mod=vendor ./cmd/master-roe --config configs/master.yaml
 start_process "master-roe-worker" "$WORKER_PID_FILE" "$WORKER_LOG" go run -mod=vendor ./cmd/master-roe-worker --config configs/master.yaml --lane BOTH
-start_process "agent" "$AGENT_PID_FILE" "$AGENT_LOG" go run -mod=vendor ./cmd/agent --config configs/agent.yaml
+start_process "agent" "$AGENT_PID_FILE" "$AGENT_LOG" env RSIEM_AGENT_LATERAL_CONTROL_MODE=marker go run -mod=vendor ./cmd/agent --config configs/agent.yaml
 start_process "detector-v0" "$DETECTOR_PID_FILE" "$DETECTOR_LOG" go run -mod=vendor ./cmd/detector-v0 --config configs/detector.yaml
 start_process "collector-tail" "$COLLECTOR_PID_FILE" "$COLLECTOR_LOG" go run -mod=vendor ./cmd/collector-tail --config configs/collector.yaml
 

@@ -1,2 +1,6 @@
 -a always,exit -F arch=b64 -S execve -k rsiem-exec
 -a always,exit -F arch=b32 -S execve -k rsiem-exec
+-a always,exit -F arch=b64 -S connect -k rsiem-connect
+-a always,exit -F arch=b32 -S connect -k rsiem-connect
+-a always,exit -F arch=b64 -S open,openat,openat2,creat,truncate,ftruncate -F dir=/etc -F success=1 -k rsiem-file-access
+-a always,exit -F arch=b32 -S open,openat,creat,truncate,ftruncate -F dir=/etc -F success=1 -k rsiem-file-access

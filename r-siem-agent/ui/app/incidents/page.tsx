@@ -86,6 +86,15 @@ function parseQueryTime(v: string | null): number | undefined {
 
 export default function IncidentsPage() {
   const searchParams = useSearchParams();
+  const requestedRunID = (searchParams.get("open_run_id") || "").trim();
+  const requestedTab = ((searchParams.get("open_tab") || "").trim().toLowerCase() as
+    | "overview"
+    | "steps"
+    | "timeline"
+    | "entities"
+    | "evidence"
+    | "actions"
+    | "");
   const [toasts, setToasts] = useState<Array<{ id: number; tone: "success" | "error"; message: string }>>([]);
   const [items, setItems] = useState<Incident[]>([]);
   const [total, setTotal] = useState(0);
@@ -136,6 +145,12 @@ export default function IncidentsPage() {
   useEffect(() => {
     setQ(searchParams.get("gq") || "");
   }, [searchParams]);
+
+  useEffect(() => {
+    if (!requestedRunID) return;
+    setSelectedRunID(requestedRunID);
+    setDrawerOpen(true);
+  }, [requestedRunID]);
 
   const load = useCallback(() => {
     const params = new URLSearchParams();
@@ -540,6 +555,7 @@ export default function IncidentsPage() {
         onClose={() => setDrawerOpen(false)}
         fromMs={globalFrom}
         toMs={globalTo}
+        initialTab={requestedTab || "overview"}
       />
     </section>
   );

@@ -1,0 +1,27 @@
+{
+  "name": "file sensitive change matches by file_path",
+  "events": [
+    {
+      "event": {
+        "event_idem_key": "evt.regression.file.filepath.1",
+        "observed_at_unix_ms": 1000,
+        "event_type": "file_change",
+        "source_type": "inotify",
+        "host": "khotso-Latitude-5500",
+        "node_id": "khotso-Latitude-5500",
+        "src_ip": "127.0.0.1",
+        "user": "khotso",
+        "file_path": "/etc/sudoers.d/rsiem-proof",
+        "action": "modified",
+        "message": "sensitive file change ts=1000"
+      },
+      "expect": {
+        "matched": true,
+        "rule_id": "R-FILE-SENSITIVE-CHANGE",
+        "lane": "FAST",
+        "severity": "high",
+        "group_key": "khotso-Latitude-5500"
+      }
+    }
+  ]
+}

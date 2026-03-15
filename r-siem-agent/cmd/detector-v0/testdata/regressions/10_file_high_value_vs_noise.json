@@ -1,0 +1,46 @@
+{
+  "name": "file high value standalone and noise suppression",
+  "events": [
+    {
+      "event": {
+        "event_idem_key": "evt.reg.file.noise.1",
+        "observed_at_unix_ms": 1000,
+        "event_ts_unix_ms": 1000,
+        "recv_ts_unix_ms": 1000,
+        "event_type": "file_change",
+        "source_type": "inotify",
+        "node_id": "lab-node",
+        "host": "lab-node",
+        "src_ip": "127.0.0.1",
+        "user": "unknown",
+        "file_path": "/etc/passwd",
+        "message": "FILE path=\"/etc/passwd\" action=modified",
+        "line": "FILE path=\"/etc/passwd\" action=modified"
+      },
+      "expect": {
+        "matched": false
+      }
+    },
+    {
+      "event": {
+        "event_idem_key": "evt.reg.file.highvalue.1",
+        "observed_at_unix_ms": 2000,
+        "event_ts_unix_ms": 2000,
+        "recv_ts_unix_ms": 2000,
+        "event_type": "file_change",
+        "source_type": "inotify",
+        "node_id": "lab-node",
+        "host": "lab-node",
+        "src_ip": "127.0.0.1",
+        "user": "alice",
+        "file_path": "/etc/sudoers.d/custom",
+        "message": "FILE path=\"/etc/sudoers.d/custom\" action=modified",
+        "line": "FILE path=\"/etc/sudoers.d/custom\" action=modified"
+      },
+      "expect": {
+        "matched": true,
+        "rule_id": "R-FILE-SENSITIVE-CHANGE"
+      }
+    }
+  ]
+}

@@ -116,10 +116,15 @@ func loadDetectorRegressionConfig(t *testing.T) *config.DetectorConfig {
 func resetDetectorRegressionState(cfg *config.DetectorConfig) {
 	fr03HostBurstTracker = newBurstTracker(fr03HostBurstWindowMs, fr03HostBurstThreshold)
 	processBurstTracker = newBurstTracker(processBurstWindowMs, processCountThreshold)
+	countFailedPwSrcTracker = newBurstTracker(countFailedPwWindowMs, countFailedPwThreshold)
+	authFailedPwBurstUserTracker = newBurstTracker(authBurstUserWindowMs, authBurstUserThreshold)
+	authFailedPwBurstSrcTracker = newBurstTracker(authBurstSrcWindowMs, authBurstSrcThreshold)
 	recentAuthByNode = newLastSeenTracker(5 * time.Minute)
+	recentLocalAdminByNode = newLastSeenTracker(2 * time.Minute)
 	recentSuspiciousProcByNode = newLastSeenTracker(2 * time.Minute)
 	recentSuspiciousProcContext = newRecentProcessContextTracker(2 * time.Minute)
 	recentAuthProcByNode = newLastSeenTracker(5 * time.Minute)
+	recentFileAlertByPath = newLastSeenTracker(15 * time.Second)
 	initNetworkPolicy(cfg)
 	initBaselinePolicy(cfg)
 }

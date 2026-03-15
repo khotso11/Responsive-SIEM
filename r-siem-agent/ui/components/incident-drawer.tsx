@@ -9,11 +9,13 @@ import {
   downloadIncidentReport,
   getApiBase,
   getArtifacts,
+  getInvestigation,
   getIncident,
   getIncidentEvents,
   isUnauthorizedError,
   me,
   markIncidentReviewed,
+  refreshInvestigation,
   reissueIncident,
   restoreIncidentAccess,
   rejectIncident
@@ -21,7 +23,7 @@ import {
   verifyIncidentUser
 } from "@/lib/api";
 import { emitIncidentMutated, emitIncidentsUpdated, INCIDENT_MUTATED_EVENT, INCIDENTS_UPDATED_EVENT } from "@/lib/events";
-import { AuthUser, EventRow, Incident, IncidentUIState, StepResult } from "@/lib/types";
+import { AuditEntry, AuthUser, EventRow, Incident, IncidentUIState, StepResult, InvestigationResponse } from "@/lib/types";
 import { EmptyState, LaneBadge, LoadingState, StatusBadge, ValueRow, unixMsToLocal } from "@/components/ui";
 
 type DrawerTab = "overview" | "steps" | "timeline" | "entities" | "evidence" | "actions";
@@ -54,18 +56,226 @@ function policyHighlights(run: Incident | null): string[] {
   return highlights;
 }
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function annotationSummary(entry: AuditEntry): string {
+  if (entry.msg !== "response_run_corroborated") {
+    return entry.msg.replaceAll("_", " ");
+  }
+  const details = asRecord(entry.details) || {};
+  const sourceType = String(details.source_type || entry.source || "system");
+  const protocolFamily = String(details.protocol_family || "");
+  const dstIP = String(details.dst_ip || "");
+  const dstPort = Number(details.dst_port || 0);
+  const execPath = String(details.exec_path || details.comm || "");
+  const parts = [`Later ${sourceType} telemetry corroborated this incident`];
+  const destination = [protocolFamily || "", dstPort > 0 ? String(dstPort) : "", dstIP || ""].filter(Boolean).join(" ");
+  if (destination) parts.push(`for ${destination}`);
+  if (execPath) parts.push(`from ${execPath}`);
+  return parts.join(" ") + ".";
+}
+
+function intFromUnknown(value: unknown): number {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  return 0;
+}
+
+function stringFromUnknown(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function requestMetrics(data?: Record<string, unknown>): { attempts: number; latencyMs: number; httpStatus: number; errorClass: string } {
+  const req = asRecord(data?._request);
+  if (!req) {
+    return { attempts: 0, latencyMs: 0, httpStatus: 0, errorClass: "" };
+  }
+  return {
+    attempts: intFromUnknown(req.attempts),
+    latencyMs: intFromUnknown(req.latency_ms),
+    httpStatus: intFromUnknown(req.http_status),
+    errorClass: stringFromUnknown(req.error_class)
+  };
+}
+
+function intelligenceStatusLabel(status?: string): string {
+  switch ((status || "").toLowerCase()) {
+    case "ok":
+      return "ok";
+    case "timeout":
+      return "timeout";
+    case "timed_out":
+      return "timed out";
+    case "network_error":
+      return "network";
+    case "upstream_error":
+      return "upstream";
+    case "auth_failed":
+      return "auth failed";
+    case "rate_limited":
+      return "rate limited";
+    case "running":
+      return "running";
+    case "requested":
+      return "requested";
+    case "completed":
+      return "completed";
+    default:
+      return status || "unknown";
+  }
+}
+
+function intelligenceStatusClass(status?: string): string {
+  switch ((status || "").toLowerCase()) {
+    case "ok":
+    case "completed":
+      return "border-emerald-700/60 bg-emerald-950/70 text-emerald-200";
+    case "timeout":
+    case "timed_out":
+      return "border-amber-700/60 bg-amber-950/70 text-amber-200";
+    case "network_error":
+      return "border-sky-700/60 bg-sky-950/70 text-sky-200";
+    case "upstream_error":
+    case "rate_limited":
+      return "border-fuchsia-700/60 bg-fuchsia-950/70 text-fuchsia-200";
+    case "auth_failed":
+      return "border-rose-700/60 bg-rose-950/70 text-rose-200";
+    case "running":
+    case "requested":
+      return "border-cyan-700/60 bg-cyan-950/70 text-cyan-200";
+    default:
+      return "border-ink-700/60 bg-ink-900/70 text-ink-200";
+  }
+}
+
+function providerMeta(provider?: string): { label: string; mark: string; cardClass: string; markClass: string } {
+  switch ((provider || "").toLowerCase()) {
+    case "virustotal":
+      return {
+        label: "VirusTotal",
+        mark: "VT",
+        cardClass: "border-sky-800/70 bg-sky-950/20",
+        markClass: "border-sky-700/70 bg-sky-950/70 text-sky-100"
+      };
+    case "abuseipdb":
+      return {
+        label: "AbuseIPDB",
+        mark: "AB",
+        cardClass: "border-emerald-800/70 bg-emerald-950/20",
+        markClass: "border-emerald-700/70 bg-emerald-950/70 text-emerald-100"
+      };
+    case "greynoise":
+      return {
+        label: "GreyNoise",
+        mark: "GN",
+        cardClass: "border-fuchsia-800/70 bg-fuchsia-950/20",
+        markClass: "border-fuchsia-700/70 bg-fuchsia-950/70 text-fuchsia-100"
+      };
+    case "urlscan":
+      return {
+        label: "urlscan",
+        mark: "US",
+        cardClass: "border-amber-800/70 bg-amber-950/20",
+        markClass: "border-amber-700/70 bg-amber-950/70 text-amber-100"
+      };
+    default:
+      return {
+        label: provider || "provider",
+        mark: (provider || "?").slice(0, 2).toUpperCase(),
+        cardClass: "border-ink-800 bg-ink-950/70",
+        markClass: "border-ink-700 bg-ink-900 text-ink-100"
+      };
+  }
+}
+
+function combinedReputationSummary(
+  summaries: Array<{ provider: string; status: string; verdict: string; score?: number; summary: string }>
+): { tone: string; title: string; detail: string } | null {
+  if (summaries.length === 0) return null;
+  const ok = summaries.filter((item) => item.status === "ok");
+  if (ok.length === 0) {
+    return {
+      tone: "border-amber-800/60 bg-amber-950/20 text-amber-100",
+      title: "Reputation: no completed provider verdicts yet",
+      detail: "Enabled providers have not returned a completed reputation verdict for this incident."
+    };
+  }
+
+  const suspicious = ok.filter((item) => {
+    const verdict = (item.verdict || "").toLowerCase();
+    return verdict === "malicious" || verdict === "suspicious";
+  });
+  if (suspicious.length > 0) {
+    return {
+      tone: "border-rose-800/60 bg-rose-950/20 text-rose-100",
+      title: "Reputation: suspicious across enabled providers",
+      detail: suspicious.map((item) => `${providerMeta(item.provider).label}: ${item.summary}`).join(" | ")
+    };
+  }
+
+  const cleanish = ok.filter((item) => {
+    const verdict = (item.verdict || "").toLowerCase();
+    return verdict === "benign" || verdict === "harmless" || verdict === "unknown" || verdict === "";
+  });
+  if (cleanish.length === ok.length) {
+    return {
+      tone: "border-emerald-800/60 bg-emerald-950/20 text-emerald-100",
+      title: "Reputation: clean across enabled providers",
+      detail: `${ok.length} provider${ok.length === 1 ? "" : "s"} reported no negative reputation signal. A score of 0 here means clean/no signal, not a failed lookup.`
+    };
+  }
+
+  return {
+    tone: "border-cyan-800/60 bg-cyan-950/20 text-cyan-100",
+    title: "Reputation: mixed provider context",
+    detail: ok.map((item) => `${providerMeta(item.provider).label}: ${item.summary}`).join(" | ")
+  };
+}
+
+function providerSummaryHeadline(summary: { provider: string; status: string; verdict: string; score?: number; summary: string }): string {
+  const provider = (summary.provider || "").toLowerCase();
+  const verdict = (summary.verdict || "").toLowerCase();
+  const score = typeof summary.score === "number" ? summary.score : undefined;
+  if (summary.status === "ok" && score === 0) {
+    if (provider === "abuseipdb" && (verdict === "benign" || verdict === "unknown" || verdict === "")) {
+      return "No abuse reports found in AbuseIPDB";
+    }
+    if (provider === "virustotal" && (verdict === "benign" || verdict === "harmless" || verdict === "unknown" || verdict === "")) {
+      return "No malicious or suspicious detections in VirusTotal";
+    }
+    return "No negative reputation signal returned";
+  }
+  return summary.summary;
+}
+
+function providerScoreHint(summary: { provider: string; status: string; verdict: string; score?: number }): string {
+  if (summary.status !== "ok" || summary.score !== 0) return "";
+  const provider = (summary.provider || "").toLowerCase();
+  if (provider === "abuseipdb") {
+    return "Score 0 means AbuseIPDB reported no abuse confidence for this observable.";
+  }
+  if (provider === "virustotal") {
+    return "Score 0 means VirusTotal returned no malicious or suspicious signal for this observable.";
+  }
+  return "Score 0 means the provider returned no negative reputation signal.";
+}
+
 export function IncidentDrawer({
   runID,
   open,
   onClose,
   fromMs,
-  toMs
+  toMs,
+  initialTab
 }: {
   runID: string;
   open: boolean;
   onClose: () => void;
   fromMs?: number;
   toMs?: number;
+  initialTab?: DrawerTab;
 }) {
   const [tab, setTab] = useState<DrawerTab>("overview");
   const [run, setRun] = useState<Incident | null>(null);
@@ -74,6 +284,9 @@ export function IncidentDrawer({
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [hasLoadedOnce, setHasLoadedOnce] = useState(false);
+  const [investigation, setInvestigation] = useState<InvestigationResponse | null>(null);
+  const [investigationLoading, setInvestigationLoading] = useState(false);
+  const [investigationError, setInvestigationError] = useState("");
   const [actionBusy, setActionBusy] = useState(false);
   const [actor, setActor] = useState("");
   const [actorDirty, setActorDirty] = useState(false);
@@ -85,6 +298,7 @@ export function IncidentDrawer({
   const [pivotNode, setPivotNode] = useState("");
   const [artifactMap, setArtifactMap] = useState<Array<{ path: string; is_dir: boolean; size: number; modified: string }>>([]);
   const [uiState, setUIState] = useState<IncidentUIState>({ notes: [], assignment: "", reviewed: false });
+  const [annotations, setAnnotations] = useState<AuditEntry[]>([]);
   const [assignee, setAssignee] = useState("");
   const [assigneeDirty, setAssigneeDirty] = useState(false);
   const [noteText, setNoteText] = useState("");
@@ -107,6 +321,7 @@ export function IncidentDrawer({
       setSteps(detail.steps || []);
       setAuthUser(user);
       setUIState(detail.ui_state || { notes: [], assignment: "", reviewed: false });
+      setAnnotations(detail.annotations || []);
       if (!actorDirty) {
         setActor(user?.username || "soc.analyst");
       }
@@ -141,8 +356,23 @@ export function IncidentDrawer({
     }
   }, [actorDirty, assigneeDirty, fromMs, hasLoadedOnce, open, pivotNode, pivotSrcIP, pivotUser, runID, toMs]);
 
+  const loadInvestigationData = useCallback(async () => {
+    if (!runID || !open) return;
+    setInvestigationError("");
+    setInvestigationLoading(true);
+    try {
+      const res = await getInvestigation(runID);
+      setInvestigation(res);
+    } catch (err: any) {
+      setInvestigationError(err?.message || "investigation load failed");
+    } finally {
+      setInvestigationLoading(false);
+    }
+  }, [open, runID]);
+
   useEffect(() => {
     if (!open) return;
+    setTab(initialTab || "overview");
     setDecisionMsg("");
     setNewRunID("");
     setActor("");
@@ -157,14 +387,22 @@ export function IncidentDrawer({
     setRestoreScope("both");
     setRestoreReason("");
     setRestoreReference("");
+    setInvestigation(null);
+    setInvestigationError("");
+    setInvestigationLoading(false);
     setHasLoadedOnce(false);
     setLoading(false);
     setRefreshing(false);
-  }, [runID, open]);
+  }, [initialTab, runID, open]);
 
   useEffect(() => {
     load();
   }, [load]);
+
+  useEffect(() => {
+    if (!open || tab !== "evidence") return;
+    void loadInvestigationData();
+  }, [loadInvestigationData, open, tab, runID]);
 
   useEffect(() => {
     if (!open || !runID) return;
@@ -220,6 +458,20 @@ export function IncidentDrawer({
     return cp;
   }, [events]);
 
+  const refreshInvestigationNow = useCallback(async () => {
+    if (!runID) return;
+    setInvestigationError("");
+    setInvestigationLoading(true);
+    try {
+      await refreshInvestigation(runID);
+      await loadInvestigationData();
+    } catch (err: any) {
+      setInvestigationError(err?.message || "refresh failed");
+    } finally {
+      setInvestigationLoading(false);
+    }
+  }, [loadInvestigationData, runID]);
+
   const bundle = useMemo(
     () => ({
       run,
@@ -230,6 +482,25 @@ export function IncidentDrawer({
     }),
     [run, steps, events, uiState]
   );
+
+  const investigationJobs = Array.isArray(investigation?.jobs) ? investigation.jobs : [];
+  const investigationObservables = Array.isArray(investigation?.observables) ? investigation.observables : [];
+  const investigationEnrichments = Array.isArray(investigation?.enrichments) ? investigation.enrichments : [];
+  const investigationSummaries = Array.isArray(investigation?.summaries) ? investigation.summaries : [];
+  const visibleInvestigationSummaries = investigationSummaries.filter((summary) => summary.status !== "skipped_no_api_key");
+  const visibleInvestigationEnrichments = investigationEnrichments.filter((enrichment) => enrichment.status !== "skipped_no_api_key");
+  const reputationSummary = combinedReputationSummary(visibleInvestigationSummaries);
+  const scanTopDestinations = Array.isArray(run?.top_destinations) ? run.top_destinations.filter(Boolean) : [];
+  const scanContextVisible = Boolean(run?.protocol_family || run?.dst_port || run?.scan_fanout || scanTopDestinations.length > 0);
+  const observableFieldHints = [
+    { label: "dst_ip", value: run?.dst_ip },
+    { label: "src_ip", value: run?.src_ip },
+    { label: "url", value: typeof run?.target === "string" && /^https?:\/\//i.test(run.target) ? run.target : "" },
+    { label: "domain", value: run?.dns_name },
+    { label: "file hash", value: run?.file_sha256 || run?.exec_sha256 }
+  ];
+  const presentObservableHints = observableFieldHints.filter((item) => item.value);
+  const missingObservableHints = observableFieldHints.filter((item) => !item.value);
 
   const exportBundle = () => {
     const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: "application/json" });
@@ -471,6 +742,10 @@ export function IncidentDrawer({
             <ValueRow label="event_type" value={run.event_type} />
             <ValueRow label="src_ip" value={run.src_ip} />
             <ValueRow label="dst_ip" value={run.dst_ip} />
+            <ValueRow label="dst_port" value={run.dst_port ? String(run.dst_port) : "-"} />
+            <ValueRow label="protocol_family" value={run.protocol_family} />
+            <ValueRow label="scan_fanout" value={run.scan_fanout ? String(run.scan_fanout) : "-"} />
+            <ValueRow label="top_destinations" value={scanTopDestinations.length > 0 ? scanTopDestinations.join(", ") : "-"} />
             <ValueRow label="user_name" value={run.user_name} />
             <ValueRow label="identity_display_name" value={run.identity_display_name} />
             <ValueRow label="identity_department" value={run.identity_department} />
@@ -632,6 +907,228 @@ export function IncidentDrawer({
               <button className="btn-secondary" onClick={() => void downloadIncidentReport(runID, "pdf")}>
                 Download PDF Report
               </button>
+              <button className="btn-secondary" onClick={() => void loadInvestigationData()} disabled={investigationLoading}>
+                {investigationLoading ? "Loading intel..." : "Reload Intelligence"}
+              </button>
+              <button className="btn-primary" onClick={() => void refreshInvestigationNow()} disabled={investigationLoading}>
+                Run Enrichment
+              </button>
+            </div>
+            {scanContextVisible ? (
+              <div className="rounded border border-cyan-900/70 bg-cyan-950/20 p-3">
+                <div className="mb-2 text-sm font-semibold text-cyan-100">Scan Context</div>
+                <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+                  <div>
+                    <div className="text-[11px] uppercase tracking-[0.18em] text-cyan-300/80">Protocol</div>
+                    <div className="mt-1 text-sm text-ink-100">{run?.protocol_family || "-"}</div>
+                  </div>
+                  <div>
+                    <div className="text-[11px] uppercase tracking-[0.18em] text-cyan-300/80">Destination Port</div>
+                    <div className="mt-1 text-sm text-ink-100">{run?.dst_port || "-"}</div>
+                  </div>
+                  <div>
+                    <div className="text-[11px] uppercase tracking-[0.18em] text-cyan-300/80">Fan-out</div>
+                    <div className="mt-1 text-sm text-ink-100">{run?.scan_fanout || "-"}</div>
+                  </div>
+                </div>
+                {scanTopDestinations.length > 0 ? (
+                  <div className="mt-3">
+                    <div className="mb-2 text-[11px] uppercase tracking-[0.18em] text-cyan-300/80">Top Destinations</div>
+                    <div className="flex flex-wrap gap-2 text-xs">
+                      {scanTopDestinations.map((destination) => (
+                        <span key={destination} className="rounded border border-cyan-800/70 bg-cyan-950/40 px-2 py-1 text-cyan-50">
+                          {destination}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+            <div className="rounded border border-ink-800 bg-ink-900/40 p-3 space-y-2">
+              <div className="flex items-center justify-between">
+                <h4 className="text-sm font-semibold">External Intelligence</h4>
+                {investigationJobs[0] ? (
+                  <div className="flex items-center gap-2 text-xs text-ink-400">
+                    <span>last job:</span>
+                    <span className={`rounded border px-2 py-0.5 ${intelligenceStatusClass(investigationJobs[0].status)}`}>
+                      {intelligenceStatusLabel(investigationJobs[0].status)}
+                    </span>
+                    <span>{unixMsToLocal(investigationJobs[0].requested_at_unix_ms)}</span>
+                  </div>
+                ) : null}
+              </div>
+              {investigationJobs.length > 0 ? (
+                <div className="flex flex-wrap gap-2 text-[11px]">
+                  {investigationJobs.slice(0, 4).map((job) => (
+                    <span key={job.job_id} className="rounded border border-ink-800 bg-ink-950/70 px-2 py-1 text-ink-300">
+                      <span className={`mr-2 rounded border px-1.5 py-0.5 ${intelligenceStatusClass(job.status)}`}>
+                        {intelligenceStatusLabel(job.status)}
+                      </span>
+                      {job.job_id}
+                    </span>
+                  ))}
+                </div>
+              ) : null}
+              {reputationSummary ? (
+                <div className={`rounded border px-3 py-2 text-sm ${reputationSummary.tone}`}>
+                  <div className="font-semibold">{reputationSummary.title}</div>
+                  <div className="mt-1 text-xs opacity-90">{reputationSummary.detail}</div>
+                </div>
+              ) : null}
+              {visibleInvestigationSummaries.length > 0 ? (
+                <div className="grid grid-cols-1 gap-2 md:grid-cols-3">
+                  {visibleInvestigationSummaries.map((summary) => {
+                    const meta = providerMeta(summary.provider);
+                    return (
+                    <div key={summary.provider} className={`rounded border p-3 text-xs shadow-[0_0_0_1px_rgba(15,23,42,0.25)] ${meta.cardClass}`}>
+                      <div className="mb-3 flex items-start justify-between gap-3">
+                        <div className="flex items-center gap-3">
+                          <span className={`inline-flex h-9 w-9 items-center justify-center rounded border text-[11px] font-semibold tracking-[0.18em] ${meta.markClass}`}>
+                            {meta.mark}
+                          </span>
+                          <div>
+                            <div className="font-semibold text-ink-100">{meta.label}</div>
+                            <div className="text-[11px] text-ink-400">{summary.provider}</div>
+                          </div>
+                        </div>
+                        <span className={`rounded border px-2 py-0.5 ${intelligenceStatusClass(summary.status)}`}>
+                          {intelligenceStatusLabel(summary.status)}
+                        </span>
+                      </div>
+                        <div className="space-y-2 text-ink-300">
+                        <div className="text-sm text-ink-100">{providerSummaryHeadline(summary)}</div>
+                        {providerScoreHint(summary) ? (
+                          <div className="text-[11px] text-ink-400">{providerScoreHint(summary)}</div>
+                        ) : null}
+                        <div className="flex flex-wrap gap-1 text-[11px]">
+                          {summary.verdict ? <span className="rounded border border-ink-700 bg-ink-900 px-1.5 py-0.5">{summary.verdict}</span> : null}
+                          {summary.latency_ms > 0 ? <span className="rounded border border-ink-700 bg-ink-900 px-1.5 py-0.5">{summary.latency_ms} ms</span> : null}
+                          {summary.attempts > 0 ? <span className="rounded border border-ink-700 bg-ink-900 px-1.5 py-0.5">{summary.attempts}x</span> : null}
+                          {summary.http_status > 0 ? <span className="rounded border border-ink-700 bg-ink-900 px-1.5 py-0.5">HTTP {summary.http_status}</span> : null}
+                          {summary.error_class ? <span className="rounded border border-ink-700 bg-ink-900 px-1.5 py-0.5">{summary.error_class}</span> : null}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                  })}
+                </div>
+              ) : null}
+              {investigationError ? <div className="text-xs text-red-400">{investigationError}</div> : null}
+              {investigationLoading && !investigation ? <LoadingState /> : null}
+              {investigation && investigationObservables.length === 0 ? (
+                <div className="rounded border border-amber-800/60 bg-amber-950/20 p-4">
+                  <div className="mb-2 text-sm font-semibold text-amber-100">No enrichable observables found for this incident</div>
+                  <div className="mb-3 text-xs text-amber-50/90">
+                    External intelligence only runs when the incident contains an observable such as `dst_ip`, `src_ip`, a URL,
+                    a domain, or a file hash.
+                  </div>
+                  <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                    <div className="rounded border border-ink-800 bg-ink-950/60 p-3">
+                      <div className="mb-2 text-[11px] uppercase tracking-[0.18em] text-ink-400">Detected On This Run</div>
+                      {presentObservableHints.length > 0 ? (
+                        <div className="flex flex-wrap gap-2 text-xs">
+                          {presentObservableHints.map((item) => (
+                            <span key={item.label} className="rounded border border-ink-700 bg-ink-900 px-2 py-1 text-ink-200">
+                              {item.label}: {item.value}
+                            </span>
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="text-xs text-ink-400">No supported IOC fields are attached to this run yet.</div>
+                      )}
+                    </div>
+                    <div className="rounded border border-ink-800 bg-ink-950/60 p-3">
+                      <div className="mb-2 text-[11px] uppercase tracking-[0.18em] text-ink-400">Supported For Enrichment</div>
+                      <div className="flex flex-wrap gap-2 text-xs">
+                        {missingObservableHints.map((item) => (
+                          <span key={item.label} className="rounded border border-ink-700 bg-ink-900 px-2 py-1 text-ink-300">
+                            {item.label}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ) : null}
+              {investigationObservables.length > 0 ? (
+                <div className="space-y-3">
+                  <div className="flex flex-wrap gap-2 text-xs">
+                    {investigationObservables.map((o) => (
+                      <span key={`${o.kind}-${o.value}-${o.role}`} className="rounded border border-ink-700 bg-ink-900 px-2 py-1">
+                        {o.kind}:{o.value} <span className="text-ink-400">({o.role})</span>
+                      </span>
+                    ))}
+                  </div>
+                  <div className="overflow-auto rounded border border-ink-800">
+                    <table className="min-w-full text-xs">
+                      <thead>
+                        <tr className="text-left">
+                          <th className="p-2">Observable</th>
+                          <th className="p-2">Provider</th>
+                          <th className="p-2">Status</th>
+                          <th className="p-2">Verdict</th>
+                          <th className="p-2">Score</th>
+                          <th className="p-2">Summary</th>
+                          <th className="p-2">Metrics</th>
+                          <th className="p-2">Fetched</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {visibleInvestigationEnrichments.map((e) => {
+                          const meta = requestMetrics(e.data);
+                          const provider = providerMeta(e.provider);
+                          return (
+                            <tr key={`${e.observable_value}-${e.provider}`} className="border-t border-ink-800/70">
+                              <td className="p-2">{e.observable_kind}:{e.observable_value}</td>
+                              <td className="p-2">
+                                <div className="flex items-center gap-2">
+                                  <span className={`inline-flex h-6 w-6 items-center justify-center rounded border text-[10px] font-semibold tracking-[0.14em] ${provider.markClass}`}>
+                                    {provider.mark}
+                                  </span>
+                                  <span className="text-ink-200">{provider.label}</span>
+                                </div>
+                              </td>
+                              <td className="p-2">
+                                <span className={`rounded border px-2 py-0.5 ${intelligenceStatusClass(e.status)}`}>
+                                  {intelligenceStatusLabel(e.status)}
+                                </span>
+                              </td>
+                              <td className="p-2 text-ink-100">{e.verdict}</td>
+                              <td className="p-2">{e.score ?? 0}</td>
+                              <td className="p-2">
+                                {e.evidence_url ? (
+                                  <a href={e.evidence_url} target="_blank" className="text-sky-300 hover:underline">
+                                    {e.summary || "view"}
+                                  </a>
+                                ) : (
+                                  e.summary || ""
+                                )}
+                              </td>
+                              <td className="p-2">
+                                <div className="flex flex-wrap gap-1 text-[11px]">
+                                  {meta.latencyMs > 0 ? <span className="rounded border border-ink-700 bg-ink-950/80 px-1.5 py-0.5">{meta.latencyMs} ms</span> : null}
+                                  {meta.attempts > 0 ? <span className="rounded border border-ink-700 bg-ink-950/80 px-1.5 py-0.5">{meta.attempts}x</span> : null}
+                                  {meta.httpStatus > 0 ? <span className="rounded border border-ink-700 bg-ink-950/80 px-1.5 py-0.5">HTTP {meta.httpStatus}</span> : null}
+                                  {meta.errorClass ? <span className="rounded border border-ink-700 bg-ink-950/80 px-1.5 py-0.5">{meta.errorClass}</span> : null}
+                                </div>
+                              </td>
+                              <td className="p-2 text-ink-400">{e.fetched_at_unix_ms ? unixMsToLocal(e.fetched_at_unix_ms) : ""}</td>
+                            </tr>
+                          );
+                        })}
+                        {visibleInvestigationEnrichments.length === 0 ? (
+                          <tr>
+                            <td className="p-2 text-ink-400" colSpan={8}>
+                              No active provider results yet. Run enrichment after an observable is attached to this incident.
+                            </td>
+                          </tr>
+                        ) : null}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              ) : null}
             </div>
             {artifactMap.length === 0 ? <EmptyState title="No FR-04 artifacts detected" /> : null}
             {artifactMap.length > 0 ? (
@@ -714,6 +1211,22 @@ export function IncidentDrawer({
                   {authUser?.role === "analyst" ? "Assign to me" : "Assign"}
                 </button>
               </div>
+            </div>
+
+            <div className="rounded border border-ink-800 p-3">
+              <h4 className="mb-2 text-sm font-semibold">System Annotations</h4>
+              {annotations.length > 0 ? (
+                <div className="max-h-36 space-y-1 overflow-auto text-xs">
+                  {annotations.map((entry, i) => (
+                    <div key={`${entry.ts}-${entry.msg}-${i}`} className="rounded bg-ink-900 px-2 py-1">
+                      <div className="text-ink-400">{entry.ts} • {entry.source}</div>
+                      <div>{annotationSummary(entry)}</div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-xs text-ink-400">No system annotations recorded for this run.</p>
+              )}
             </div>
 
             <div className="rounded border border-ink-800 p-3">

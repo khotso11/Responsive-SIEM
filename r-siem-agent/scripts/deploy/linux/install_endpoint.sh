@@ -276,6 +276,23 @@ systemctl daemon-reload
 systemctl enable --now rsiem-agent.service
 systemctl enable --now rsiem-collector-tail.service
 
+AUDIT_RULES_STATUS="not loaded (auditd tooling not detected)"
+if [[ -f "$ETC_DIR/configs/rsiem-audit-execve.rules" ]]; then
+  if command -v augenrules >/dev/null 2>&1 && [[ -d /etc/audit/rules.d ]]; then
+    install -d -m 0755 /etc/audit/rules.d
+    cp "$ETC_DIR/configs/rsiem-audit-execve.rules" /etc/audit/rules.d/rsiem-execve.rules
+    if augenrules --load; then
+      AUDIT_RULES_STATUS="loaded (/etc/audit/rules.d/rsiem-execve.rules)"
+    else
+      AUDIT_RULES_STATUS="copy succeeded, but augenrules --load failed"
+    fi
+  else
+    AUDIT_RULES_STATUS="not loaded (missing /etc/audit/rules.d or augenrules)"
+  fi
+else
+  AUDIT_RULES_STATUS="not loaded (missing ${ETC_DIR}/configs/rsiem-audit-execve.rules)"
+fi
+
 cat <<OUT
 PASS: linux endpoint install completed
 AGENT_ID=${AGENT_ID}
@@ -287,13 +304,7 @@ OPTIONAL collectors:
   systemctl enable --now rsiem-collector-procnet.service
   systemctl enable --now rsiem-collector-dns.service
   systemctl enable --now rsiem-collector-syslog.service (if present)
-Optional auditd execve rules:
-  if auditd is installed:
-    mkdir -p /etc/audit/rules.d
-    cp ${ETC_DIR}/configs/rsiem-audit-execve.rules /etc/audit/rules.d/rsiem-execve.rules
-    augenrules --load
-  if /etc/audit/rules.d or augenrules is missing:
-    install auditd first, then load the rule
+AUDIT_RULES=${AUDIT_RULES_STATUS}
 
 Health checks:
   systemctl status rsiem-agent --no-pager

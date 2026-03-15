@@ -26,12 +26,12 @@ type CollectorConfig struct {
 
 // CollectorJetStreamConfig configures JetStream for collector-tail.
 type CollectorJetStreamConfig struct {
-	URL              string `yaml:"url"`
-	Stream           string `yaml:"stream"`
-	Subject          string `yaml:"subject"`
-	OfflineSpoolPath string `yaml:"offline_spool_path"`
-	OfflineSpoolFsync *bool `yaml:"offline_spool_fsync"`
-	RetryMs          int    `yaml:"retry_ms"`
+	URL               string `yaml:"url"`
+	Stream            string `yaml:"stream"`
+	Subject           string `yaml:"subject"`
+	OfflineSpoolPath  string `yaml:"offline_spool_path"`
+	OfflineSpoolFsync *bool  `yaml:"offline_spool_fsync"`
+	RetryMs           int    `yaml:"retry_ms"`
 }
 
 // CollectorTailConfig configures tailing behavior.
@@ -43,14 +43,15 @@ type CollectorTailConfig struct {
 
 // DetectorConfig configures detector-v0.
 type DetectorConfig struct {
-	LogLevel   string                  `yaml:"log_level"`
-	JetStream  DetectorJetStreamConfig `yaml:"jetstream"`
-	Dedupe     DetectorDedupeConfig    `yaml:"dedupe"`
-	Cooldown   DetectorCooldownConfig  `yaml:"cooldown"`
-	CooldownMs int                     `yaml:"cooldown_ms"`
-	Baseline   DetectorBaselineConfig  `yaml:"baseline"`
-	Network    DetectorNetworkConfig   `yaml:"network"`
-	DNS        DetectorDNSConfig       `yaml:"dns"`
+	LogLevel     string                     `yaml:"log_level"`
+	JetStream    DetectorJetStreamConfig    `yaml:"jetstream"`
+	Dedupe       DetectorDedupeConfig       `yaml:"dedupe"`
+	Cooldown     DetectorCooldownConfig     `yaml:"cooldown"`
+	CooldownMs   int                        `yaml:"cooldown_ms"`
+	Baseline     DetectorBaselineConfig     `yaml:"baseline"`
+	Network      DetectorNetworkConfig      `yaml:"network"`
+	DNS          DetectorDNSConfig          `yaml:"dns"`
+	InternalScan DetectorInternalScanConfig `yaml:"internal_scan"`
 }
 
 // DetectorJetStreamConfig configures JetStream for detector-v0.
@@ -78,6 +79,34 @@ type DetectorNetworkConfig struct {
 	RiskyPorts             []int    `yaml:"risky_ports"`
 	RepeatThreshold        int      `yaml:"repeat_threshold"`
 	RepeatWindowMs         int      `yaml:"repeat_window_ms"`
+}
+
+type DetectorProtocolScanConfig struct {
+	Ports                  []int `yaml:"ports"`
+	UniqueTargetsThreshold int   `yaml:"unique_targets_threshold"`
+	ConfidenceScore        int   `yaml:"confidence_score"`
+}
+
+type DetectorInternalScanAllowlistConfig struct {
+	Users            []string `yaml:"users"`
+	Nodes            []string `yaml:"nodes"`
+	ExecPathPrefixes []string `yaml:"exec_path_prefixes"`
+	CommPrefixes     []string `yaml:"comm_prefixes"`
+}
+
+type DetectorInternalScanConfig struct {
+	Enabled       bool                             `yaml:"enabled"`
+	WindowMs      int                              `yaml:"window_ms"`
+	InternalCIDRs []string                         `yaml:"internal_cidrs"`
+	Allowlist     DetectorInternalScanAllowlistConfig `yaml:"allowlist"`
+	SMB           DetectorProtocolScanConfig       `yaml:"smb"`
+	RPC           DetectorProtocolScanConfig       `yaml:"rpc"`
+	LDAP          DetectorProtocolScanConfig       `yaml:"ldap"`
+	DNS           DetectorProtocolScanConfig       `yaml:"dns"`
+	FTP           DetectorProtocolScanConfig       `yaml:"ftp"`
+	RDP           DetectorProtocolScanConfig       `yaml:"rdp"`
+	WinRM         DetectorProtocolScanConfig       `yaml:"winrm"`
+	SSH           DetectorProtocolScanConfig       `yaml:"ssh"`
 }
 
 // DetectorBaselineConfig tunes in-memory first-seen tracking.
@@ -223,6 +252,20 @@ func applyDetectorDefaults(c *DetectorConfig) {
 	if len(c.DNS.SuspiciousTLDs) == 0 {
 		c.DNS.SuspiciousTLDs = []string{".top", ".xyz", ".zip", ".mov", ".cam"}
 	}
+	if c.InternalScan.WindowMs <= 0 {
+		c.InternalScan.WindowMs = 60000
+	}
+	if len(c.InternalScan.InternalCIDRs) == 0 {
+		c.InternalScan.InternalCIDRs = []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}
+	}
+	applyProtocolScanDefaults(&c.InternalScan.SMB, []int{445}, 5, 90)
+	applyProtocolScanDefaults(&c.InternalScan.RPC, []int{135}, 5, 88)
+	applyProtocolScanDefaults(&c.InternalScan.LDAP, []int{389, 636, 3268, 3269}, 5, 88)
+	applyProtocolScanDefaults(&c.InternalScan.DNS, []int{53}, 8, 82)
+	applyProtocolScanDefaults(&c.InternalScan.FTP, []int{21}, 4, 86)
+	applyProtocolScanDefaults(&c.InternalScan.RDP, []int{3389}, 4, 90)
+	applyProtocolScanDefaults(&c.InternalScan.WinRM, []int{5985, 5986}, 4, 88)
+	applyProtocolScanDefaults(&c.InternalScan.SSH, []int{22}, 5, 86)
 }
 
 func validateDetector(c *DetectorConfig) error {
@@ -247,5 +290,22 @@ func validateDetector(c *DetectorConfig) error {
 	if c.CooldownMs <= 0 {
 		return fmt.Errorf("cooldown_ms must be > 0")
 	}
+	for _, cidr := range c.InternalScan.InternalCIDRs {
+		if strings.TrimSpace(cidr) == "" {
+			return fmt.Errorf("internal_scan.internal_cidrs contains empty value")
+		}
+	}
 	return nil
+}
+
+func applyProtocolScanDefaults(c *DetectorProtocolScanConfig, ports []int, threshold int, confidence int) {
+	if len(c.Ports) == 0 {
+		c.Ports = append([]int(nil), ports...)
+	}
+	if c.UniqueTargetsThreshold <= 0 {
+		c.UniqueTargetsThreshold = threshold
+	}
+	if c.ConfidenceScore <= 0 {
+		c.ConfidenceScore = confidence
+	}
 }

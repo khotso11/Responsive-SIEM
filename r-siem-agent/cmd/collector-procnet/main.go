@@ -66,6 +66,11 @@ type procMeta struct {
 	Cmdline  string
 }
 
+var observedTCPStates = map[string]struct{}{
+	"01": {}, // ESTABLISHED
+	"02": {}, // SYN_SENT
+}
+
 func (e connEntry) key() string {
 	return fmt.Sprintf("%s:%d>%s:%d", e.SrcIP, e.SrcPort, e.DstIP, e.DstPort)
 }
@@ -252,7 +257,10 @@ func readTCPTable(path string, includeLoopback bool) ([]connEntry, error) {
 			continue
 		}
 		fields := strings.Fields(line)
-		if len(fields) < 10 || fields[3] != "01" {
+		if len(fields) < 10 {
+			continue
+		}
+		if _, ok := observedTCPStates[fields[3]]; !ok {
 			continue
 		}
 		srcIP, srcPort, ok := parseHexAddr(fields[1])

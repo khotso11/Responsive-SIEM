@@ -6,6 +6,6 @@ jetstream:
   subject: rsiem.events.raw
 
 collector:
-  poll_ms: 1000
+  poll_ms: 200
   source_type: proc_net
   include_loopback: false

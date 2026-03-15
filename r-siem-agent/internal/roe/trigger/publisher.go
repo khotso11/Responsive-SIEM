@@ -38,6 +38,10 @@ type Alert struct {
 	EventType        string
 	SrcIP            string
 	DstIP            string
+	DstPort          int
+	ProtocolFamily   string
+	ScanFanout       int
+	TopDestinations  []string
 	User             string
 	ExecPath         string
 	Comm             string
@@ -86,6 +90,8 @@ func deriveConfidence(alert Alert) int {
 		score += 6
 	}
 	switch strings.ToLower(strings.TrimSpace(alert.SourceType)) {
+	case "auditd_connect":
+		score += 9
 	case "auditd_exec":
 		score += 8
 	case "inotify":
@@ -210,6 +216,18 @@ func (p *Publisher) PublishAlert(alert Alert) (string, string, error) {
 	}
 	if strings.TrimSpace(alert.DstIP) != "" {
 		payload["dst_ip"] = strings.TrimSpace(alert.DstIP)
+	}
+	if alert.DstPort > 0 {
+		payload["dst_port"] = alert.DstPort
+	}
+	if strings.TrimSpace(alert.ProtocolFamily) != "" {
+		payload["protocol_family"] = strings.TrimSpace(alert.ProtocolFamily)
+	}
+	if alert.ScanFanout > 0 {
+		payload["scan_fanout"] = alert.ScanFanout
+	}
+	if len(alert.TopDestinations) > 0 {
+		payload["top_destinations"] = append([]string(nil), alert.TopDestinations...)
 	}
 	if strings.TrimSpace(alert.ExecPath) != "" {
 		payload["exec_path"] = strings.TrimSpace(alert.ExecPath)

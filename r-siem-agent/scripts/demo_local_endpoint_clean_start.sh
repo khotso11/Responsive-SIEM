@@ -7,10 +7,22 @@ cd "$ROOT_DIR"
 PACKAGE_DIR="${PACKAGE_DIR:-/tmp/rsiem-endpoint-package-local}"
 AGENT_ID="${AGENT_ID:-$(hostname)}"
 UI_WEB_PORT="${UI_WEB_PORT:-3100}"
-INJECT_DEMO_EVENT="${INJECT_DEMO_EVENT:-1}"
+REAL_SYSTEM="${REAL_SYSTEM:-0}"
+INJECT_DEMO_EVENT_DEFAULT="1"
+IDENTITY_DEMO_ROUTE_DEFAULT="1"
+if [[ "$REAL_SYSTEM" == "1" ]]; then
+  INJECT_DEMO_EVENT_DEFAULT="0"
+  IDENTITY_DEMO_ROUTE_DEFAULT="0"
+fi
+INJECT_DEMO_EVENT="${INJECT_DEMO_EVENT:-$INJECT_DEMO_EVENT_DEFAULT}"
 DEMO_USER="${DEMO_USER:-demo_local}"
 DEMO_SRC_IP="${DEMO_SRC_IP:-10.99.1.31}"
-IDENTITY_DEMO_ROUTE="${IDENTITY_DEMO_ROUTE:-1}"
+IDENTITY_DEMO_ROUTE="${IDENTITY_DEMO_ROUTE:-$IDENTITY_DEMO_ROUTE_DEFAULT}"
+START_INVESTIGATION_ENRICHER="${START_INVESTIGATION_ENRICHER:-1}"
+MODE_LABEL="demo_local_endpoint"
+if [[ "$REAL_SYSTEM" == "1" ]]; then
+  MODE_LABEL="real_local_endpoint"
+fi
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -19,9 +31,103 @@ need_cmd() {
   }
 }
 
-for cmd in awk docker go pkill rg sed sudo; do
+HEALTH_FAILURES=0
+
+health_ok() {
+  echo "PASS: $1"
+}
+
+health_fail() {
+  echo "FAIL: $1" >&2
+  HEALTH_FAILURES=$((HEALTH_FAILURES + 1))
+}
+
+for cmd in awk docker go nohup pkill rg sed sudo; do
   need_cmd "$cmd"
 done
+
+start_repo_proc() {
+  local name="$1"
+  local pid_file="$2"
+  local log_file="$3"
+  shift 3
+
+  nohup env GOCACHE="$ROOT_DIR/.cache/go-build" "$@" >> "$log_file" 2>&1 < /dev/null &
+  local pid=$!
+  echo "$pid" > "$pid_file"
+  sleep 1
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "$name started pid=$pid log=$log_file"
+    return 0
+  fi
+
+  echo "FAIL: failed to start ${name} (see ${log_file})" >&2
+  tail -n 40 "$log_file" >&2 || true
+  exit 1
+}
+
+last_log_timestamp() {
+  local log_file="$1"
+  if [[ ! -f "$log_file" ]]; then
+    printf 'missing-log'
+    return 0
+  fi
+  if [[ ! -s "$log_file" ]]; then
+    printf 'no-log-output-yet'
+    return 0
+  fi
+  local ts
+  ts="$(sed -n 's/.*"time":"\([^"]*\)".*/\1/p' "$log_file" 2>/dev/null | tail -n 1 || true)"
+  if [[ -n "$ts" ]]; then
+    printf '%s' "$ts"
+    return 0
+  fi
+  ts="$(sed -n 's/^\([0-9T:+.-]\{19,\}\).*/\1/p' "$log_file" 2>/dev/null | tail -n 1 || true)"
+  if [[ -n "$ts" ]]; then
+    printf '%s' "$ts"
+    return 0
+  fi
+  ts="$(sed -n 's/^\([0-9]\{4\}\/[0-9]\{2\}\/[0-9]\{2\} [0-9:]\{8\}\).*/\1/p' "$log_file" 2>/dev/null | tail -n 1 || true)"
+  if [[ -n "$ts" ]]; then
+    printf '%s' "$ts"
+    return 0
+  fi
+  printf 'unparsed-log-ts'
+}
+
+report_repo_proc_health() {
+  local name="$1"
+  local pid_file="$2"
+  local log_file="$3"
+  if [[ ! -f "$pid_file" ]]; then
+    health_fail "repo:$name missing pid file ($pid_file)"
+    return
+  fi
+  local pid
+  pid="$(tr -d '[:space:]' < "$pid_file")"
+  if [[ -z "$pid" ]]; then
+    health_fail "repo:$name empty pid file ($pid_file)"
+    return
+  fi
+  if ! kill -0 "$pid" 2>/dev/null; then
+    health_fail "repo:$name not running pid=$pid"
+    tail -n 20 "$log_file" >&2 || true
+    return
+  fi
+  health_ok "repo:$name pid=$pid log_ts=$(last_log_timestamp "$log_file")"
+}
+
+report_systemd_unit_health() {
+  local unit="$1"
+  if sudo systemctl is-active --quiet "$unit"; then
+    health_ok "endpoint:$unit active"
+    return
+  fi
+  health_fail "endpoint:$unit not active"
+  sudo systemctl status "$unit" -l --no-pager | sed -n '1,12p' >&2 || true
+}
+
+echo "MODE=${MODE_LABEL}"
 
 echo "[0/10] Preparing local endpoint package"
 mkdir -p "$PACKAGE_DIR/bin" "$PACKAGE_DIR/pki"
@@ -84,6 +190,8 @@ pkill -f '/detector-v0 --config' 2>/dev/null || true
 pkill -f 'go run -mod=vendor ./cmd/detector-v0 --config' 2>/dev/null || true
 pkill -f '/collector-tail --config configs/collector.yaml' 2>/dev/null || true
 pkill -f '/agent --config configs/agent.yaml' 2>/dev/null || true
+pkill -f '/investigation-enricher' 2>/dev/null || true
+pkill -f 'go run ./cmd/investigation-enricher' 2>/dev/null || true
 sleep 2
 
 echo "[2/10] Starting infrastructure"
@@ -145,14 +253,19 @@ if [[ "$IDENTITY_DEMO_ROUTE" == "1" ]]; then
 fi
 
 echo "[4/10] Starting one master, one worker, one detector"
-env GOCACHE="$ROOT_DIR/.cache/go-build" go run -mod=vendor ./cmd/master-roe --config tmp/master_lan_db.yaml >> logs/master-roe.log 2>&1 &
-echo $! > .pids/master-roe.pid
+mkdir -p logs .pids .cache/go-build
+: > logs/master-roe.log
+: > logs/worker.log
+: > logs/detector.log
 
-env GOCACHE="$ROOT_DIR/.cache/go-build" go run -mod=vendor ./cmd/master-roe-worker --config tmp/master_lan_db.yaml --lane BOTH >> logs/worker.log 2>&1 &
-echo $! > .pids/worker.pid
+start_repo_proc "master-roe" ".pids/master-roe.pid" "logs/master-roe.log" \
+  go run -mod=vendor ./cmd/master-roe --config tmp/master_lan_db.yaml
 
-env GOCACHE="$ROOT_DIR/.cache/go-build" go run -mod=vendor ./cmd/detector-v0 --config configs/detector.yaml >> logs/detector.log 2>&1 &
-echo $! > .pids/detector.pid
+start_repo_proc "master-roe-worker" ".pids/worker.pid" "logs/worker.log" \
+  go run -mod=vendor ./cmd/master-roe-worker --config tmp/master_lan_db.yaml --lane BOTH
+
+start_repo_proc "detector-v0" ".pids/detector.pid" "logs/detector.log" \
+  go run -mod=vendor ./cmd/detector-v0 --config configs/detector.yaml
 
 sleep 3
 DB_SINK_LINE="$(rg -n '"msg":"db_sink_enabled"' logs/master-roe.log | tail -n 1 || true)"
@@ -161,6 +274,13 @@ if [[ -z "$DB_SINK_LINE" ]]; then
   exit 1
 fi
 echo "$DB_SINK_LINE"
+DETECTOR_STARTED_LINE="$(rg -n '"msg":"detector_started"' logs/detector.log | tail -n 1 || true)"
+if [[ -z "$DETECTOR_STARTED_LINE" ]]; then
+  echo "FAIL: detector_started not observed in logs/detector.log" >&2
+  tail -n 40 logs/detector.log >&2 || true
+  exit 1
+fi
+echo "$DETECTOR_STARTED_LINE"
 if [[ "$IDENTITY_DEMO_ROUTE" == "1" ]]; then
   echo "IDENTITY_DEMO_ROUTE=PB-AUTH-ABUSE-CONTAIN"
 fi
@@ -182,19 +302,77 @@ sudo usermod -a -G adm rsiem
 echo "[7/10] Restarting installed local endpoint services"
 sudo systemctl restart rsiem-agent
 sudo systemctl restart rsiem-collector-tail
+for optional_unit in rsiem-collector-auditd rsiem-collector-inotify rsiem-collector-procnet rsiem-collector-dns; do
+  if sudo systemctl list-unit-files "${optional_unit}.service" >/dev/null 2>&1; then
+    sudo systemctl restart "${optional_unit}" || true
+  fi
+done
 sleep 3
 
 sudo systemctl status rsiem-agent -l --no-pager | sed -n '1,12p'
 sudo systemctl status rsiem-collector-tail -l --no-pager | sed -n '1,12p'
+for optional_unit in rsiem-collector-auditd rsiem-collector-inotify rsiem-collector-procnet rsiem-collector-dns; do
+  if sudo systemctl is-enabled "${optional_unit}.service" >/dev/null 2>&1 || sudo systemctl is-active "${optional_unit}.service" >/dev/null 2>&1; then
+    sudo systemctl status "${optional_unit}" -l --no-pager | sed -n '1,8p' || true
+  fi
+done
 
 echo "[8/10] Starting UI"
 ./scripts/ui_down.sh >/dev/null 2>&1 || true
 UI_UP_OUT="$(UI_WEB_PORT="$UI_WEB_PORT" ./scripts/ui_up.sh)"
 echo "$UI_UP_OUT"
 
-echo "[9/10] Verifying service logs"
-sudo tail -n 10 /var/log/rsiem/agent.log || true
-sudo tail -n 15 /var/log/rsiem/collector-tail.log || true
+UI_API_URL="$(printf '%s\n' "$UI_UP_OUT" | sed -n 's/^UI_API_URL=//p' | tail -n1)"
+if [[ -z "$UI_API_URL" ]]; then
+  echo "FAIL: UI_API_URL missing from ui_up output" >&2
+  exit 1
+fi
+for _ in $(seq 1 30); do
+  if curl -sS --max-time 3 "${UI_API_URL}/api/health" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+if ! curl -sS --max-time 3 "${UI_API_URL}/api/health" >/dev/null 2>&1; then
+  echo "FAIL: ui api not healthy at ${UI_API_URL}/api/health" >&2
+  tail -n 40 logs/ui-api.log >&2 || true
+  exit 1
+fi
+
+if [[ "$START_INVESTIGATION_ENRICHER" == "1" ]]; then
+  echo "[8a/10] Starting investigation enricher"
+  if [[ -x "./scripts/run_investigation_enricher.sh" && -f "./.env.investigation.local" ]]; then
+    mkdir -p logs .pids
+    : > logs/investigation-enricher.log
+    start_repo_proc "investigation-enricher" ".pids/investigation-enricher.pid" "logs/investigation-enricher.log" \
+      ./scripts/run_investigation_enricher.sh
+  else
+    echo "WARN: investigation-enricher not started (missing ./scripts/run_investigation_enricher.sh or ./.env.investigation.local)" >&2
+  fi
+fi
+
+echo "[9/10] Health summary"
+report_repo_proc_health "master-roe" ".pids/master-roe.pid" "logs/master-roe.log"
+report_repo_proc_health "master-roe-worker" ".pids/worker.pid" "logs/worker.log"
+report_repo_proc_health "detector-v0" ".pids/detector.pid" "logs/detector.log"
+if [[ -f ".pids/investigation-enricher.pid" ]]; then
+  report_repo_proc_health "investigation-enricher" ".pids/investigation-enricher.pid" "logs/investigation-enricher.log"
+fi
+
+report_systemd_unit_health "rsiem-agent"
+report_systemd_unit_health "rsiem-collector-tail"
+for optional_unit in rsiem-collector-auditd rsiem-collector-inotify rsiem-collector-procnet rsiem-collector-dns; do
+  if sudo systemctl list-unit-files "${optional_unit}.service" >/dev/null 2>&1; then
+    report_systemd_unit_health "${optional_unit}"
+  fi
+done
+
+health_ok "ui-api health=${UI_API_URL}/api/health"
+
+if [[ "$HEALTH_FAILURES" -ne 0 ]]; then
+  echo "FAIL: health summary reported ${HEALTH_FAILURES} failure(s)" >&2
+  exit 1
+fi
 
 if [[ "$INJECT_DEMO_EVENT" == "1" ]]; then
   echo "[10/10] Injecting one known-good local auth event"
@@ -222,5 +400,7 @@ PASS: local endpoint clean start completed
 NEXT:
 1) Open UI: http://127.0.0.1:${UI_WEB_PORT}
 2) Refresh the dashboard
-3) Look for Active Endpoints > 0 and a FAST waiting incident if the demo event was injected
+3) Look for Active Endpoints > 0
+4) If REAL_SYSTEM=1, generate real telemetry from this host and confirm new incidents appear
+5) If INJECT_DEMO_EVENT=1, look for a FAST waiting incident from the injected auth event
 EOF

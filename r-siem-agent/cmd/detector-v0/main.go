@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,64 +26,106 @@ import (
 )
 
 const (
-	invalidUserRuleID        = "R-COLLECT-INVALID-USER"
-	statProcessRuleID        = "R-STAT-PROCESS-MED"
-	processCountRuleID       = "R-COUNT-PROCESS-HOST"
-	fileSensitiveRuleID      = "R-FILE-SENSITIVE-CHANGE"
-	networkObserveRuleID     = "R-NET-OUTBOUND-CONNECTION"
-	authProcFileRuleID       = "R-AUTH-PROC-FILE-CHAIN"
-	processFirstSeenRuleID   = "R-PROC-FIRST-SEEN-SUSPICIOUS"
-	networkFirstSeenRuleID   = "R-NET-FIRST-SEEN-RISKY"
-	dnsSuspiciousRuleID      = "R-DNS-SUSPICIOUS-QUERY"
-	fr03HostRuleID           = "R-FR03-HOST-BRUTEFORCE-BURST"
-	fr03NetworkRuleID        = "R-FR03-NETWORK-C2-BEACON"
-	fr03DeceptionRuleID      = "R-FR03-DECEPTION-TRIPWIRE"
-	invalidUserLane          = "FAST"
-	statProcessLane          = "STANDARD"
-	processCountLane         = "STANDARD"
-	fileSensitiveLane        = "FAST"
-	networkObserveLane       = "STANDARD"
-	fr03Lane                 = "FAST"
-	detectorSeverityMedium   = "medium"
-	detectorSeverityHigh     = "high"
-	detectorSeverityCritical = "critical"
-	processCountThreshold    = 3
-	processBurstWindowMs     = 60000
-	fr03HostBurstThreshold   = 3
-	fr03HostBurstWindowMs    = 5000
-	defaultPullBatch         = 10
-	defaultPullTimeout       = 500 * time.Millisecond
+	invalidUserRuleID          = "R-COLLECT-INVALID-USER"
+	collectFailedPwRuleID      = "R-COLLECT-FAILED-PW"
+	countFailedPwSrcRuleID     = "R-COUNT-FAILED-PW-SRCIP"
+	authBurstUserRuleID        = "R-AUTH-FAILED-PW-BURST-USER"
+	authBurstSrcRuleID         = "R-AUTH-FAILED-PW-BURST-SRCIP"
+	statProcessRuleID          = "R-STAT-PROCESS-MED"
+	processCountRuleID         = "R-COUNT-PROCESS-HOST"
+	fileSensitiveRuleID        = "R-FILE-SENSITIVE-CHANGE"
+	networkObserveRuleID       = "R-NET-OUTBOUND-CONNECTION"
+	internalSMBScanRuleID      = "R-NET-INTERNAL-SMB-SCAN"
+	internalRPCScanRuleID      = "R-NET-INTERNAL-RPC-SCAN"
+	internalLDAPScanRuleID     = "R-NET-INTERNAL-LDAP-SCAN"
+	internalDNSScanRuleID      = "R-NET-INTERNAL-DNS-SWEEP"
+	internalFTPScanRuleID      = "R-NET-INTERNAL-FTP-SCAN"
+	internalRDPScanRuleID      = "R-NET-INTERNAL-RDP-SCAN"
+	internalWinRMScanRuleID    = "R-NET-INTERNAL-WINRM-SCAN"
+	internalSSHScanRuleID      = "R-NET-INTERNAL-SSH-SCAN"
+	internalApprovedScanRuleID = "R-NET-INTERNAL-APPROVED-SCAN"
+	authProcFileRuleID         = "R-AUTH-PROC-FILE-CHAIN"
+	processFirstSeenRuleID     = "R-PROC-FIRST-SEEN-SUSPICIOUS"
+	networkFirstSeenRuleID     = "R-NET-FIRST-SEEN-RISKY"
+	dnsSuspiciousRuleID        = "R-DNS-SUSPICIOUS-QUERY"
+	fr03HostRuleID             = "R-FR03-HOST-BRUTEFORCE-BURST"
+	fr03NetworkRuleID          = "R-FR03-NETWORK-C2-BEACON"
+	fr03DeceptionRuleID        = "R-FR03-DECEPTION-TRIPWIRE"
+	invalidUserLane            = "FAST"
+	statProcessLane            = "STANDARD"
+	processCountLane           = "STANDARD"
+	fileSensitiveLane          = "FAST"
+	networkObserveLane         = "STANDARD"
+	internalScanLane           = "FAST"
+	fr03Lane                   = "FAST"
+	detectorSeverityMedium     = "medium"
+	detectorSeverityHigh       = "high"
+	detectorSeverityCritical   = "critical"
+	processCountThreshold      = 3
+	processBurstWindowMs       = 60000
+	countFailedPwThreshold     = 5
+	countFailedPwWindowMs      = 60000
+	authBurstUserThreshold     = 5
+	authBurstUserWindowMs      = 300000
+	authBurstSrcThreshold      = 8
+	authBurstSrcWindowMs       = 300000
+	fr03HostBurstThreshold     = 3
+	fr03HostBurstWindowMs      = 5000
+	defaultPullBatch           = 10
+	defaultPullTimeout         = 500 * time.Millisecond
 )
 
 var (
-	invalidUserPattern          = "invalid user"
-	ipv4FromPattern             = regexp.MustCompile(`(?i)\bfrom\s+(\d{1,3}(?:\.\d{1,3}){3})\b`)
-	processCountPattern         = regexp.MustCompile(`(?i)\bprocess_count=(\d+)\b`)
-	explicitTSPattern           = regexp.MustCompile(`\bts=([0-9]{9,13})\b`)
-	fr03HostMarkerPattern       = regexp.MustCompile(`(?i)\battack=host_bruteforce\b`)
-	fr03NetworkMarkerPattern    = regexp.MustCompile(`(?i)\battack=(network_scan|c2_beacon)\b`)
-	fr03DeceptionPattern        = regexp.MustCompile(`(?i)\battack=deception_tripwire\b`)
-	suspiciousProcPattern       = regexp.MustCompile(`(?i)\b(exec=)?("?)(/usr/bin/(nmap|nc|curl|wget)|/bin/(bash|sh)|/usr/bin/python3?)\b`)
-	sensitiveFilePattern        = regexp.MustCompile(`(?i)(/etc/(sudoers|passwd|shadow)\b|authorized_keys\b|/root/\.ssh/)`)
-	dstIPPattern                = regexp.MustCompile(`(?i)\bdst_ip=([0-9]{1,3}(?:\.[0-9]{1,3}){3})\b`)
-	dstPortPattern              = regexp.MustCompile(`(?i)\bdst_port=(\d{1,5})\b`)
-	dnsNamePattern              = regexp.MustCompile(`(?i)\bqname=([A-Za-z0-9._-]+)\b`)
-	dnsTypePattern              = regexp.MustCompile(`(?i)\bqtype=([A-Za-z0-9]+)\b`)
-	fr03HostBurstTracker        = newBurstTracker(fr03HostBurstWindowMs, fr03HostBurstThreshold)
-	processBurstTracker         = newBurstTracker(processBurstWindowMs, processCountThreshold)
-	networkBurstTracker         *burstTracker
-	knownBadNetworkDestinations map[string]struct{}
-	benignNetworkDestinations   map[string]struct{}
-	knownBadDomains             map[string]struct{}
-	suspiciousDNSTLDs           []string
-	riskyNetworkPorts           map[int]struct{}
-	recentAuthByNode            = newLastSeenTracker(5 * time.Minute)
-	recentSuspiciousProcByNode  = newLastSeenTracker(2 * time.Minute)
-	recentSuspiciousProcContext = newRecentProcessContextTracker(2 * time.Minute)
-	recentAuthProcByNode        = newLastSeenTracker(5 * time.Minute)
-	processFirstSeenTracker     *firstSeenTracker
-	networkFirstSeenTracker     *firstSeenTracker
+	invalidUserPattern            = "invalid user"
+	ipv4FromPattern               = regexp.MustCompile(`(?i)\bfrom\s+(\d{1,3}(?:\.\d{1,3}){3})\b`)
+	processCountPattern           = regexp.MustCompile(`(?i)\bprocess_count=(\d+)\b`)
+	explicitTSPattern             = regexp.MustCompile(`\bts=([0-9]{9,13})\b`)
+	fr03HostMarkerPattern         = regexp.MustCompile(`(?i)\battack=host_bruteforce\b`)
+	fr03NetworkMarkerPattern      = regexp.MustCompile(`(?i)\battack=(network_scan|c2_beacon)\b`)
+	fr03DeceptionPattern          = regexp.MustCompile(`(?i)\battack=deception_tripwire\b`)
+	suspiciousProcPattern         = regexp.MustCompile(`(?i)\b(exec=)?("?)(/usr/bin/(nmap|nc|curl|wget)|/bin/(bash|sh)|/usr/bin/python3?)\b`)
+	highValueSensitiveFilePattern = regexp.MustCompile(`(?i)(/etc/sudoers(\.d(/[^[:space:]]+)?)?\b|authorized_keys\b|/root/\.ssh/)`)
+	chainSensitiveFilePattern     = regexp.MustCompile(`(?i)(/etc/(sudoers(\.d(/[^[:space:]]+)?)?|passwd|shadow|group|gshadow)\b|authorized_keys\b|/root/\.ssh/)`)
+	noisyStandaloneFilePattern    = regexp.MustCompile(`(?i)(/etc/(passwd|group|shadow|gshadow)(\.[^/[:space:]]+)?\b|/etc/[^[:space:]]+\.lock\b|/etc/\.pwd\.lock\b)`)
+	dstIPPattern                  = regexp.MustCompile(`(?i)\bdst_ip=([0-9]{1,3}(?:\.[0-9]{1,3}){3})\b`)
+	dstPortPattern                = regexp.MustCompile(`(?i)\bdst_port=(\d{1,5})\b`)
+	dnsNamePattern                = regexp.MustCompile(`(?i)\bqname=([A-Za-z0-9._-]+)\b`)
+	dnsTypePattern                = regexp.MustCompile(`(?i)\bqtype=([A-Za-z0-9]+)\b`)
+	fr03HostBurstTracker          = newBurstTracker(fr03HostBurstWindowMs, fr03HostBurstThreshold)
+	processBurstTracker           = newBurstTracker(processBurstWindowMs, processCountThreshold)
+	countFailedPwSrcTracker       = newBurstTracker(countFailedPwWindowMs, countFailedPwThreshold)
+	authFailedPwBurstUserTracker  = newBurstTracker(authBurstUserWindowMs, authBurstUserThreshold)
+	authFailedPwBurstSrcTracker   = newBurstTracker(authBurstSrcWindowMs, authBurstSrcThreshold)
+	networkBurstTracker           *burstTracker
+	knownBadNetworkDestinations   map[string]struct{}
+	benignNetworkDestinations     map[string]struct{}
+	knownBadDomains               map[string]struct{}
+	suspiciousDNSTLDs             []string
+	riskyNetworkPorts             map[int]struct{}
+	internalScanCIDRs             []*net.IPNet
+	internalProtocolDetections    []*protocolScanDetection
+	internalScanAllowedUsers      map[string]struct{}
+	internalScanAllowedNodes      map[string]struct{}
+	internalScanAllowedExecPrefix []string
+	internalScanAllowedCommPrefix []string
+	recentAuthByNode              = newLastSeenTracker(5 * time.Minute)
+	recentLocalAdminByNode        = newLastSeenTracker(2 * time.Minute)
+	recentSuspiciousProcByNode    = newLastSeenTracker(2 * time.Minute)
+	recentSuspiciousProcContext   = newRecentProcessContextTracker(2 * time.Minute)
+	recentAuthProcByNode          = newLastSeenTracker(5 * time.Minute)
+	recentFileAlertByPath         = newLastSeenTracker(15 * time.Second)
+	processFirstSeenTracker       *firstSeenTracker
+	networkFirstSeenTracker       *firstSeenTracker
 )
+
+type protocolScanDetection struct {
+	Label      string
+	RuleID     string
+	Severity   string
+	Confidence int
+	Ports      map[int]struct{}
+	Tracker    *uniqueDestTracker
+}
 
 type rawEvent struct {
 	EventIdemKey     string `json:"event_idem_key"`
@@ -227,6 +270,7 @@ func handleMessage(ctx context.Context, logger *slog.Logger, kv nats.KeyValue, c
 	logger.Info("event_received", slog.String("event_idem_key", evt.EventIdemKey))
 
 	message := eventMessage(evt)
+	evt = enrichExtractedNetworkFields(evt, message)
 	evt = enrichNetworkEventIdentity(evt)
 	match, ok := matchRule(message, evt)
 	if !ok {
@@ -292,6 +336,7 @@ func handleMessage(ctx context.Context, logger *slog.Logger, kv nats.KeyValue, c
 		logger.Info("cooldown_hit",
 			slog.String("rule_id", match.RuleID),
 			slog.String("group_key", match.GroupKey),
+			slog.String("source_type", evt.SourceType),
 			slog.Int64("remaining_ms", remaining),
 		)
 		_ = msg.Ack()
@@ -310,6 +355,7 @@ func handleMessage(ctx context.Context, logger *slog.Logger, kv nats.KeyValue, c
 		AlertKey:         alertKey,
 		RuleID:           match.RuleID,
 		Severity:         match.Severity,
+		ConfidenceScore:  match.ConfidenceScore,
 		Lane:             match.Lane,
 		GroupKey:         match.GroupKey,
 		ObservedAtUnixMs: alertTsUnixMs,
@@ -321,6 +367,10 @@ func handleMessage(ctx context.Context, logger *slog.Logger, kv nats.KeyValue, c
 		EventType:        strings.TrimSpace(evt.EventType),
 		SrcIP:            strings.TrimSpace(evt.SrcIP),
 		DstIP:            strings.TrimSpace(evt.DstIP),
+		DstPort:          match.DstPort,
+		ProtocolFamily:   match.ProtocolFamily,
+		ScanFanout:       match.ScanFanout,
+		TopDestinations:  append([]string(nil), match.TopDestinations...),
 		User:             strings.TrimSpace(evt.User),
 		ExecPath:         strings.TrimSpace(evt.ExecPath),
 		Comm:             strings.TrimSpace(evt.Comm),
@@ -417,10 +467,15 @@ func recordSuspiciousProcessContext(match ruleMatch, evt rawEvent) {
 }
 
 type ruleMatch struct {
-	RuleID   string
-	Lane     string
-	Severity string
-	GroupKey string
+	RuleID          string
+	Lane            string
+	Severity        string
+	GroupKey        string
+	ConfidenceScore int
+	ProtocolFamily  string
+	DstPort         int
+	ScanFanout      int
+	TopDestinations []string
 }
 
 func eventMessage(evt rawEvent) string {
@@ -495,7 +550,14 @@ func matchRule(message string, evt rawEvent) (ruleMatch, bool) {
 		}, true
 	}
 
-	if eventTypeIs(evt.EventType, "file", "file_change") && sensitiveFilePattern.MatchString(message) {
+	if eventTypeIs(evt.EventType, "file", "file_change") {
+		fileEvidence := strings.TrimSpace(evt.FilePath)
+		if fileEvidence == "" {
+			fileEvidence = message
+		}
+		if !chainSensitiveFilePattern.MatchString(fileEvidence) {
+			return ruleMatch{}, false
+		}
 		groupKey := strings.TrimSpace(evt.Host)
 		if groupKey == "" {
 			groupKey = detectorNodeID(evt)
@@ -504,12 +566,33 @@ func matchRule(message string, evt rawEvent) (ruleMatch, bool) {
 			groupKey = strings.TrimSpace(evt.GroupKey)
 		}
 		if recentAuthProcByNode.SeenWithin(groupKey, evt.ObservedAtUnixMs) {
+			if fileAlertKey := normalizedFileAlertKey(groupKey, evt, fileEvidence); fileAlertKey != "" {
+				if recentFileAlertByPath.SeenWithin(fileAlertKey, evt.ObservedAtUnixMs) {
+					return ruleMatch{}, false
+				}
+				recentFileAlertByPath.Observe(fileAlertKey, evt.ObservedAtUnixMs)
+			}
 			return ruleMatch{
 				RuleID:   authProcFileRuleID,
 				Lane:     fr03Lane,
 				Severity: detectorSeverityCritical,
 				GroupKey: groupKey,
 			}, true
+		}
+		if !highValueSensitiveFilePattern.MatchString(fileEvidence) {
+			return ruleMatch{}, false
+		}
+		if isLocalAdminChurnFileNoise(groupKey, evt, fileEvidence) {
+			return ruleMatch{}, false
+		}
+		if fileAlertKey := normalizedFileAlertKey(groupKey, evt, fileEvidence); fileAlertKey != "" {
+			if recentFileAlertByPath.SeenWithin(fileAlertKey, evt.ObservedAtUnixMs) {
+				return ruleMatch{}, false
+			}
+			recentFileAlertByPath.Observe(fileAlertKey, evt.ObservedAtUnixMs)
+		}
+		if noisyStandaloneFilePattern.MatchString(fileEvidence) && strings.EqualFold(strings.TrimSpace(evt.User), "unknown") {
+			return ruleMatch{}, false
 		}
 		return ruleMatch{
 			RuleID:   fileSensitiveRuleID,
@@ -526,6 +609,9 @@ func matchRule(message string, evt rawEvent) (ruleMatch, bool) {
 		}
 		if groupKey == "" {
 			groupKey = strings.TrimSpace(evt.GroupKey)
+		}
+		if isLocalAdminProcess(evt) {
+			recentLocalAdminByNode.Observe(groupKey, evt.ObservedAtUnixMs)
 		}
 		suspicious := suspiciousProcPattern.MatchString(processEvidenceText(evt, message))
 		if suspicious {
@@ -564,7 +650,7 @@ func matchRule(message string, evt rawEvent) (ruleMatch, bool) {
 		if dstIP == "" {
 			dstIP = extractDstIP(message)
 		}
-		if dstIP == "" || !isPublicIPv4(dstIP) || isBenignNetworkDestination(dstIP) {
+		if dstIP == "" {
 			return ruleMatch{}, false
 		}
 		dstPort := evt.DstPort
@@ -578,35 +664,94 @@ func matchRule(message string, evt rawEvent) (ruleMatch, bool) {
 		if groupKey == "" {
 			groupKey = strings.TrimSpace(evt.GroupKey)
 		}
+		if isInternalIPv4(dstIP) {
+			if detection := matchInternalProtocolDetection(dstPort); detection != nil {
+				sourceKey := internalScanSourceKey(groupKey, evt, detection.Label)
+				if detection.Tracker != nil {
+					matched, fanout, topDestinations := detection.Tracker.Observe(sourceKey, dstIP, evt.ObservedAtUnixMs)
+					if matched {
+						ruleID := detection.RuleID
+						lane := internalScanLane
+						severity := detection.Severity
+						confidence := detection.Confidence
+						if isInternalScanApprovedSource(evt) {
+							ruleID = internalApprovedScanRuleID
+							lane = networkObserveLane
+							severity = detectorSeverityMedium
+							if confidence > 72 {
+								confidence = 72
+							}
+						}
+						return ruleMatch{
+							RuleID:          ruleID,
+							Lane:            lane,
+							Severity:        severity,
+							GroupKey:        groupKey,
+							ConfidenceScore: confidence,
+							ProtocolFamily:  detection.Label,
+							DstPort:         dstPort,
+							ScanFanout:      fanout,
+							TopDestinations: topDestinations,
+						}, true
+					}
+				}
+			}
+			return ruleMatch{}, false
+		}
+		if !isPublicIPv4(dstIP) || isBenignNetworkDestination(dstIP) {
+			return ruleMatch{}, false
+		}
 		repeated := networkBurstTracker != nil && networkBurstTracker.Observe(dstIP, evt.ObservedAtUnixMs)
 		if groupKey != "" && recentSuspiciousProcByNode.SeenWithin(groupKey, evt.ObservedAtUnixMs) && (isRiskyNetworkPort(dstPort) || repeated || isKnownBadNetworkDestination(dstIP)) {
+			protocolFamily := ""
+			if detection := matchInternalProtocolDetection(dstPort); detection != nil {
+				protocolFamily = detection.Label
+			}
 			return ruleMatch{
-				RuleID:   "R-SEQ-PROCESS-TO-NET",
-				Lane:     fr03Lane,
-				Severity: detectorSeverityHigh,
-				GroupKey: groupKey,
+				RuleID:         "R-SEQ-PROCESS-TO-NET",
+				Lane:           fr03Lane,
+				Severity:       detectorSeverityHigh,
+				GroupKey:       groupKey,
+				DstPort:        dstPort,
+				ProtocolFamily: protocolFamily,
 			}, true
 		}
 		firstSeenKey := strings.TrimSpace(groupKey) + "|" + dstIP + ":" + strconv.Itoa(dstPort)
 		if networkFirstSeenTracker != nil && networkFirstSeenTracker.Observe(firstSeenKey, evt.ObservedAtUnixMs) && (isKnownBadNetworkDestination(dstIP) || isRiskyNetworkPort(dstPort)) {
+			protocolFamily := ""
+			if detection := matchInternalProtocolDetection(dstPort); detection != nil {
+				protocolFamily = detection.Label
+			}
 			return ruleMatch{
-				RuleID:   networkFirstSeenRuleID,
-				Lane:     fr03Lane,
-				Severity: detectorSeverityHigh,
-				GroupKey: dstIP,
+				RuleID:         networkFirstSeenRuleID,
+				Lane:           fr03Lane,
+				Severity:       detectorSeverityHigh,
+				GroupKey:       dstIP,
+				DstPort:        dstPort,
+				ProtocolFamily: protocolFamily,
 			}, true
 		}
 		if isKnownBadNetworkDestination(dstIP) || isRiskyNetworkPort(dstPort) || repeated {
+			protocolFamily := ""
+			if detection := matchInternalProtocolDetection(dstPort); detection != nil {
+				protocolFamily = detection.Label
+			}
 			return ruleMatch{
-				RuleID:   networkObserveRuleID,
-				Lane:     networkObserveLane,
-				Severity: detectorSeverityHigh,
-				GroupKey: dstIP,
+				RuleID:          networkObserveRuleID,
+				Lane:            networkObserveLane,
+				Severity:        detectorSeverityHigh,
+				GroupKey:        dstIP,
+				DstPort:         dstPort,
+				ProtocolFamily:  protocolFamily,
+				ScanFanout:      0,
+				TopDestinations: nil,
 			}, true
 		}
 	}
 
 	if strings.EqualFold(strings.TrimSpace(evt.EventType), "auth_failed") {
+		failedPassword := strings.Contains(lower, "failed password")
+		invalidUser := strings.Contains(lower, invalidUserPattern)
 		groupKey := strings.TrimSpace(evt.SrcIP)
 		if groupKey == "" {
 			groupKey = extractIPv4(message)
@@ -619,12 +764,57 @@ func matchRule(message string, evt rawEvent) (ruleMatch, bool) {
 			nodeKey = strings.TrimSpace(evt.GroupKey)
 		}
 		recentAuthByNode.Observe(nodeKey, evt.ObservedAtUnixMs)
-		return ruleMatch{
-			RuleID:   invalidUserRuleID,
-			Lane:     invalidUserLane,
-			Severity: detectorSeverityHigh,
-			GroupKey: groupKey,
-		}, true
+		userKey := strings.TrimSpace(evt.User)
+
+		if failedPassword {
+			if groupKey != "" && authFailedPwBurstSrcTracker.Observe(groupKey, evt.ObservedAtUnixMs) {
+				return ruleMatch{
+					RuleID:   authBurstSrcRuleID,
+					Lane:     invalidUserLane,
+					Severity: detectorSeverityHigh,
+					GroupKey: groupKey,
+				}, true
+			}
+			if userKey != "" && authFailedPwBurstUserTracker.Observe(userKey, evt.ObservedAtUnixMs) {
+				return ruleMatch{
+					RuleID:   authBurstUserRuleID,
+					Lane:     invalidUserLane,
+					Severity: detectorSeverityHigh,
+					GroupKey: userKey,
+				}, true
+			}
+			if groupKey != "" && countFailedPwSrcTracker.Observe(groupKey, evt.ObservedAtUnixMs) {
+				return ruleMatch{
+					RuleID:   countFailedPwSrcRuleID,
+					Lane:     invalidUserLane,
+					Severity: detectorSeverityHigh,
+					GroupKey: groupKey,
+				}, true
+			}
+			if invalidUser {
+				return ruleMatch{
+					RuleID:   invalidUserRuleID,
+					Lane:     invalidUserLane,
+					Severity: detectorSeverityHigh,
+					GroupKey: groupKey,
+				}, true
+			}
+			return ruleMatch{
+				RuleID:   collectFailedPwRuleID,
+				Lane:     invalidUserLane,
+				Severity: detectorSeverityHigh,
+				GroupKey: groupKey,
+			}, true
+		}
+		if invalidUser {
+			return ruleMatch{
+				RuleID:   invalidUserRuleID,
+				Lane:     invalidUserLane,
+				Severity: detectorSeverityHigh,
+				GroupKey: groupKey,
+			}, true
+		}
+		return ruleMatch{}, false
 	}
 	if strings.Contains(strings.ToLower(message), invalidUserPattern) {
 		groupKey := extractIPv4(message)
@@ -679,6 +869,19 @@ func extractDstPort(line string) int {
 	return parsed
 }
 
+func enrichExtractedNetworkFields(evt rawEvent, message string) rawEvent {
+	if !eventTypeIs(evt.EventType, "network", "network_connection") {
+		return evt
+	}
+	if strings.TrimSpace(evt.DstIP) == "" {
+		evt.DstIP = extractDstIP(message)
+	}
+	if evt.DstPort == 0 {
+		evt.DstPort = extractDstPort(message)
+	}
+	return evt
+}
+
 func matchString(pattern *regexp.Regexp, line string) string {
 	match := pattern.FindStringSubmatch(line)
 	if len(match) < 2 {
@@ -728,6 +931,31 @@ func initNetworkPolicy(cfg *config.DetectorConfig) {
 		riskyNetworkPorts[port] = struct{}{}
 	}
 	networkBurstTracker = newBurstTracker(int64(cfg.Network.RepeatWindowMs), cfg.Network.RepeatThreshold)
+	internalScanCIDRs = make([]*net.IPNet, 0, len(cfg.InternalScan.InternalCIDRs))
+	for _, raw := range cfg.InternalScan.InternalCIDRs {
+		_, block, err := net.ParseCIDR(strings.TrimSpace(raw))
+		if err != nil || block == nil {
+			continue
+		}
+		internalScanCIDRs = append(internalScanCIDRs, block)
+	}
+	internalProtocolDetections = buildInternalProtocolDetections(cfg)
+	internalScanAllowedUsers = make(map[string]struct{}, len(cfg.InternalScan.Allowlist.Users))
+	for _, raw := range cfg.InternalScan.Allowlist.Users {
+		value := strings.ToLower(strings.TrimSpace(raw))
+		if value != "" {
+			internalScanAllowedUsers[value] = struct{}{}
+		}
+	}
+	internalScanAllowedNodes = make(map[string]struct{}, len(cfg.InternalScan.Allowlist.Nodes))
+	for _, raw := range cfg.InternalScan.Allowlist.Nodes {
+		value := strings.ToLower(strings.TrimSpace(raw))
+		if value != "" {
+			internalScanAllowedNodes[value] = struct{}{}
+		}
+	}
+	internalScanAllowedExecPrefix = normalizeLowerTrimmed(cfg.InternalScan.Allowlist.ExecPathPrefixes)
+	internalScanAllowedCommPrefix = normalizeLowerTrimmed(cfg.InternalScan.Allowlist.CommPrefixes)
 }
 
 func initBaselinePolicy(cfg *config.DetectorConfig) {
@@ -794,6 +1022,45 @@ func isPublicIPv4(raw string) bool {
 	return true
 }
 
+func isInternalIPv4(raw string) bool {
+	ip := net.ParseIP(strings.TrimSpace(raw))
+	if ip == nil {
+		return false
+	}
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return false
+	}
+	for _, block := range internalScanCIDRs {
+		if block.Contains(ip4) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeLowerTrimmed(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, raw := range values {
+		value := strings.ToLower(strings.TrimSpace(raw))
+		if value != "" {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+func isInternalScanApprovedSource(evt rawEvent) bool {
+	if _, ok := internalScanAllowedUsers[strings.ToLower(strings.TrimSpace(evt.User))]; ok {
+		return true
+	}
+	node := strings.ToLower(strings.TrimSpace(detectorNodeID(evt)))
+	if _, ok := internalScanAllowedNodes[node]; ok {
+		return true
+	}
+	return false
+}
+
 func parseProcessCount(message string) (int, bool) {
 	match := processCountPattern.FindStringSubmatch(message)
 	if len(match) < 2 {
@@ -810,6 +1077,14 @@ func alertKeyForRule(ruleID, eventID string) string {
 	switch ruleID {
 	case invalidUserRuleID:
 		return "A-COLLECT-INVALID-USER-" + eventID
+	case collectFailedPwRuleID:
+		return "A-COLLECT-FAILED-PW-" + eventID
+	case countFailedPwSrcRuleID:
+		return "A-COUNT-FAILED-PW-SRCIP-" + eventID
+	case authBurstUserRuleID:
+		return "A-AUTH-FAILED-PW-BURST-USER-" + eventID
+	case authBurstSrcRuleID:
+		return "A-AUTH-FAILED-PW-BURST-SRCIP-" + eventID
 	case statProcessRuleID:
 		return "A-STAT-PROCESS-MED-" + eventID
 	case processCountRuleID:
@@ -818,8 +1093,28 @@ func alertKeyForRule(ruleID, eventID string) string {
 		return "A-FILE-SENSITIVE-CHANGE-" + eventID
 	case networkObserveRuleID:
 		return "A-NET-OUTBOUND-CONNECTION-" + eventID
+	case internalSMBScanRuleID:
+		return "A-NET-INTERNAL-SMB-SCAN-" + eventID
+	case internalRPCScanRuleID:
+		return "A-NET-INTERNAL-RPC-SCAN-" + eventID
+	case internalLDAPScanRuleID:
+		return "A-NET-INTERNAL-LDAP-SCAN-" + eventID
+	case internalDNSScanRuleID:
+		return "A-NET-INTERNAL-DNS-SWEEP-" + eventID
+	case internalFTPScanRuleID:
+		return "A-NET-INTERNAL-FTP-SCAN-" + eventID
+	case internalRDPScanRuleID:
+		return "A-NET-INTERNAL-RDP-SCAN-" + eventID
+	case internalWinRMScanRuleID:
+		return "A-NET-INTERNAL-WINRM-SCAN-" + eventID
+	case internalSSHScanRuleID:
+		return "A-NET-INTERNAL-SSH-SCAN-" + eventID
+	case internalApprovedScanRuleID:
+		return "A-NET-INTERNAL-APPROVED-SCAN-" + eventID
 	case networkFirstSeenRuleID:
 		return "A-NET-FIRST-SEEN-RISKY-" + eventID
+	case "R-SEQ-PROCESS-TO-NET":
+		return "A-SEQ-PROCESS-TO-NET-" + eventID
 	case processFirstSeenRuleID:
 		return "A-PROC-FIRST-SEEN-SUSPICIOUS-" + eventID
 	case dnsSuspiciousRuleID:
@@ -848,6 +1143,9 @@ func eventTypeIs(raw string, values ...string) bool {
 }
 
 func isProcessEvent(evt rawEvent, message string) bool {
+	if eventTypeIs(evt.EventType, "network", "network_connection") {
+		return false
+	}
 	if eventTypeIs(evt.EventType, "process", "process_exec") {
 		return true
 	}
@@ -872,6 +1170,96 @@ func processEvidenceText(evt rawEvent, message string) string {
 		}
 	}
 	return strings.Join(kept, " ")
+}
+
+func isLocalAdminProcess(evt rawEvent) bool {
+	text := strings.ToLower(strings.TrimSpace(processEvidenceText(evt, "")))
+	if text == "" {
+		return false
+	}
+	for _, needle := range []string{
+		"/usr/bin/sudo",
+		" comm=sudo",
+		" sudo ",
+		"/usr/bin/su",
+		" comm=su",
+		"/usr/bin/passwd",
+		"/usr/sbin/useradd",
+		"/usr/sbin/usermod",
+		"/usr/sbin/userdel",
+		"/usr/bin/chsh",
+		"/usr/bin/chfn",
+		"/usr/sbin/visudo",
+		"/usr/bin/systemctl",
+		"/usr/bin/loginctl",
+		"/usr/bin/apt",
+		"/usr/bin/apt-get",
+		"/usr/bin/dpkg",
+	} {
+		if strings.Contains(text, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func isLocalAdminChurnFileNoise(groupKey string, evt rawEvent, fileEvidence string) bool {
+	if strings.TrimSpace(groupKey) == "" {
+		return false
+	}
+	if !recentLocalAdminByNode.SeenWithin(groupKey, evt.ObservedAtUnixMs) {
+		return false
+	}
+	normalized := strings.ToLower(strings.TrimSpace(fileEvidence))
+	if normalized == "" {
+		return false
+	}
+	for _, needle := range []string{
+		"/etc/passwd",
+		"/etc/group",
+		"/etc/shadow",
+		"/etc/gshadow",
+		"/etc/passwd.",
+		"/etc/group.",
+		"/etc/shadow.",
+		"/etc/gshadow.",
+		"/etc/passwd.lock",
+		"/etc/group.lock",
+		"/etc/shadow.lock",
+		"/etc/gshadow.lock",
+		"/etc/.pwd.lock",
+	} {
+		if strings.Contains(normalized, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizedFileAlertKey(groupKey string, evt rawEvent, fileEvidence string) string {
+	nodeKey := strings.TrimSpace(groupKey)
+	if nodeKey == "" {
+		nodeKey = detectorNodeID(evt)
+	}
+	pathKey := strings.TrimSpace(evt.FilePath)
+	if pathKey == "" {
+		pathKey = strings.TrimSpace(fileEvidence)
+	}
+	pathKey = strings.ToLower(pathKey)
+	if pathKey == "" {
+		return ""
+	}
+	for _, prefix := range []string{
+		"deleted ",
+		"modified ",
+		"attrib ",
+		"created ",
+		"action=",
+		"path=",
+	} {
+		pathKey = strings.TrimPrefix(pathKey, prefix)
+	}
+	return nodeKey + "|" + pathKey
 }
 
 func extractEventTSUnixMs(evt rawEvent, message string) int64 {
@@ -927,6 +1315,13 @@ type burstTracker struct {
 	windowMs  int64
 	threshold int
 	hitsByKey map[string][]int64
+}
+
+type uniqueDestTracker struct {
+	mu        sync.Mutex
+	windowMs  int64
+	threshold int
+	state     map[string]map[string]int64
 }
 
 type lastSeenTracker struct {
@@ -1058,6 +1453,14 @@ func newBurstTracker(windowMs int64, threshold int) *burstTracker {
 	}
 }
 
+func newUniqueDestTracker(windowMs int64, threshold int) *uniqueDestTracker {
+	return &uniqueDestTracker{
+		windowMs:  windowMs,
+		threshold: threshold,
+		state:     make(map[string]map[string]int64, 32),
+	}
+}
+
 func (b *burstTracker) Observe(key string, observedAtUnixMs int64) bool {
 	if strings.TrimSpace(key) == "" {
 		return false
@@ -1080,6 +1483,129 @@ func (b *burstTracker) Observe(key string, observedAtUnixMs int64) bool {
 	kept = append(kept, observedAtUnixMs)
 	b.hitsByKey[key] = kept
 	return len(kept) == b.threshold
+}
+
+func (t *uniqueDestTracker) Observe(key, destination string, observedAtUnixMs int64) (bool, int, []string) {
+	if strings.TrimSpace(key) == "" || strings.TrimSpace(destination) == "" {
+		return false, 0, nil
+	}
+	if observedAtUnixMs <= 0 {
+		observedAtUnixMs = time.Now().UnixMilli()
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	cutoff := observedAtUnixMs - t.windowMs
+	for existingKey, destinations := range t.state {
+		for dst, ts := range destinations {
+			if ts < cutoff {
+				delete(destinations, dst)
+			}
+		}
+		if len(destinations) == 0 {
+			delete(t.state, existingKey)
+		}
+	}
+	destinations := t.state[key]
+	if destinations == nil {
+		destinations = make(map[string]int64, t.threshold+2)
+		t.state[key] = destinations
+	}
+	destinations[destination] = observedAtUnixMs
+	fanout := len(destinations)
+	type rankedDestination struct {
+		dst string
+		ts  int64
+	}
+	ranked := make([]rankedDestination, 0, fanout)
+	for dst, ts := range destinations {
+		ranked = append(ranked, rankedDestination{dst: dst, ts: ts})
+	}
+	sort.Slice(ranked, func(i, j int) bool {
+		if ranked[i].ts == ranked[j].ts {
+			return ranked[i].dst < ranked[j].dst
+		}
+		return ranked[i].ts > ranked[j].ts
+	})
+	topDestinations := make([]string, 0, min(5, len(ranked)))
+	for idx, item := range ranked {
+		if idx >= 5 {
+			break
+		}
+		topDestinations = append(topDestinations, item.dst)
+	}
+	return fanout == t.threshold, fanout, topDestinations
+}
+
+func buildInternalProtocolDetections(cfg *config.DetectorConfig) []*protocolScanDetection {
+	if !cfg.InternalScan.Enabled {
+		return nil
+	}
+	windowMs := int64(cfg.InternalScan.WindowMs)
+	build := func(label, ruleID, severity string, protocolCfg config.DetectorProtocolScanConfig) *protocolScanDetection {
+		if len(protocolCfg.Ports) == 0 || protocolCfg.UniqueTargetsThreshold <= 0 {
+			return nil
+		}
+		ports := make(map[int]struct{}, len(protocolCfg.Ports))
+		for _, port := range protocolCfg.Ports {
+			if port > 0 && port <= 65535 {
+				ports[port] = struct{}{}
+			}
+		}
+		if len(ports) == 0 {
+			return nil
+		}
+		return &protocolScanDetection{
+			Label:      label,
+			RuleID:     ruleID,
+			Severity:   severity,
+			Confidence: protocolCfg.ConfidenceScore,
+			Ports:      ports,
+			Tracker:    newUniqueDestTracker(windowMs, protocolCfg.UniqueTargetsThreshold),
+		}
+	}
+	var detections []*protocolScanDetection
+	for _, detection := range []*protocolScanDetection{
+		build("smb", internalSMBScanRuleID, detectorSeverityHigh, cfg.InternalScan.SMB),
+		build("rpc", internalRPCScanRuleID, detectorSeverityHigh, cfg.InternalScan.RPC),
+		build("ldap", internalLDAPScanRuleID, detectorSeverityHigh, cfg.InternalScan.LDAP),
+		build("dns", internalDNSScanRuleID, detectorSeverityHigh, cfg.InternalScan.DNS),
+		build("ftp", internalFTPScanRuleID, detectorSeverityHigh, cfg.InternalScan.FTP),
+		build("rdp", internalRDPScanRuleID, detectorSeverityHigh, cfg.InternalScan.RDP),
+		build("winrm", internalWinRMScanRuleID, detectorSeverityHigh, cfg.InternalScan.WinRM),
+		build("ssh", internalSSHScanRuleID, detectorSeverityHigh, cfg.InternalScan.SSH),
+	} {
+		if detection != nil {
+			detections = append(detections, detection)
+		}
+	}
+	return detections
+}
+
+func matchInternalProtocolDetection(dstPort int) *protocolScanDetection {
+	if dstPort <= 0 {
+		return nil
+	}
+	for _, detection := range internalProtocolDetections {
+		if detection == nil {
+			continue
+		}
+		if _, ok := detection.Ports[dstPort]; ok {
+			return detection
+		}
+	}
+	return nil
+}
+
+func internalScanSourceKey(groupKey string, evt rawEvent, protocol string) string {
+	nodeKey := strings.TrimSpace(groupKey)
+	if nodeKey == "" {
+		nodeKey = detectorNodeID(evt)
+	}
+	if nodeKey == "" {
+		nodeKey = strings.TrimSpace(evt.SrcIP)
+	}
+	userKey := strings.ToLower(strings.TrimSpace(evt.User))
+	return strings.Join([]string{nodeKey, userKey, protocol}, "|")
 }
 
 func checkCooldown(kv nats.KeyValue, key string, cooldownMs int) (int64, bool, error) {

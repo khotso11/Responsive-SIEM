@@ -22,6 +22,7 @@ ui/tsconfig.tsbuildinfo
 /detector-v0
 /master-consume
 dist/
+.env.investigation.local
 
 # ---- local endpoint enrollment artifacts ----
 pki/agents/khotso-Latitude-5500/

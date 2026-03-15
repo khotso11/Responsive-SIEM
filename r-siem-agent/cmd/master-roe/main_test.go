@@ -224,6 +224,32 @@ policies:
 	}
 }
 
+func TestShouldRecordCorroborationOnlyForAuditdConnect(t *testing.T) {
+	if shouldRecordCorroboration("", responseTrigger{SourceType: "auditd_connect"}) {
+		t.Fatalf("empty run_id should not record corroboration")
+	}
+	if shouldRecordCorroboration("run-1", responseTrigger{SourceType: "proc_net"}) {
+		t.Fatalf("proc_net should not record corroboration")
+	}
+	if !shouldRecordCorroboration("run-1", responseTrigger{SourceType: "auditd_connect"}) {
+		t.Fatalf("auditd_connect should record corroboration")
+	}
+}
+
+func TestBuildCorroborationDedupeKeyFallsBackWithoutEventId(t *testing.T) {
+	key := buildCorroborationDedupeKey("run-1", responseTrigger{
+		SourceType:     "auditd_connect",
+		DstIP:          "172.30.50.14",
+		DstPort:        5985,
+		ProtocolFamily: "winrm",
+		ExecPath:       "/usr/bin/nmap",
+		Cmdline:        "/usr/bin/nmap -Pn -n",
+	})
+	if key == "" {
+		t.Fatalf("expected non-empty corroboration dedupe key")
+	}
+}
+
 func TestFailedSafeRunIncludesReasonAndOperatorAction(t *testing.T) {
 	run := runRecord{
 		RunID:     "run-1",

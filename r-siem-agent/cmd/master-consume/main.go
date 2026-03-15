@@ -483,7 +483,12 @@ func parseJSONRecord(record []byte) (string, *int64, map[string]any, bool) {
 
 	var jsonType string
 	if v, ok := obj["type"].(string); ok {
-		jsonType = v
+		jsonType = strings.TrimSpace(v)
+	}
+	if jsonType == "" {
+		if v, ok := obj["event_type"].(string); ok {
+			jsonType = strings.TrimSpace(v)
+		}
 	}
 
 	var ts *int64
@@ -493,7 +498,37 @@ func parseJSONRecord(record []byte) (string, *int64, map[string]any, bool) {
 		}
 	}
 
-	allow := []string{"host", "user", "process", "src_ip", "dst_ip", "severity", "message"}
+	allow := []string{
+		"event_idem_key",
+		"host",
+		"node_id",
+		"group_key",
+		"source",
+		"source_type",
+		"event_type",
+		"user",
+		"process",
+		"pid",
+		"ppid",
+		"session_id",
+		"tty",
+		"src_ip",
+		"src_port",
+		"dst_ip",
+		"dst_port",
+		"dns_name",
+		"dns_type",
+		"exec_path",
+		"comm",
+		"cmdline",
+		"file_path",
+		"file_sha256",
+		"exec_sha256",
+		"signer_hint",
+		"severity",
+		"message",
+		"raw_line",
+	}
 	fields := make(map[string]any)
 	for _, key := range allow {
 		val, ok := obj[key]
@@ -1092,6 +1127,8 @@ func deriveConfidence(ruleKind, severity, lane string, evidenceCount int, rec *N
 	}
 	if rec != nil {
 		switch strings.ToLower(strings.TrimSpace(stringField(rec.Fields, "source_type"))) {
+		case "auditd_connect":
+			score += 9
 		case "auditd_exec":
 			score += 8
 		case "inotify":

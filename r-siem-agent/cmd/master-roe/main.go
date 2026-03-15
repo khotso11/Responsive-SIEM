@@ -339,6 +339,10 @@ type responseTrigger struct {
 	NodeID           string
 	SrcIP            string
 	DstIP            string
+	DstPort          int
+	ProtocolFamily   string
+	ScanFanout       int
+	TopDestinations  []string
 	UserName         string
 	ExecPath         string
 	Comm             string
@@ -383,6 +387,10 @@ type runRecord struct {
 	AssetRole                 string            `json:"asset_role,omitempty"`
 	SrcIP                     string            `json:"src_ip,omitempty"`
 	DstIP                     string            `json:"dst_ip,omitempty"`
+	DstPort                   int               `json:"dst_port,omitempty"`
+	ProtocolFamily            string            `json:"protocol_family,omitempty"`
+	ScanFanout                int               `json:"scan_fanout,omitempty"`
+	TopDestinations           []string          `json:"top_destinations,omitempty"`
 	UserName                  string            `json:"user,omitempty"`
 	IdentityDisplayName       string            `json:"identity_display_name,omitempty"`
 	IdentityDepartment        string            `json:"identity_department,omitempty"`
@@ -1639,6 +1647,10 @@ func processTrigger(runtime *roeRuntime, msg *nats.Msg, lane string, runJournal 
 		NodeID:          trigger.NodeID,
 		SrcIP:           trigger.SrcIP,
 		DstIP:           trigger.DstIP,
+		DstPort:         trigger.DstPort,
+		ProtocolFamily:  trigger.ProtocolFamily,
+		ScanFanout:      trigger.ScanFanout,
+		TopDestinations: append([]string(nil), trigger.TopDestinations...),
 		UserName:        trigger.UserName,
 		AgentID:         trigger.AgentID,
 		TargetAgentID:   trigger.TargetAgentID,
@@ -1654,9 +1666,12 @@ func processTrigger(runtime *roeRuntime, msg *nats.Msg, lane string, runJournal 
 	}
 	runtime.enrichRunContext(&run)
 
-	if ok, err := runtime.tryAcquireGroupLock(trigger, runID); err != nil {
+	if ok, existingRunID, err := runtime.tryAcquireGroupLock(trigger, runID); err != nil {
 		return err
 	} else if !ok {
+		if err := runtime.recordRunCorroboration(existingRunID, trigger); err != nil {
+			return err
+		}
 		return nil
 	}
 
@@ -1686,6 +1701,10 @@ func processTrigger(runtime *roeRuntime, msg *nats.Msg, lane string, runJournal 
 		slog.String("event_type", trigger.EventType),
 		slog.String("src_ip", trigger.SrcIP),
 		slog.String("dst_ip", trigger.DstIP),
+		slog.Int("dst_port", trigger.DstPort),
+		slog.String("protocol_family", trigger.ProtocolFamily),
+		slog.Int("scan_fanout", trigger.ScanFanout),
+		slog.Any("top_destinations", trigger.TopDestinations),
 		slog.String("user", trigger.UserName),
 		slog.String("identity_display_name", run.IdentityDisplayName),
 		slog.String("identity_department", run.IdentityDepartment),
@@ -1973,6 +1992,10 @@ func processResult(runtime *roeRuntime, msg *nats.Msg, lane string) error {
 	runtime.logger.LogAttrs(context.Background(), slog.LevelInfo, "response_run_updated",
 		slog.String("run_id", run.RunID),
 		slog.String("status", run.Status),
+		slog.String("protocol_family", run.ProtocolFamily),
+		slog.Int("dst_port", run.DstPort),
+		slog.Int("scan_fanout", run.ScanFanout),
+		slog.Any("top_destinations", run.TopDestinations),
 		slog.String("approval_policy_rule_id", run.ApprovalPolicyRuleID),
 		slog.String("allowlist_rule_id", run.AllowlistRuleID),
 		slog.Int("step_succeeded_count", run.StepSucceededCount),
@@ -2206,6 +2229,7 @@ func decodeTrigger(data []byte) (responseTrigger, error) {
 		NodeID:         stringFieldRaw(raw, "node_id"),
 		SrcIP:          stringFieldRaw(raw, "src_ip"),
 		DstIP:          stringFieldRaw(raw, "dst_ip"),
+		ProtocolFamily: stringFieldRaw(raw, "protocol_family"),
 		UserName:       stringFieldRaw(raw, "user"),
 		ExecPath:       stringFieldRaw(raw, "exec_path"),
 		Comm:           stringFieldRaw(raw, "comm"),
@@ -2237,6 +2261,15 @@ func decodeTrigger(data []byte) (responseTrigger, error) {
 	}
 	if ts, ok := int64Field(raw, "alert_ts_unix_ms"); ok {
 		trigger.AlertTsUnixMs = ts
+	}
+	if port, ok := intField(raw, "dst_port"); ok {
+		trigger.DstPort = port
+	}
+	if fanout, ok := intField(raw, "scan_fanout"); ok {
+		trigger.ScanFanout = fanout
+	}
+	if values, ok := stringSliceField(raw, "top_destinations"); ok {
+		trigger.TopDestinations = values
 	}
 	if confidence, ok := int64Field(raw, "confidence_score"); ok {
 		trigger.ConfidenceScore = int(confidence)
@@ -2485,6 +2518,33 @@ func int64Field(raw map[string]any, key string) (int64, bool) {
 	return 0, false
 }
 
+func intField(raw map[string]any, key string) (int, bool) {
+	value, ok := int64Field(raw, key)
+	if !ok {
+		return 0, false
+	}
+	return int(value), true
+}
+
+func stringSliceField(raw map[string]any, key string) ([]string, bool) {
+	val, ok := raw[key]
+	if !ok {
+		return nil, false
+	}
+	items, ok := val.([]any)
+	if !ok {
+		return nil, false
+	}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		trimmed := strings.TrimSpace(fmt.Sprintf("%v", item))
+		if trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out, true
+}
+
 func uint64Field(raw map[string]any, key string) (uint64, bool) {
 	val, ok := raw[key]
 	if !ok {
@@ -2549,6 +2609,78 @@ func (r *roeRuntime) persistIdempotency(trigger responseTrigger, runID string, p
 	}
 	_, err = r.idempKV.Put(trigger.TriggerIdemKey, payload)
 	return err
+}
+
+func buildCorroborationDedupeKey(runID string, trigger responseTrigger) string {
+	base := firstNonEmpty(
+		strings.TrimSpace(trigger.EventIdemKey),
+		firstNonEmpty(
+			strings.TrimSpace(trigger.TriggerIdemKey),
+			fmt.Sprintf("%s|%s|%s|%d|%s|%s|%s",
+				strings.TrimSpace(runID),
+				strings.TrimSpace(trigger.SourceType),
+				strings.TrimSpace(trigger.DstIP),
+				trigger.DstPort,
+				strings.TrimSpace(trigger.ProtocolFamily),
+				strings.TrimSpace(trigger.ExecPath),
+				strings.TrimSpace(trigger.Cmdline),
+			),
+		),
+	)
+	return fmt.Sprintf("corroboration.%s.%s", strings.TrimSpace(runID), shortHash(base))
+}
+
+func shouldRecordCorroboration(runID string, trigger responseTrigger) bool {
+	return strings.TrimSpace(runID) != "" && strings.EqualFold(strings.TrimSpace(trigger.SourceType), "auditd_connect")
+}
+
+func (r *roeRuntime) recordRunCorroboration(runID string, trigger responseTrigger) error {
+	if !shouldRecordCorroboration(runID, trigger) {
+		return nil
+	}
+	key := buildCorroborationDedupeKey(runID, trigger)
+	if _, err := r.idempKV.Get(key); err == nil {
+		return nil
+	} else if !errors.Is(err, nats.ErrKeyNotFound) {
+		return err
+	}
+
+	record := map[string]any{
+		"run_id":              strings.TrimSpace(runID),
+		"source_type":         strings.TrimSpace(trigger.SourceType),
+		"event_idem_key":      strings.TrimSpace(trigger.EventIdemKey),
+		"trigger_idem_key":    strings.TrimSpace(trigger.TriggerIdemKey),
+		"observed_at_unix_ms": trigger.ObservedAtUnixMs,
+	}
+	payload, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	if _, err := r.idempKV.Put(key, payload); err != nil {
+		return err
+	}
+
+	r.logger.LogAttrs(context.Background(), slog.LevelInfo, "response_run_corroborated",
+		slog.String("run_id", strings.TrimSpace(runID)),
+		slog.String("rule_id", trigger.RuleID),
+		slog.String("source_type", trigger.SourceType),
+		slog.String("event_type", trigger.EventType),
+		slog.String("group_by", trigger.GroupBy),
+		slog.String("group_key", trigger.GroupKey),
+		slog.String("src_ip", trigger.SrcIP),
+		slog.String("dst_ip", trigger.DstIP),
+		slog.Int("dst_port", trigger.DstPort),
+		slog.String("protocol_family", trigger.ProtocolFamily),
+		slog.String("user", trigger.UserName),
+		slog.String("exec_path", trigger.ExecPath),
+		slog.String("comm", trigger.Comm),
+		slog.String("cmdline", trigger.Cmdline),
+		slog.String("event_idem_key", trigger.EventIdemKey),
+		slog.String("trigger_idem_key", trigger.TriggerIdemKey),
+		slog.Int64("event_ts_unix_ms", trigger.EventTsUnixMs),
+		slog.Int64("observed_at_unix_ms", trigger.ObservedAtUnixMs),
+	)
+	return nil
 }
 
 func (r *roeRuntime) persistResultDedupe(key string, result stepResult, jsSeq uint64) error {
@@ -2626,9 +2758,9 @@ func (r *roeRuntime) releaseResultLock(lockKey string, result stepResult) {
 	)
 }
 
-func (r *roeRuntime) tryAcquireGroupLock(trigger responseTrigger, runID string) (bool, error) {
+func (r *roeRuntime) tryAcquireGroupLock(trigger responseTrigger, runID string) (bool, string, error) {
 	if trigger.GroupBy == "" || trigger.GroupKey == "" {
-		return true, nil
+		return true, "", nil
 	}
 	lockKey := fmt.Sprintf("lock.group.%s.%s", trigger.RuleID, trigger.GroupKey)
 	now := time.Now().UnixMilli()
@@ -2641,13 +2773,14 @@ func (r *roeRuntime) tryAcquireGroupLock(trigger responseTrigger, runID string) 
 		var existing map[string]any
 		if err := json.Unmarshal(entry.Value(), &existing); err == nil {
 			acquiredAt, _ := int64Field(existing, "acquired_at_unix_ms")
+			existingRunID := strings.TrimSpace(stringFieldRaw(existing, "run_id"))
 			if acquiredAt > 0 && now-acquiredAt < ttl {
-				runtimeLogSuppressed(r.logger, trigger, runID, lockKey)
-				return false, nil
+				runtimeLogSuppressed(r.logger, trigger, runID, existingRunID, lockKey)
+				return false, existingRunID, nil
 			}
 		}
 	} else if !errors.Is(err, nats.ErrKeyNotFound) {
-		return false, err
+		return false, "", err
 	}
 	record := map[string]any{
 		"run_id":              runID,
@@ -2656,20 +2789,22 @@ func (r *roeRuntime) tryAcquireGroupLock(trigger responseTrigger, runID string) 
 	}
 	payload, err := json.Marshal(record)
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
 	if _, err := r.locksKV.Put(lockKey, payload); err != nil {
-		return false, err
+		return false, "", err
 	}
-	return true, nil
+	return true, "", nil
 }
 
-func runtimeLogSuppressed(logger *slog.Logger, trigger responseTrigger, runID, lockKey string) {
+func runtimeLogSuppressed(logger *slog.Logger, trigger responseTrigger, runID, existingRunID, lockKey string) {
 	logger.LogAttrs(context.Background(), slog.LevelInfo, "response_run_suppressed_by_lock",
 		slog.String("run_id", runID),
+		slog.String("existing_run_id", existingRunID),
 		slog.String("rule_id", trigger.RuleID),
 		slog.String("group_by", trigger.GroupBy),
 		slog.String("group_key", trigger.GroupKey),
+		slog.String("source_type", trigger.SourceType),
 		slog.String("lock_key", lockKey),
 	)
 }
@@ -2929,6 +3064,8 @@ func deriveTriggerConfidence(trigger responseTrigger) int {
 		score += 6
 	}
 	switch strings.ToLower(strings.TrimSpace(trigger.SourceType)) {
+	case "auditd_connect":
+		score += 9
 	case "auditd_exec":
 		score += 8
 	case "inotify":
@@ -3535,6 +3672,14 @@ func expandStepTemplateVars(input, runID string, trigger responseTrigger, target
 		"{{src_ip}}":           strings.TrimSpace(trigger.SrcIP),
 		"{dst_ip}":             strings.TrimSpace(trigger.DstIP),
 		"{{dst_ip}}":           strings.TrimSpace(trigger.DstIP),
+		"{dst_port}":           strconv.Itoa(trigger.DstPort),
+		"{{dst_port}}":         strconv.Itoa(trigger.DstPort),
+		"{protocol_family}":    strings.TrimSpace(trigger.ProtocolFamily),
+		"{{protocol_family}}":  strings.TrimSpace(trigger.ProtocolFamily),
+		"{scan_fanout}":        strconv.Itoa(trigger.ScanFanout),
+		"{{scan_fanout}}":      strconv.Itoa(trigger.ScanFanout),
+		"{top_destinations}":   strings.Join(trigger.TopDestinations, ","),
+		"{{top_destinations}}": strings.Join(trigger.TopDestinations, ","),
 		"{user}":               strings.TrimSpace(trigger.UserName),
 		"{{user}}":             strings.TrimSpace(trigger.UserName),
 		"{user_name}":          strings.TrimSpace(trigger.UserName),
@@ -4154,6 +4299,52 @@ ALTER TABLE normalized_events ADD COLUMN IF NOT EXISTS dst_ip INET NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS normalized_events_event_idem_key_uidx ON normalized_events(event_idem_key);
 CREATE INDEX IF NOT EXISTS normalized_events_event_ts_idx ON normalized_events(event_ts_unix_ms);
 CREATE INDEX IF NOT EXISTS normalized_events_node_id_idx ON normalized_events(node_id);
+
+CREATE TABLE IF NOT EXISTS incident_observables (
+  id BIGSERIAL PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  observable_kind TEXT NOT NULL,
+  observable_value TEXT NOT NULL,
+  observable_role TEXT NOT NULL,
+  observable_source TEXT NOT NULL,
+  created_at_unix_ms BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS incident_observables_run_idx
+  ON incident_observables(run_id);
+CREATE INDEX IF NOT EXISTS incident_observables_value_idx
+  ON incident_observables(observable_kind, observable_value);
+
+CREATE TABLE IF NOT EXISTS observable_enrichments (
+  id BIGSERIAL PRIMARY KEY,
+  observable_kind TEXT NOT NULL,
+  observable_value TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  status TEXT NOT NULL,
+  provider_verdict TEXT NOT NULL,
+  provider_score INT NOT NULL,
+  summary TEXT NOT NULL,
+  evidence_url TEXT NOT NULL,
+  data_json JSONB NOT NULL,
+  fetched_at_unix_ms BIGINT NOT NULL,
+  expires_at_unix_ms BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS observable_enrichments_lookup_idx
+  ON observable_enrichments(observable_kind, observable_value, provider);
+CREATE UNIQUE INDEX IF NOT EXISTS observable_enrichments_uq
+  ON observable_enrichments(observable_kind, observable_value, provider);
+
+CREATE TABLE IF NOT EXISTS enrichment_jobs (
+  job_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  requested_by TEXT NOT NULL,
+  requested_at_unix_ms BIGINT NOT NULL,
+  completed_at_unix_ms BIGINT NULL,
+  refresh BOOLEAN NOT NULL DEFAULT FALSE,
+  error_text TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS enrichment_jobs_run_idx
+  ON enrichment_jobs(run_id);
 `
 	_, err := s.db.ExecContext(ctx, schemaSQL)
 	return err

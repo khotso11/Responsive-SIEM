@@ -95,6 +95,17 @@ func TestValidateStepParamsAllowlist(t *testing.T) {
 		t.Fatalf("agent_command allowlist rejected quarantine params: %s", reason)
 	}
 
+	if reason := validateStepParams(agentCmd.RequiredParams(), agentCmd.OptionalParams(), map[string]any{
+		"command":          "halt_lateral_movement",
+		"dst_ip":           "172.30.50.14",
+		"top_destinations": "172.30.50.14,172.30.50.13,172.30.50.12,172.30.50.11",
+		"protocol_family":  "winrm",
+		"reason":           "internal_protocol_scan:R-NET-INTERNAL-WINRM-SCAN",
+		"duration_ms":      900000,
+	}); reason != "" {
+		t.Fatalf("agent_command allowlist rejected lateral containment params: %s", reason)
+	}
+
 	if reason := validateStepParams(block.RequiredParams(), block.OptionalParams(), map[string]any{
 		"direction": "ingress",
 	}); reason != "" {

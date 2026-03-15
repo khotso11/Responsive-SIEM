@@ -1,7 +1,7 @@
 import "./globals.css";
 import type { Metadata } from "next";
 import { AppShell } from "@/components/app-shell";
-import type { ReactNode } from "react";
+import { Suspense, type ReactNode } from "react";
 
 export const metadata: Metadata = {
   title: "R-SIEM SOC UI",
@@ -9,11 +9,13 @@ export const metadata: Metadata = {
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {
-  return (
-    <html lang="en">
-      <body>
-        <AppShell>{children}</AppShell>
-      </body>
-    </html>
-  );
+	return (
+		<html lang="en">
+			<body>
+				<Suspense fallback={<div className="p-8 text-sm text-ink-200">Loading UI shell...</div>}>
+					<AppShell>{children}</AppShell>
+				</Suspense>
+			</body>
+		</html>
+	);
 }

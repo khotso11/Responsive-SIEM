@@ -19,10 +19,17 @@ export type Incident = {
   event_type?: string;
   src_ip?: string;
   dst_ip?: string;
+  dst_port?: number;
+  protocol_family?: string;
+  scan_fanout?: number;
+  top_destinations?: string[];
   user_name?: string;
   exec_path?: string;
   comm?: string;
   cmdline?: string;
+  file_sha256?: string;
+  exec_sha256?: string;
+  dns_name?: string;
   identity_display_name?: string;
   identity_department?: string;
   identity_manager?: string;
@@ -100,6 +107,7 @@ export type IncidentDetailResponse = {
   run: Incident;
   steps: StepResult[];
   ui_state?: IncidentUIState;
+  annotations?: AuditEntry[];
   source: string;
 };
 
@@ -219,5 +227,60 @@ export type EndpointsGeoResponse = {
   generated_at: string;
   endpoints: EndpointGeoSummary[];
   count: number;
+  source: string;
+};
+
+export type InvestigationObservable = {
+  kind: string;
+  value: string;
+  role: string;
+  source: string;
+  created_at_unix_ms: number;
+};
+
+export type InvestigationProviderResult = {
+  observable_kind: string;
+  observable_value: string;
+  provider: string;
+  status: string;
+  verdict: string;
+  score: number;
+  summary: string;
+  evidence_url?: string;
+  fetched_at_unix_ms?: number;
+  expires_at_unix_ms?: number;
+  data?: Record<string, unknown>;
+};
+
+export type InvestigationProviderSummary = {
+  provider: string;
+  status: string;
+  verdict: string;
+  score: number;
+  summary: string;
+  attempts: number;
+  latency_ms: number;
+  http_status: number;
+  error_class: string;
+  fetched_at_unix_ms?: number;
+};
+
+export type InvestigationJob = {
+  job_id: string;
+  run_id: string;
+  status: string;
+  requested_by: string;
+  requested_at_unix_ms: number;
+  completed_at_unix_ms?: number;
+  refresh: boolean;
+  error_text?: string;
+};
+
+export type InvestigationResponse = {
+  run_id: string;
+  observables: InvestigationObservable[];
+  enrichments: InvestigationProviderResult[];
+  summaries: InvestigationProviderSummary[];
+  jobs: InvestigationJob[];
   source: string;
 };

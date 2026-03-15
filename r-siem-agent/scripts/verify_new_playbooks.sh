@@ -35,6 +35,25 @@ json_or_null() {
   fi
 }
 
+json_string_array_from_csv() {
+  local csv="${1:-}"
+  local out="["
+  local first=1
+  IFS=',' read -r -a values <<< "$csv"
+  local value trimmed
+  for value in "${values[@]}"; do
+    trimmed="$(echo "$value" | xargs)"
+    [[ -n "$trimmed" ]] || continue
+    if [[ "$first" -eq 0 ]]; then
+      out+=","
+    fi
+    out+="\"$(json_escape "$trimmed")\""
+    first=0
+  done
+  out+="]"
+  printf '%s' "$out"
+}
+
 line_count() {
   local file="$1"
   [[ -f "$file" ]] || { echo 0; return; }
@@ -88,6 +107,29 @@ publish_trigger() {
   local alert_key="A-MANUAL-${rule_id}-${token}"
   local payload
   payload="{\"msg\":\"response_trigger\",\"trigger_idem_key\":\"${trigger_id}\",\"alert_key\":\"${alert_key}\",\"rule_id\":\"${rule_id}\",\"severity\":\"high\",\"lane\":\"${lane}\",\"group_by\":\"src_ip\",\"group_key\":\"manual.${playbook_id}.${token}\",\"observed_at_unix_ms\":${now_ms}}"
+  nats pub rsiem.response.triggers.fast "$payload" >/dev/null
+}
+
+publish_internal_scan_trigger() {
+  local playbook_id="$1"
+  local rule_id="$2"
+  local protocol_family="$3"
+  local dst_port="$4"
+  local dst_ip="$5"
+  local top_destinations_csv="$6"
+  local lane="FAST"
+  local now_ms
+  now_ms="$(date +%s%3N)"
+  local token
+  token="$(date +%s%N 2>/dev/null || printf '%s000000000' "$(date +%s)")"
+  local trigger_id="trig.manual.${rule_id}.${token}"
+  local alert_key="A-MANUAL-${rule_id}-${token}"
+  local top_destinations_json
+  top_destinations_json="$(json_string_array_from_csv "$top_destinations_csv")"
+  local scan_fanout
+  scan_fanout="$(printf '%s\n' "$top_destinations_csv" | awk -F',' '{print NF}')"
+  local payload
+  payload="{\"msg\":\"response_trigger\",\"trigger_idem_key\":\"${trigger_id}\",\"alert_key\":\"${alert_key}\",\"rule_id\":\"${rule_id}\",\"severity\":\"high\",\"lane\":\"${lane}\",\"group_by\":\"host\",\"group_key\":\"manual.${playbook_id}.${token}\",\"observed_at_unix_ms\":${now_ms},\"event_type\":\"network_connection\",\"source_type\":\"auditd_connect\",\"node_id\":\"verify-new-playbooks-node\",\"user\":\"verify_new_playbooks\",\"dst_ip\":\"${dst_ip}\",\"dst_port\":${dst_port},\"protocol_family\":\"${protocol_family}\",\"scan_fanout\":${scan_fanout},\"top_destinations\":${top_destinations_json}}"
   nats pub rsiem.response.triggers.fast "$payload" >/dev/null
 }
 
@@ -216,9 +258,73 @@ for item in "${playbooks[@]}"; do
 
 done
 
+internal_scan_cases=(
+  "PB-NET-INTERNAL-SCAN-CONTAIN|R-NET-INTERNAL-SSH-SCAN|ssh|22|172.30.50.13|172.30.50.13,172.30.50.12,172.30.50.11,172.30.50.14"
+  "PB-NET-INTERNAL-SCAN-CONTAIN|R-NET-INTERNAL-RPC-SCAN|rpc|135|172.30.50.13|172.30.50.13,172.30.50.12,172.30.50.11,172.30.50.14"
+  "PB-NET-INTERNAL-SCAN-CONTAIN|R-NET-INTERNAL-LDAP-SCAN|ldap|389|172.30.50.13|172.30.50.13,172.30.50.12,172.30.50.11,172.30.50.14"
+  "PB-NET-INTERNAL-SCAN-CONTAIN|R-NET-INTERNAL-SMB-SCAN|smb|445|172.30.50.13|172.30.50.13,172.30.50.12,172.30.50.11,172.30.50.14"
+  "PB-NET-INTERNAL-SCAN-CONTAIN|R-NET-INTERNAL-RDP-SCAN|rdp|3389|172.30.50.13|172.30.50.13,172.30.50.12,172.30.50.11,172.30.50.14"
+  "PB-NET-INTERNAL-SCAN-CONTAIN|R-NET-INTERNAL-WINRM-SCAN|winrm|5985|172.30.50.13|172.30.50.13,172.30.50.12,172.30.50.11,172.30.50.14"
+)
+
+for item in "${internal_scan_cases[@]}"; do
+  IFS='|' read -r playbook_id rule_id protocol_family dst_port dst_ip top_destinations_csv <<< "$item"
+
+  base_master="$(line_count "$LOG_MASTER")"
+  base_agent="$(line_count "$LOG_AGENT")"
+  base_runs="$(line_count "$EXPORT_RUNS")"
+
+  publish_internal_scan_trigger "$playbook_id" "$rule_id" "$protocol_family" "$dst_port" "$dst_ip" "$top_destinations_csv"
+
+  run_created_line="$(wait_match_rg "$LOG_MASTER" "$base_master" "\"msg\":\"response_run_created\".*\"rule_id\":\"${rule_id}\".*\"playbook_id\":\"${playbook_id}\"" 40 || true)"
+  [[ -n "$run_created_line" ]] || fail_with_context "missing run_created for ${playbook_id}/${rule_id}"
+
+  run_id="$(printf '%s\n' "$run_created_line" | sed -n 's/.*"run_id":"\([^"]*\)".*/\1/p' | head -n 1)"
+  [[ -n "$run_id" ]] || fail_with_context "failed to parse run_id for ${playbook_id}/${rule_id}"
+
+  printf '%s\n' "$run_created_line" | rg -q "\"dst_ip\":\"${dst_ip}\"" \
+    || fail_with_context "missing dst_ip assertion for ${playbook_id}/${rule_id}"
+  printf '%s\n' "$run_created_line" | rg -q "\"dst_port\":${dst_port}" \
+    || fail_with_context "missing dst_port assertion for ${playbook_id}/${rule_id}"
+  printf '%s\n' "$run_created_line" | rg -q "\"protocol_family\":\"${protocol_family}\"" \
+    || fail_with_context "missing protocol_family assertion for ${playbook_id}/${rule_id}"
+  printf '%s\n' "$run_created_line" | rg -q "\"scan_fanout\":4" \
+    || fail_with_context "missing scan_fanout assertion for ${playbook_id}/${rule_id}"
+  IFS=',' read -r -a top_destinations <<< "$top_destinations_csv"
+  for destination in "${top_destinations[@]}"; do
+    destination="$(echo "$destination" | xargs)"
+    printf '%s\n' "$run_created_line" | rg -q "\"${destination}\"" \
+      || fail_with_context "missing top_destination ${destination} for ${playbook_id}/${rule_id}"
+  done
+
+  approval_policy_line="$(wait_match_rg "$LOG_MASTER" "$base_master" "\"msg\":\"approval_policy_evaluated\".*\"run_id\":\"${run_id}\"" 10 || true)"
+  [[ -n "$approval_policy_line" ]] || fail_with_context "missing approval policy line for ${playbook_id}/${rule_id} run_id=${run_id}"
+  printf '%s\n' "$approval_policy_line" | rg -q '"approval_required":false' \
+    || fail_with_context "expected auto approval for ${playbook_id}/${rule_id} run_id=${run_id}"
+
+  run_updated_line="$(wait_match_rg "$LOG_MASTER" "$base_master" "\"msg\":\"response_run_updated\".*\"run_id\":\"${run_id}\".*\"status\":\"SUCCEEDED\"" 60 || true)"
+  [[ -n "$run_updated_line" ]] || fail_with_context "missing terminal SUCCEEDED run_updated for ${playbook_id}/${rule_id} run_id=${run_id}"
+
+  agent_line="$(tail_from "$LOG_AGENT" "$base_agent" | rg "\"msg\":\"agent_command_exec_start\".*\"run_id\":\"${run_id}\".*\"command_id\":\"halt_lateral_movement\"" | tail -n 1 || true)"
+  [[ -n "$agent_line" ]] || fail_with_context "missing halt_lateral_movement agent command for ${playbook_id}/${rule_id} run_id=${run_id}"
+
+  export_run_line="$(tail_from "$EXPORT_RUNS" "$base_runs" | rg "\"run_id\":\"${run_id}\".*\"status\":\"SUCCEEDED\"" | tail -n 1 || true)"
+  [[ -n "$export_run_line" ]] || fail_with_context "missing export run line for ${playbook_id}/${rule_id} run_id=${run_id}"
+
+  success_count=$((success_count + 1))
+
+  printf '{"playbook_id":"%s","run_id":"%s","expected_status":"SUCCEEDED","operator_action":null,"failed_safe_reason":null,"evidence":{"run_created_line":"%s","run_updated_line":"%s","agent_exec_lines":["%s"],"exports_run_line":"%s"}}\n' \
+    "$(json_escape "$playbook_id")" \
+    "$(json_escape "$run_id")" \
+    "$(json_escape "$run_created_line")" \
+    "$(json_escape "$run_updated_line")" \
+    "$(json_escape "$agent_line")" \
+    "$(json_escape "$export_run_line")" >> "$entries_file"
+done
+
 entry_count="$(wc -l < "$entries_file" | tr -d '[:space:]')"
-[[ "$entry_count" == "8" ]] || fail_with_context "expected 8 playbook entries, got ${entry_count}"
-[[ "$success_count" == "6" ]] || fail_with_context "expected 6 SUCCEEDED playbooks, got ${success_count}"
+[[ "$entry_count" == "14" ]] || fail_with_context "expected 14 playbook entries, got ${entry_count}"
+[[ "$success_count" == "12" ]] || fail_with_context "expected 12 SUCCEEDED playbooks, got ${success_count}"
 [[ "$failed_safe_count" == "2" ]] || fail_with_context "expected 2 FAILED_SAFE playbooks, got ${failed_safe_count}"
 
 generated_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"

@@ -31,3 +31,31 @@ func TestDeriveConfidenceAlertEvidenceBased(t *testing.T) {
 		t.Fatalf("bare confidence=%d, want less than old hardcoded-high default", bare)
 	}
 }
+
+func TestDeriveConfidenceAuditdConnectScoresHigherThanProcNet(t *testing.T) {
+	procNet := deriveConfidence(Alert{
+		Severity:   "high",
+		Lane:       "FAST",
+		SourceType: "proc_net",
+		User:       "khotso",
+		ExecPath:   "/usr/bin/nmap",
+		Comm:       "nmap",
+		Cmdline:    "/usr/bin/nmap -Pn -n",
+		DstIP:      "172.30.50.14",
+	})
+
+	auditdConnect := deriveConfidence(Alert{
+		Severity:   "high",
+		Lane:       "FAST",
+		SourceType: "auditd_connect",
+		User:       "khotso",
+		ExecPath:   "/usr/bin/nmap",
+		Comm:       "nmap",
+		Cmdline:    "/usr/bin/nmap -Pn -n",
+		DstIP:      "172.30.50.14",
+	})
+
+	if auditdConnect <= procNet {
+		t.Fatalf("auditd_connect confidence=%d, want greater than proc_net=%d", auditdConnect, procNet)
+	}
+}

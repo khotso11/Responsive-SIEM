@@ -11,3 +11,11 @@ collector:
   recursive: true
   source_type: inotify
   coalesce_window_ms: 1000
+  attribution_wait_ms: 15000
+  recent_context_root: /var/lib/rsiem/recent_context
+  recent_exec_max_age_ms: 120000
+  recent_file_access_max_age_ms: 30000
+
+  ignore_prefixes:
+    - /etc/rsiem
+    - /etc/systemd/system/rsiem-

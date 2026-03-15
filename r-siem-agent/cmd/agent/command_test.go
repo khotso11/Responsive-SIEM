@@ -21,6 +21,19 @@ func (f *fakeRunner) Run(ctx context.Context, spec execSpec) execResult {
 	return f.result
 }
 
+type recordingRunner struct {
+	specs   []execSpec
+	results func(execSpec) execResult
+}
+
+func (r *recordingRunner) Run(ctx context.Context, spec execSpec) execResult {
+	r.specs = append(r.specs, spec)
+	if r.results != nil {
+		return r.results(spec)
+	}
+	return execResult{ExitCode: 0}
+}
+
 func TestCommandIdentifier(t *testing.T) {
 	if got := commandIdentifier(map[string]any{"command": "ping"}); got != "ping" {
 		t.Fatalf("command identifier=%q, want ping", got)
@@ -253,6 +266,7 @@ func TestMarkerCommandIdempotent(t *testing.T) {
 	if err := os.Chdir(base); err != nil {
 		t.Fatalf("chdir: %v", err)
 	}
+	t.Setenv("RSIEM_AGENT_RESPONSE_ACTION_ROOT", filepath.Join(base, "response-actions"))
 	exec := newCommandExecutor(slog.Default(), quarantinePolicy{})
 
 	first := exec.handle(context.Background(), commandRequest{
@@ -288,6 +302,126 @@ func TestMarkerCommandIdempotent(t *testing.T) {
 	}
 	if _, err := os.Stat(first.Stdout); err != nil {
 		t.Fatalf("expected marker file %q: %v", first.Stdout, err)
+	}
+}
+
+func TestHaltLateralMovementFallsBackToMarkerWithoutTargets(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("RSIEM_AGENT_LATERAL_CONTROL_MODE", "firewall")
+	t.Setenv("RSIEM_AGENT_RESPONSE_ACTION_ROOT", filepath.Join(base, "response-actions"))
+
+	exec := newCommandExecutor(slog.Default(), quarantinePolicy{})
+	reply := exec.handle(context.Background(), commandRequest{
+		RunID:      "run-lateral-marker",
+		StepID:     "step-1",
+		ActionType: "agent_command",
+		Params: map[string]any{
+			"command": "halt_lateral_movement",
+		},
+	})
+	if reply.Status != "ok" || reply.ExitCode != 0 {
+		t.Fatalf("unexpected fallback reply: %#v", reply)
+	}
+	if !strings.Contains(reply.Stdout, "mode=marker reason=no_scoped_targets") {
+		t.Fatalf("expected marker fallback marker in stdout, got %q", reply.Stdout)
+	}
+}
+
+func TestHaltLateralMovementFirewallModeProgramsNFT(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("RSIEM_AGENT_LATERAL_CONTROL_MODE", "firewall")
+	t.Setenv("RSIEM_AGENT_RESPONSE_ACTION_ROOT", filepath.Join(base, "response-actions"))
+
+	prevLookPath := execLookPath
+	execLookPath = func(file string) (string, error) {
+		if file == "nft" {
+			return "/usr/sbin/nft", nil
+		}
+		return "", os.ErrNotExist
+	}
+	defer func() { execLookPath = prevLookPath }()
+
+	runner := &recordingRunner{
+		results: func(spec execSpec) execResult {
+			return execResult{ExitCode: 0, Stdout: ""}
+		},
+	}
+	exec := &commandExecutor{
+		logger:      slog.Default(),
+		timeout:     time.Second,
+		runner:      runner,
+		allowlist:   map[string]execSpec{"halt_lateral_movement": {}},
+		outputLimit: 4096,
+	}
+	reply := exec.handle(context.Background(), commandRequest{
+		RunID:      "run-lateral-fw",
+		StepID:     "step-1",
+		ActionType: "agent_command",
+		Params: map[string]any{
+			"command":          "halt_lateral_movement",
+			"dst_ip":           "172.30.50.13",
+			"top_destinations": "172.30.50.13,172.30.50.12,172.30.50.11,172.30.50.14",
+			"protocol_family":  "rdp",
+			"duration_ms":      600000,
+			"reason":           "internal_protocol_scan:R-NET-INTERNAL-RDP-SCAN",
+			"node_id":          "endpoint-01",
+		},
+	})
+	if reply.Status != "ok" || reply.ExitCode != 0 {
+		t.Fatalf("unexpected firewall reply: %#v", reply)
+	}
+	if _, err := os.Stat(reply.Stdout); err != nil {
+		t.Fatalf("expected lateral containment state file %q: %v", reply.Stdout, err)
+	}
+	data, err := os.ReadFile(reply.Stdout)
+	if err != nil {
+		t.Fatalf("read state file: %v", err)
+	}
+	if !strings.Contains(string(data), "\"backend\": \"nft\"") {
+		t.Fatalf("expected nft backend in state file, got %s", string(data))
+	}
+	if !strings.Contains(string(data), "\"protocol_family\": \"rdp\"") {
+		t.Fatalf("expected protocol_family in state file, got %s", string(data))
+	}
+	if !strings.Contains(string(data), "172.30.50.14") {
+		t.Fatalf("expected target IPs in state file, got %s", string(data))
+	}
+
+	var sawAddTable bool
+	var sawRuleV4 bool
+	targetAdds := map[string]bool{
+		"172.30.50.13": false,
+		"172.30.50.12": false,
+		"172.30.50.11": false,
+		"172.30.50.14": false,
+	}
+	for _, spec := range runner.specs {
+		if spec.Command != "/usr/sbin/nft" {
+			t.Fatalf("unexpected command %q", spec.Command)
+		}
+		joined := strings.Join(spec.Args, " ")
+		if strings.Contains(joined, "add table inet rsiem_contain") {
+			sawAddTable = true
+		}
+		if strings.Contains(joined, "add rule inet rsiem_contain rsiem_output ip daddr @lateral_block_v4 drop") {
+			sawRuleV4 = true
+		}
+		for target := range targetAdds {
+			if strings.Contains(joined, "add element inet rsiem_contain lateral_block_v4") && strings.Contains(joined, target) {
+				targetAdds[target] = true
+			}
+		}
+	}
+	if !sawAddTable {
+		t.Fatalf("expected nft add table command, got %#v", runner.specs)
+	}
+	if !sawRuleV4 {
+		t.Fatalf("expected nft add rule for v4 targets, got %#v", runner.specs)
+	}
+	for target, seen := range targetAdds {
+		if !seen {
+			t.Fatalf("expected nft add element for target %s, got %#v", target, runner.specs)
+		}
 	}
 }
 

@@ -6,6 +6,7 @@ cd "$ROOT_DIR"
 
 command -v go >/dev/null 2>&1 || { echo "FAIL: missing go"; exit 1; }
 command -v npm >/dev/null 2>&1 || { echo "FAIL: missing npm"; exit 1; }
+command -v curl >/dev/null 2>&1 || { echo "FAIL: missing curl"; exit 1; }
 
 mkdir -p logs .pids .cache/go-build
 
@@ -34,35 +35,76 @@ prepare_ui_dev_cache() {
   fi
 }
 
+wait_for_http_ready() {
+  local name="$1" url="$2" tries="${3:-30}"
+  for _ in $(seq 1 "$tries"); do
+    if curl -fsS --max-time 2 "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "FAIL: ${name} not ready at ${url}" >&2
+  return 1
+}
+
+resolve_child_pid() {
+  local pattern="$1"
+  pgrep -f "$pattern" | tail -n1 || true
+}
+
 start_if_needed() {
-  local name="$1" pid_file="$2" log_file="$3"
-  shift 3
+  local name="$1" pid_file="$2" log_file="$3" ready_url="$4" process_pattern="$5"
+  shift 5
 
   if [[ -f "$pid_file" ]]; then
     local old_pid
     old_pid="$(cat "$pid_file" 2>/dev/null || true)"
     if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
-      echo "$name already running pid=$old_pid"
+      if wait_for_http_ready "$name" "$ready_url" 3; then
+        echo "$name already running pid=$old_pid"
+        return
+      fi
+    fi
+    rm -f "$pid_file"
+  fi
+
+  if wait_for_http_ready "$name" "$ready_url" 1; then
+    local discovered_pid
+    discovered_pid="$(resolve_child_pid "$process_pattern")"
+    if [[ -n "$discovered_pid" ]]; then
+      echo "$discovered_pid" > "$pid_file"
+      echo "$name already running pid=$discovered_pid"
       return
     fi
+    echo "$name already running and ready"
+    return
   fi
 
   echo "Starting $name..."
-  "$@" >> "$log_file" 2>&1 &
-  local pid="$!"
-  echo "$pid" > "$pid_file"
-  sleep 1
-  if ! kill -0 "$pid" 2>/dev/null; then
-    echo "FAIL: $name failed to start; see $log_file"
+  nohup "$@" >> "$log_file" 2>&1 < /dev/null &
+  local launcher_pid="$!"
+  echo "$launcher_pid" > "$pid_file"
+  if ! wait_for_http_ready "$name" "$ready_url" 30; then
+    tail -n 40 "$log_file" >&2 || true
     exit 1
   fi
-  echo "$name started pid=$pid"
+  local runtime_pid
+  runtime_pid="$(resolve_child_pid "$process_pattern")"
+  if [[ -n "$runtime_pid" ]]; then
+    echo "$runtime_pid" > "$pid_file"
+    echo "$name started pid=$runtime_pid"
+  else
+    rm -f "$pid_file"
+    echo "FAIL: ${name} became ready but no stable child pid matched pattern ${process_pattern}" >&2
+    tail -n 40 "$log_file" >&2 || true
+    exit 1
+  fi
 }
 
 cleanup_stale_ui_procs
 prepare_ui_dev_cache
 
-start_if_needed "ui-api" ".pids/ui-api.pid" "logs/ui-api.log" env \
+start_if_needed "ui-api" ".pids/ui-api.pid" "logs/ui-api.log" "${UI_API_BASE}/api/health" "/tmp/go-build.*/exe/ui-api|cmd/ui-api --addr ${UI_API_ADDR}" env \
   UI_API_KEY="$UI_API_KEY" \
   GOFLAGS="${GOFLAGS:--mod=mod}" \
   GOCACHE="$ROOT_DIR/.cache/go-build" \
@@ -73,7 +115,7 @@ if [[ ! -d ui/node_modules ]]; then
   npm --prefix ui install --no-audit --no-fund
 fi
 
-start_if_needed "ui-web" ".pids/ui-web.pid" "logs/ui-web.log" env \
+start_if_needed "ui-web" ".pids/ui-web.pid" "logs/ui-web.log" "http://${UI_WEB_HOST}:${UI_WEB_PORT}" "next dev --hostname ${UI_WEB_HOST} --port ${UI_WEB_PORT}|next/dist/bin/next" env \
   NEXT_PUBLIC_UI_API_BASE="$UI_API_BASE" \
   NEXT_PUBLIC_UI_API_KEY="$UI_API_KEY" \
   RSIEM_UI_DIST_DIR="$UI_DEV_DIST_DIR" \

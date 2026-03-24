@@ -454,7 +454,7 @@ func (networkBlockStubConnector) RequiredParams() []string {
 }
 
 func (networkBlockStubConnector) OptionalParams() []string {
-	return []string{"direction"}
+	return []string{"direction", "duration_ms", "reason", "reference", "actor", "node_id", "mode", "response_action_id", "containment_run_id", "dns_name", "resolved_targets"}
 }
 
 func (c networkBlockStubConnector) Execute(ctx context.Context, step Step) (map[string]any, error) {

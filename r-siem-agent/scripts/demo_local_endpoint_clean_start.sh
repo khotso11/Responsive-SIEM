@@ -42,7 +42,7 @@ health_fail() {
   HEALTH_FAILURES=$((HEALTH_FAILURES + 1))
 }
 
-for cmd in awk docker go nohup pkill rg sed sudo; do
+for cmd in awk curl docker go nohup pkill rg sed sudo; do
   need_cmd "$cmd"
 done
 
@@ -127,6 +127,21 @@ report_systemd_unit_health() {
   sudo systemctl status "$unit" -l --no-pager | sed -n '1,12p' >&2 || true
 }
 
+wait_for_http_ready() {
+  local name="$1"
+  local url="$2"
+  local tries="${3:-30}"
+  for _ in $(seq 1 "$tries"); do
+    if curl -fsS --max-time 2 "$url" >/dev/null 2>&1; then
+      echo "PASS: ${name} ready at ${url}"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "FAIL: ${name} not ready at ${url}" >&2
+  return 1
+}
+
 echo "MODE=${MODE_LABEL}"
 
 echo "[0/10] Preparing local endpoint package"
@@ -209,6 +224,11 @@ NATS_URL="nats://${MASTER_IP}:4222"
 echo "MASTER_IP=$MASTER_IP"
 echo "NATS_URL=$NATS_URL"
 echo "DB_DSN=$DB_DSN"
+
+if ! wait_for_http_ready "nats-monitor" "http://127.0.0.1:8222/healthz" 30; then
+  docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' >&2 || true
+  exit 1
+fi
 
 echo "[3/10] Building DB-backed master config"
 awk '

@@ -31,6 +31,7 @@ const (
 	defaultCommandResultRoot     = "/var/lib/rsiem/command_results"
 	defaultCommandReplySpoolRoot = "/var/lib/rsiem/command_reply_spool"
 	defaultResponseActionRoot    = "/var/lib/rsiem/response_actions"
+	defaultHostsPath             = "/etc/hosts"
 )
 
 var execLookPath = exec.LookPath
@@ -512,6 +513,27 @@ type lateralContainmentRecord struct {
 	LastUpdatedAtUnixMs int64    `json:"last_updated_at_unix_ms,omitempty"`
 }
 
+type networkBlockRecord struct {
+	Version             int      `json:"version"`
+	ActionID            string   `json:"action_id"`
+	RunID               string   `json:"run_id"`
+	StepID              string   `json:"step_id,omitempty"`
+	NodeID              string   `json:"node_id,omitempty"`
+	Direction           string   `json:"direction"`
+	Target              string   `json:"target"`
+	Targets             []string `json:"targets,omitempty"`
+	Hostnames           []string `json:"hostnames,omitempty"`
+	Reason              string   `json:"reason,omitempty"`
+	Backend             string   `json:"backend,omitempty"`
+	Status              string   `json:"status"`
+	Applied             bool     `json:"applied"`
+	Cleared             bool     `json:"cleared"`
+	AppliedAtUnixMs     int64    `json:"applied_at_unix_ms,omitempty"`
+	ExpiresAtUnixMs     int64    `json:"expires_at_unix_ms,omitempty"`
+	ClearedAtUnixMs     int64    `json:"cleared_at_unix_ms,omitempty"`
+	LastUpdatedAtUnixMs int64    `json:"last_updated_at_unix_ms,omitempty"`
+}
+
 type safeDeniedError struct {
 	reason string
 }
@@ -587,20 +609,17 @@ func (e *commandExecutor) handle(ctx context.Context, req commandRequest) comman
 	stepID := strings.TrimSpace(req.StepID)
 	actionKey := commandID
 	if actionType == "network_block" {
-		plan, err := buildNetworkBlockPlan(req.Target, req.Params)
-		if err != nil {
-			return commandReply{Status: "error", ExitCode: -1, ErrorClass: "allowlist_denied"}
-		}
+		reply := e.executeNetworkBlockCommand(ctx, req)
 		e.logger.LogAttrs(context.Background(), slog.LevelInfo, "agent_command_exec_done",
 			slog.String("run_id", runID),
 			slog.String("step_id", stepID),
 			slog.String("command_id", "network_block"),
-			slog.Int("exit_code", 0),
-			slog.Int64("duration_ms", 0),
-			slog.Bool("stdout_truncated", false),
-			slog.Bool("stderr_truncated", false),
+			slog.Int("exit_code", reply.ExitCode),
+			slog.Int64("duration_ms", reply.DurationMs),
+			slog.Bool("stdout_truncated", reply.TruncatedStdout),
+			slog.Bool("stderr_truncated", reply.TruncatedStderr),
 		)
-		return commandReply{Status: "ok", ExitCode: 0, DurationMs: 0, Stdout: plan}
+		return reply
 	}
 
 	if actionType == "network_rate_limit" {
@@ -1755,6 +1774,35 @@ func writeLateralContainmentRecord(path string, rec lateralContainmentRecord) er
 	return os.WriteFile(path, data, 0o600)
 }
 
+func readNetworkBlockRecord(path string) (networkBlockRecord, error) {
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return networkBlockRecord{}, denySafe("network_block_symlink_not_allowed")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return networkBlockRecord{}, err
+	}
+	var rec networkBlockRecord
+	if err := json.Unmarshal(data, &rec); err != nil {
+		return networkBlockRecord{}, denySafe("network_block_record_invalid")
+	}
+	return rec, nil
+}
+
+func writeNetworkBlockRecord(path string, rec networkBlockRecord) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return denySafe("network_block_symlink_not_allowed")
+	}
+	data, err := json.MarshalIndent(rec, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
+}
+
 func chooseFirstNonEmpty(values ...string) string {
 	for _, v := range values {
 		if strings.TrimSpace(v) != "" {
@@ -1762,6 +1810,23 @@ func chooseFirstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func uniqueStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
 }
 
 func splitCSVValues(input string) []string {
@@ -1798,6 +1863,24 @@ func uniqueValidPrivateIPs(values []string) ([]string, error) {
 		out = append(out, canonical)
 	}
 	return out, nil
+}
+
+func uniquePrivateIPsBestEffort(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, raw := range values {
+		ip := net.ParseIP(strings.TrimSpace(raw))
+		if ip == nil || !ip.IsPrivate() {
+			continue
+		}
+		canonical := ip.String()
+		if _, ok := seen[canonical]; ok {
+			continue
+		}
+		seen[canonical] = struct{}{}
+		out = append(out, canonical)
+	}
+	return out
 }
 
 func nftTimeoutString(durationMs int64) string {
@@ -1841,36 +1924,81 @@ func (e *commandExecutor) ensureNFTBase(ctx context.Context, nftBin string) erro
 		return fmt.Errorf("nft add table: %w", createTable.Err)
 	}
 
-	createSetV4 := e.runFirewallSpec(ctx, execSpec{Command: nftBin, Args: []string{"add", "set", "inet", "rsiem_contain", "lateral_block_v4", "{ type ipv4_addr; flags timeout; }"}})
-	if createSetV4.Err != nil && !ignorableNFTError(createSetV4, "File exists") {
-		return fmt.Errorf("nft add set lateral_block_v4: %w", createSetV4.Err)
+	setSpecs := []struct {
+		name string
+		spec string
+	}{
+		{name: "lateral_block_v4", spec: "{ type ipv4_addr; flags timeout; }"},
+		{name: "lateral_block_v6", spec: "{ type ipv6_addr; flags timeout; }"},
+		{name: "network_block_ingress_v4", spec: "{ type ipv4_addr; flags interval,timeout; }"},
+		{name: "network_block_ingress_v6", spec: "{ type ipv6_addr; flags interval,timeout; }"},
+		{name: "network_block_egress_v4", spec: "{ type ipv4_addr; flags interval,timeout; }"},
+		{name: "network_block_egress_v6", spec: "{ type ipv6_addr; flags interval,timeout; }"},
 	}
-
-	createSetV6 := e.runFirewallSpec(ctx, execSpec{Command: nftBin, Args: []string{"add", "set", "inet", "rsiem_contain", "lateral_block_v6", "{ type ipv6_addr; flags timeout; }"}})
-	if createSetV6.Err != nil && !ignorableNFTError(createSetV6, "File exists") {
-		return fmt.Errorf("nft add set lateral_block_v6: %w", createSetV6.Err)
-	}
-
-	createChain := e.runFirewallSpec(ctx, execSpec{Command: nftBin, Args: []string{"add", "chain", "inet", "rsiem_contain", "rsiem_output", "{ type filter hook output priority 0; policy accept; }"}})
-	if createChain.Err != nil && !ignorableNFTError(createChain, "File exists") {
-		return fmt.Errorf("nft add chain rsiem_output: %w", createChain.Err)
-	}
-
-	listChain := e.runFirewallSpec(ctx, execSpec{Command: nftBin, Args: []string{"list", "chain", "inet", "rsiem_contain", "rsiem_output"}})
-	if listChain.Err != nil {
-		return fmt.Errorf("nft list chain rsiem_output: %w", listChain.Err)
-	}
-	chainText := listChain.Stdout + "\n" + listChain.Stderr
-	if !strings.Contains(chainText, "@lateral_block_v4") {
-		addRuleV4 := e.runFirewallSpec(ctx, execSpec{Command: nftBin, Args: []string{"add", "rule", "inet", "rsiem_contain", "rsiem_output", "ip", "daddr", "@lateral_block_v4", "drop"}})
-		if addRuleV4.Err != nil && !ignorableNFTError(addRuleV4, "File exists") {
-			return fmt.Errorf("nft add rule v4: %w", addRuleV4.Err)
+	for _, item := range setSpecs {
+		createSet := e.runFirewallSpec(ctx, execSpec{Command: nftBin, Args: []string{"add", "set", "inet", "rsiem_contain", item.name, item.spec}})
+		if createSet.Err != nil && !ignorableNFTError(createSet, "File exists") {
+			return fmt.Errorf("nft add set %s: %w", item.name, createSet.Err)
 		}
 	}
-	if !strings.Contains(chainText, "@lateral_block_v6") {
-		addRuleV6 := e.runFirewallSpec(ctx, execSpec{Command: nftBin, Args: []string{"add", "rule", "inet", "rsiem_contain", "rsiem_output", "ip6", "daddr", "@lateral_block_v6", "drop"}})
-		if addRuleV6.Err != nil && !ignorableNFTError(addRuleV6, "File exists") {
-			return fmt.Errorf("nft add rule v6: %w", addRuleV6.Err)
+
+	chainSpecs := []struct {
+		name string
+		spec string
+	}{
+		{name: "rsiem_input", spec: "{ type filter hook input priority 0; policy accept; }"},
+		{name: "rsiem_output", spec: "{ type filter hook output priority 0; policy accept; }"},
+	}
+	for _, item := range chainSpecs {
+		createChain := e.runFirewallSpec(ctx, execSpec{Command: nftBin, Args: []string{"add", "chain", "inet", "rsiem_contain", item.name, item.spec}})
+		if createChain.Err != nil && !ignorableNFTError(createChain, "File exists") {
+			return fmt.Errorf("nft add chain %s: %w", item.name, createChain.Err)
+		}
+	}
+
+	listOutput := e.runFirewallSpec(ctx, execSpec{Command: nftBin, Args: []string{"list", "chain", "inet", "rsiem_contain", "rsiem_output"}})
+	if listOutput.Err != nil {
+		return fmt.Errorf("nft list chain rsiem_output: %w", listOutput.Err)
+	}
+	outputText := listOutput.Stdout + "\n" + listOutput.Stderr
+	outputRules := []struct {
+		marker string
+		args   []string
+	}{
+		{marker: "@lateral_block_v4", args: []string{"add", "rule", "inet", "rsiem_contain", "rsiem_output", "ip", "daddr", "@lateral_block_v4", "drop"}},
+		{marker: "@lateral_block_v6", args: []string{"add", "rule", "inet", "rsiem_contain", "rsiem_output", "ip6", "daddr", "@lateral_block_v6", "drop"}},
+		{marker: "@network_block_egress_v4", args: []string{"add", "rule", "inet", "rsiem_contain", "rsiem_output", "oifname", "!=", "lo", "ip", "daddr", "@network_block_egress_v4", "drop"}},
+		{marker: "@network_block_egress_v6", args: []string{"add", "rule", "inet", "rsiem_contain", "rsiem_output", "oifname", "!=", "lo", "ip6", "daddr", "@network_block_egress_v6", "drop"}},
+	}
+	for _, item := range outputRules {
+		if strings.Contains(outputText, item.marker) {
+			continue
+		}
+		addRule := e.runFirewallSpec(ctx, execSpec{Command: nftBin, Args: item.args})
+		if addRule.Err != nil && !ignorableNFTError(addRule, "File exists") {
+			return fmt.Errorf("nft add output rule %s: %w", item.marker, addRule.Err)
+		}
+	}
+
+	listInput := e.runFirewallSpec(ctx, execSpec{Command: nftBin, Args: []string{"list", "chain", "inet", "rsiem_contain", "rsiem_input"}})
+	if listInput.Err != nil {
+		return fmt.Errorf("nft list chain rsiem_input: %w", listInput.Err)
+	}
+	inputText := listInput.Stdout + "\n" + listInput.Stderr
+	inputRules := []struct {
+		marker string
+		args   []string
+	}{
+		{marker: "@network_block_ingress_v4", args: []string{"add", "rule", "inet", "rsiem_contain", "rsiem_input", "iifname", "!=", "lo", "ip", "saddr", "@network_block_ingress_v4", "drop"}},
+		{marker: "@network_block_ingress_v6", args: []string{"add", "rule", "inet", "rsiem_contain", "rsiem_input", "iifname", "!=", "lo", "ip6", "saddr", "@network_block_ingress_v6", "drop"}},
+	}
+	for _, item := range inputRules {
+		if strings.Contains(inputText, item.marker) {
+			continue
+		}
+		addRule := e.runFirewallSpec(ctx, execSpec{Command: nftBin, Args: item.args})
+		if addRule.Err != nil && !ignorableNFTError(addRule, "File exists") {
+			return fmt.Errorf("nft add input rule %s: %w", item.marker, addRule.Err)
 		}
 	}
 	return nil
@@ -1899,6 +2027,428 @@ func (e *commandExecutor) applyLateralFirewallTargets(ctx context.Context, nftBi
 	return nil
 }
 
+func networkBlockActionID(req commandRequest) string {
+	for _, candidate := range []string{
+		strings.TrimSpace(stringParam(req.Params, "response_action_id")),
+		strings.TrimSpace(stringParam(req.Params, "containment_run_id")),
+		strings.TrimSpace(req.RunID),
+	} {
+		if candidate == "" {
+			continue
+		}
+		if candidate != filepath.Base(candidate) || strings.Contains(candidate, string(filepath.Separator)) {
+			return ""
+		}
+		return candidate
+	}
+	return ""
+}
+
+func normalizeNetworkBlockDirection(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "both":
+		return "both"
+	case "ingress", "egress":
+		return strings.ToLower(strings.TrimSpace(raw))
+	default:
+		return ""
+	}
+}
+
+func canonicalNetworkBlockTargets(raw string) ([]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || !validIPOrCIDR(raw) {
+		return nil, denySafe("invalid_network_block_target")
+	}
+	if raw == "0.0.0.0/0" {
+		return []string{"0.0.0.0/0", "::/0"}, nil
+	}
+	if ip := net.ParseIP(raw); ip != nil {
+		return []string{ip.String()}, nil
+	}
+	_, network, err := net.ParseCIDR(raw)
+	if err != nil || network == nil {
+		return nil, denySafe("invalid_network_block_target")
+	}
+	return []string{network.String()}, nil
+}
+
+func canonicalNetworkBlockHostnames(raw string) ([]string, error) {
+	host := strings.ToLower(strings.TrimSpace(raw))
+	if host == "" || !validHostname(host) {
+		return nil, denySafe("invalid_network_block_target")
+	}
+	return []string{host}, nil
+}
+
+func optionalResolvedTargets(raw string) ([]string, error) {
+	parts := splitCSVValues(raw)
+	if len(parts) == 0 {
+		return nil, nil
+	}
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		targets, err := canonicalNetworkBlockTargets(part)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, targets...)
+	}
+	return uniqueStrings(out), nil
+}
+
+func resolveHostnameTargets(ctx context.Context, hostnames []string) []string {
+	resolver := net.DefaultResolver
+	out := make([]string, 0, len(hostnames)*2)
+	for _, hostname := range hostnames {
+		ips, err := resolver.LookupIP(ctx, "ip", hostname)
+		if err != nil {
+			continue
+		}
+		for _, ip := range ips {
+			if ip == nil {
+				continue
+			}
+			out = append(out, ip.String())
+		}
+	}
+	return uniqueStrings(out)
+}
+
+func hostsFilePath() string {
+	path := strings.TrimSpace(os.Getenv("RSIEM_AGENT_HOSTS_PATH"))
+	if path == "" {
+		path = defaultHostsPath
+	}
+	return path
+}
+
+func networkBlockHostsMarker(actionID string) string {
+	return "# rsiem-network-block:" + strings.TrimSpace(actionID)
+}
+
+func loadHostsFile(path string) (string, os.FileMode, error) {
+	if err := ensureNoSymlinkPath(path, true); err != nil {
+		return "", 0, denySafe("hosts_path_symlink_not_allowed")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", 0o644, nil
+		}
+		return "", 0, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", 0, err
+	}
+	return string(data), info.Mode().Perm(), nil
+}
+
+func writeHostsFile(path, content string, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), "rsiem-hosts-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		_ = os.Remove(tmpPath)
+	}()
+	if _, err := tmp.WriteString(content); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpPath, mode); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
+}
+
+func applyHostsBlockEntries(path, actionID string, hostnames []string) error {
+	if len(hostnames) == 0 {
+		return nil
+	}
+	content, mode, err := loadHostsFile(path)
+	if err != nil {
+		return err
+	}
+	lines := []string{}
+	if content != "" {
+		lines = strings.Split(strings.TrimRight(content, "\n"), "\n")
+	}
+	marker := networkBlockHostsMarker(actionID)
+	existing := strings.Join(lines, "\n")
+	for _, hostname := range uniqueStrings(hostnames) {
+		for _, entry := range []string{
+			fmt.Sprintf("127.0.0.1 %s %s", hostname, marker),
+			fmt.Sprintf("::1 %s %s", hostname, marker),
+		} {
+			if strings.Contains(existing, entry) {
+				continue
+			}
+			lines = append(lines, entry)
+		}
+	}
+	next := strings.Join(lines, "\n")
+	if next != "" {
+		next += "\n"
+	}
+	return writeHostsFile(path, next, mode)
+}
+
+func clearHostsBlockEntries(path, actionID string) error {
+	content, mode, err := loadHostsFile(path)
+	if err != nil {
+		return err
+	}
+	if content == "" {
+		return nil
+	}
+	marker := networkBlockHostsMarker(actionID)
+	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
+	filtered := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if strings.Contains(line, marker) {
+			continue
+		}
+		filtered = append(filtered, line)
+	}
+	next := strings.Join(filtered, "\n")
+	if next != "" {
+		next += "\n"
+	}
+	return writeHostsFile(path, next, mode)
+}
+
+func networkBlockSetNames(direction, target string) []string {
+	ip := net.ParseIP(target)
+	isV4 := ip != nil && ip.To4() != nil
+	if ip == nil {
+		_, network, _ := net.ParseCIDR(target)
+		if network != nil && network.IP.To4() != nil {
+			isV4 = true
+		}
+	}
+	suffix := "v6"
+	if isV4 {
+		suffix = "v4"
+	}
+	switch direction {
+	case "ingress":
+		return []string{"network_block_ingress_" + suffix}
+	case "egress":
+		return []string{"network_block_egress_" + suffix}
+	default:
+		return []string{"network_block_ingress_" + suffix, "network_block_egress_" + suffix}
+	}
+}
+
+func (e *commandExecutor) applyNetworkBlockTargets(ctx context.Context, nftBin, direction string, targets []string, durationMs int64) error {
+	timeoutValue := nftTimeoutString(durationMs)
+	for _, target := range targets {
+		for _, setName := range networkBlockSetNames(direction, target) {
+			addResult := e.runFirewallSpec(ctx, execSpec{Command: nftBin, Args: []string{"add", "element", "inet", "rsiem_contain", setName, fmt.Sprintf("{ %s timeout %s }", target, timeoutValue)}})
+			if addResult.Err == nil || ignorableNFTError(addResult, "File exists") {
+				if addResult.Err == nil {
+					continue
+				}
+				deleteResult := e.runFirewallSpec(ctx, execSpec{Command: nftBin, Args: []string{"delete", "element", "inet", "rsiem_contain", setName, fmt.Sprintf("{ %s }", target)}})
+				if deleteResult.Err != nil && !ignorableNFTError(deleteResult, "No such file or directory", "No such element", "No such file") {
+					return fmt.Errorf("nft delete element %s %s: %w", setName, target, deleteResult.Err)
+				}
+				retryAdd := e.runFirewallSpec(ctx, execSpec{Command: nftBin, Args: []string{"add", "element", "inet", "rsiem_contain", setName, fmt.Sprintf("{ %s timeout %s }", target, timeoutValue)}})
+				if retryAdd.Err != nil && !ignorableNFTError(retryAdd, "File exists") {
+					return fmt.Errorf("nft add element %s %s: %w", setName, target, retryAdd.Err)
+				}
+				continue
+			}
+			if addResult.Err != nil {
+				return fmt.Errorf("nft add element %s %s: %w", setName, target, addResult.Err)
+			}
+		}
+	}
+	return nil
+}
+
+func (e *commandExecutor) clearNetworkBlockTargets(ctx context.Context, nftBin, direction string, targets []string) error {
+	for _, target := range targets {
+		for _, setName := range networkBlockSetNames(direction, target) {
+			deleteResult := e.runFirewallSpec(ctx, execSpec{Command: nftBin, Args: []string{"delete", "element", "inet", "rsiem_contain", setName, fmt.Sprintf("{ %s }", target)}})
+			if deleteResult.Err != nil && !ignorableNFTError(deleteResult, "No such file or directory", "No such element", "No such file") {
+				return fmt.Errorf("nft delete element %s %s: %w", setName, target, deleteResult.Err)
+			}
+		}
+	}
+	return nil
+}
+
+func loadNetworkBlockRecord(root string, req commandRequest) (networkBlockRecord, string, error) {
+	if actionID := networkBlockActionID(req); actionID != "" {
+		path := filepath.Join(root, "network", actionID, "state.json")
+		rec, err := readNetworkBlockRecord(path)
+		if err == nil {
+			return rec, path, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return networkBlockRecord{}, "", err
+		}
+		if strings.EqualFold(strings.TrimSpace(stringParam(req.Params, "mode")), "clear") {
+			return networkBlockRecord{}, "", os.ErrNotExist
+		}
+		return networkBlockRecord{}, path, os.ErrNotExist
+	}
+	return networkBlockRecord{}, "", os.ErrNotExist
+}
+
+func (e *commandExecutor) executeNetworkBlockCommand(ctx context.Context, req commandRequest) commandReply {
+	start := time.Now()
+	runID := strings.TrimSpace(req.RunID)
+	stepID := strings.TrimSpace(req.StepID)
+	if runID == "" || runID != filepath.Base(runID) || strings.Contains(runID, string(filepath.Separator)) {
+		return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:invalid_run_id", ErrorClass: safeDeniedClass}
+	}
+	direction := normalizeNetworkBlockDirection(stringParam(req.Params, "direction"))
+	if direction == "" {
+		return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:invalid_direction", ErrorClass: safeDeniedClass}
+	}
+	target := strings.TrimSpace(req.Target)
+	if target == "" {
+		target = strings.TrimSpace(stringParam(req.Params, "target"))
+	}
+	target = strings.TrimSpace(target)
+	var targets []string
+	var hostnames []string
+	var err error
+	if validIPOrCIDR(target) {
+		targets, err = canonicalNetworkBlockTargets(target)
+		if err != nil {
+			return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: err.Error(), ErrorClass: safeDeniedClass}
+		}
+	} else {
+		hostnames, err = canonicalNetworkBlockHostnames(target)
+		if err != nil {
+			return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: err.Error(), ErrorClass: safeDeniedClass}
+		}
+	}
+	mode := strings.ToLower(strings.TrimSpace(stringParam(req.Params, "mode")))
+	if mode == "" {
+		mode = "apply"
+	}
+	if mode != "apply" && mode != "clear" {
+		return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:invalid_mode", ErrorClass: safeDeniedClass}
+	}
+	resolvedTargets, err := optionalResolvedTargets(stringParam(req.Params, "resolved_targets"))
+	if err != nil {
+		return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: err.Error(), ErrorClass: safeDeniedClass}
+	}
+	actionID := networkBlockActionID(req)
+	if actionID == "" {
+		return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:invalid_response_action_id", ErrorClass: safeDeniedClass}
+	}
+	root, err := ensureResolvedDirectoryAllowAbs(responseActionRoot(), "", true)
+	if err != nil {
+		return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:invalid_response_action_root", ErrorClass: safeDeniedClass}
+	}
+	record, recordPath, err := loadNetworkBlockRecord(root, req)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: err.Error(), ErrorClass: safeDeniedClass}
+	}
+	if recordPath == "" {
+		recordPath = filepath.Join(root, "network", actionID, "state.json")
+	}
+
+	nftBin, err := execLookPath("nft")
+	if err != nil {
+		return commandReply{Status: "error", ExitCode: 1, DurationMs: time.Since(start).Milliseconds(), Stderr: "nft_not_found", ErrorClass: "exec_failed"}
+	}
+	cmdCtx, cancel := context.WithTimeout(ctx, e.timeout)
+	defer cancel()
+	if err := e.ensureNFTBase(cmdCtx, nftBin); err != nil {
+		return commandReply{Status: "error", ExitCode: 1, DurationMs: time.Since(start).Milliseconds(), Stderr: err.Error(), ErrorClass: "exec_failed"}
+	}
+
+	nowMs := time.Now().UnixMilli()
+	if mode == "clear" {
+		if record.RunID == "" {
+			return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:containment_record_missing", ErrorClass: safeDeniedClass}
+		}
+		if record.ActionID != actionID {
+			return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:containment_record_mismatch", ErrorClass: safeDeniedClass}
+		}
+		if len(record.Targets) > 0 {
+			if err := e.clearNetworkBlockTargets(cmdCtx, nftBin, record.Direction, record.Targets); err != nil {
+				return commandReply{Status: "error", ExitCode: 1, DurationMs: time.Since(start).Milliseconds(), Stderr: err.Error(), ErrorClass: "exec_failed"}
+			}
+		}
+		if len(record.Hostnames) > 0 {
+			if err := clearHostsBlockEntries(hostsFilePath(), actionID); err != nil {
+				return commandReply{Status: "error", ExitCode: 1, DurationMs: time.Since(start).Milliseconds(), Stderr: err.Error(), ErrorClass: "exec_failed"}
+			}
+		}
+		record.Status = "cleared"
+		record.Cleared = true
+		record.ClearedAtUnixMs = nowMs
+		record.LastUpdatedAtUnixMs = nowMs
+		if err := writeNetworkBlockRecord(recordPath, record); err != nil {
+			return commandReply{Status: "error", ExitCode: 1, DurationMs: time.Since(start).Milliseconds(), Stderr: err.Error(), ErrorClass: "exec_failed"}
+		}
+		return commandReply{Status: "ok", ExitCode: 0, DurationMs: time.Since(start).Milliseconds(), Stdout: recordPath}
+	}
+
+	durationMs, set, err := intParam(req.Params, "duration_ms")
+	if err != nil || (set && durationMs <= 0) {
+		return commandReply{Status: "error", ExitCode: 3, DurationMs: time.Since(start).Milliseconds(), Stderr: "safe_denied:invalid_duration_ms", ErrorClass: safeDeniedClass}
+	}
+	if !set {
+		durationMs = int64(2 * time.Hour / time.Millisecond)
+	}
+	if len(hostnames) > 0 {
+		if len(resolvedTargets) == 0 {
+			resolveCtx, resolveCancel := context.WithTimeout(ctx, 2*time.Second)
+			resolvedTargets = resolveHostnameTargets(resolveCtx, hostnames)
+			resolveCancel()
+		}
+		if err := applyHostsBlockEntries(hostsFilePath(), actionID, hostnames); err != nil {
+			return commandReply{Status: "error", ExitCode: 1, DurationMs: time.Since(start).Milliseconds(), Stderr: err.Error(), ErrorClass: "exec_failed"}
+		}
+		targets = append(targets, resolvedTargets...)
+	}
+	targets = uniqueStrings(targets)
+	if len(targets) > 0 {
+		if err := e.applyNetworkBlockTargets(cmdCtx, nftBin, direction, targets, durationMs); err != nil {
+			return commandReply{Status: "error", ExitCode: 1, DurationMs: time.Since(start).Milliseconds(), Stderr: err.Error(), ErrorClass: "exec_failed"}
+		}
+	}
+	record = networkBlockRecord{
+		Version:             1,
+		ActionID:            actionID,
+		RunID:               runID,
+		StepID:              stepID,
+		NodeID:              strings.TrimSpace(stringParam(req.Params, "node_id")),
+		Direction:           direction,
+		Target:              target,
+		Targets:             append([]string(nil), targets...),
+		Hostnames:           append([]string(nil), hostnames...),
+		Reason:              strings.TrimSpace(stringParam(req.Params, "reason")),
+		Backend:             "nft",
+		Status:              "applied",
+		Applied:             true,
+		AppliedAtUnixMs:     nowMs,
+		ExpiresAtUnixMs:     nowMs + durationMs,
+		LastUpdatedAtUnixMs: nowMs,
+	}
+	if err := writeNetworkBlockRecord(recordPath, record); err != nil {
+		return commandReply{Status: "error", ExitCode: 1, DurationMs: time.Since(start).Milliseconds(), Stderr: err.Error(), ErrorClass: "exec_failed"}
+	}
+	return commandReply{Status: "ok", ExitCode: 0, DurationMs: time.Since(start).Milliseconds(), Stdout: recordPath}
+}
+
 func (e *commandExecutor) lateralTargetsFromRequest(req commandRequest) ([]string, error) {
 	candidates := make([]string, 0, 8)
 	candidates = append(candidates, splitCSVValues(stringParam(req.Params, "top_destinations"))...)
@@ -1911,7 +2461,7 @@ func (e *commandExecutor) lateralTargetsFromRequest(req commandRequest) ([]strin
 	if len(candidates) == 0 {
 		return nil, nil
 	}
-	return uniqueValidPrivateIPs(candidates)
+	return uniquePrivateIPsBestEffort(candidates), nil
 }
 
 func (e *commandExecutor) executeLateralMovementCommand(ctx context.Context, req commandRequest) commandReply {

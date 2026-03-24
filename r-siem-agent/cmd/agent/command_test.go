@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -67,30 +68,202 @@ func TestPolicyDenied(t *testing.T) {
 	}
 }
 
-func TestDryRunNetworkBlockPlan(t *testing.T) {
-	runner := &fakeRunner{}
-	exec := &commandExecutor{
-		logger:  slog.Default(),
-		timeout: time.Second,
-		runner:  runner,
-		allowlist: map[string]execSpec{
-			"network_block": {DryRun: true},
-		},
+func TestNetworkBlockApplyAndClear(t *testing.T) {
+	t.Setenv("RSIEM_AGENT_RESPONSE_ACTION_ROOT", t.TempDir())
+	prevLookPath := execLookPath
+	execLookPath = func(file string) (string, error) {
+		if file != "nft" {
+			return "", os.ErrNotExist
+		}
+		return "/usr/sbin/nft", nil
 	}
-	reply := exec.handle(context.Background(), commandRequest{
+	defer func() {
+		execLookPath = prevLookPath
+	}()
+
+	runner := &recordingRunner{}
+	exec := &commandExecutor{
+		logger:      slog.Default(),
+		timeout:     time.Second,
+		runner:      runner,
+		outputLimit: 4096,
+	}
+
+	apply := exec.handle(context.Background(), commandRequest{
 		RunID:      "run-1",
 		StepID:     "step-1",
 		ActionType: "network_block",
 		Target:     "10.0.0.1",
 		Params: map[string]any{
-			"direction": "ingress",
+			"direction":          "ingress",
+			"duration_ms":        60000,
+			"response_action_id": "uiact_123",
+			"node_id":            "node-1",
 		},
 	})
-	if runner.called {
-		t.Fatalf("expected runner not called for dry-run")
+	if apply.Status != "ok" || apply.ExitCode != 0 {
+		t.Fatalf("unexpected apply reply: %#v", apply)
 	}
-	want := "dry_run: network_block target=10.0.0.1 direction=ingress"
-	if reply.Status != "ok" || reply.Stdout != want {
+	data, err := os.ReadFile(apply.Stdout)
+	if err != nil {
+		t.Fatalf("read network block record: %v", err)
+	}
+	if !strings.Contains(string(data), "\"direction\": \"ingress\"") {
+		t.Fatalf("network block record missing ingress direction: %s", string(data))
+	}
+	if len(runner.specs) == 0 {
+		t.Fatalf("expected nft commands to be issued")
+	}
+
+	clear := exec.handle(context.Background(), commandRequest{
+		RunID:      "run-1",
+		StepID:     "step-2",
+		ActionType: "network_block",
+		Target:     "10.0.0.1",
+		Params: map[string]any{
+			"direction":          "ingress",
+			"mode":               "clear",
+			"response_action_id": "uiact_123",
+		},
+	})
+	if clear.Status != "ok" || clear.ExitCode != 0 {
+		t.Fatalf("unexpected clear reply: %#v", clear)
+	}
+	data, err = os.ReadFile(clear.Stdout)
+	if err != nil {
+		t.Fatalf("read cleared network block record: %v", err)
+	}
+	if !strings.Contains(string(data), "\"status\": \"cleared\"") {
+		t.Fatalf("network block record missing cleared status: %s", string(data))
+	}
+}
+
+func TestNetworkBlockHostnameApplyAndClear(t *testing.T) {
+	t.Setenv("RSIEM_AGENT_RESPONSE_ACTION_ROOT", t.TempDir())
+	hostsPath := filepath.Join(t.TempDir(), "hosts")
+	if err := os.WriteFile(hostsPath, []byte("127.0.0.1 localhost\n"), 0o644); err != nil {
+		t.Fatalf("write hosts: %v", err)
+	}
+	t.Setenv("RSIEM_AGENT_HOSTS_PATH", hostsPath)
+	prevLookPath := execLookPath
+	execLookPath = func(file string) (string, error) {
+		if file != "nft" {
+			return "", os.ErrNotExist
+		}
+		return "/usr/sbin/nft", nil
+	}
+	defer func() {
+		execLookPath = prevLookPath
+	}()
+
+	runner := &recordingRunner{}
+	exec := &commandExecutor{
+		logger:      slog.Default(),
+		timeout:     time.Second,
+		runner:      runner,
+		outputLimit: 4096,
+	}
+
+	apply := exec.handle(context.Background(), commandRequest{
+		RunID:      "run-host-1",
+		StepID:     "step-host-1",
+		ActionType: "network_block",
+		Target:     "proof-rsiem-demo.invalid",
+		Params: map[string]any{
+			"direction":          "egress",
+			"duration_ms":        60000,
+			"response_action_id": "uiact_dns_123",
+			"node_id":            "node-1",
+		},
+	})
+	if apply.Status != "ok" || apply.ExitCode != 0 {
+		t.Fatalf("unexpected hostname apply reply: %#v", apply)
+	}
+	recordData, err := os.ReadFile(apply.Stdout)
+	if err != nil {
+		t.Fatalf("read network block record: %v", err)
+	}
+	if !strings.Contains(string(recordData), "\"hostnames\": [") {
+		t.Fatalf("network block record missing hostnames: %s", string(recordData))
+	}
+	hostsData, err := os.ReadFile(hostsPath)
+	if err != nil {
+		t.Fatalf("read hosts: %v", err)
+	}
+	if !strings.Contains(string(hostsData), "proof-rsiem-demo.invalid") {
+		t.Fatalf("hosts file missing blocked hostname: %s", string(hostsData))
+	}
+
+	clear := exec.handle(context.Background(), commandRequest{
+		RunID:      "run-host-1",
+		StepID:     "step-host-2",
+		ActionType: "network_block",
+		Target:     "proof-rsiem-demo.invalid",
+		Params: map[string]any{
+			"direction":          "egress",
+			"mode":               "clear",
+			"response_action_id": "uiact_dns_123",
+		},
+	})
+	if clear.Status != "ok" || clear.ExitCode != 0 {
+		t.Fatalf("unexpected hostname clear reply: %#v", clear)
+	}
+	hostsData, err = os.ReadFile(hostsPath)
+	if err != nil {
+		t.Fatalf("read hosts after clear: %v", err)
+	}
+	if strings.Contains(string(hostsData), "proof-rsiem-demo.invalid") {
+		t.Fatalf("hosts file still contains blocked hostname after clear: %s", string(hostsData))
+	}
+}
+
+func TestNetworkBlockApplyToleratesMissingDeleteDuringRefresh(t *testing.T) {
+	t.Setenv("RSIEM_AGENT_RESPONSE_ACTION_ROOT", t.TempDir())
+	prevLookPath := execLookPath
+	execLookPath = func(file string) (string, error) {
+		if file != "nft" {
+			return "", os.ErrNotExist
+		}
+		return "/usr/sbin/nft", nil
+	}
+	defer func() {
+		execLookPath = prevLookPath
+	}()
+
+	runner := &recordingRunner{
+		results: func(spec execSpec) execResult {
+			args := strings.Join(spec.Args, " ")
+			switch {
+			case strings.Contains(args, "add element") && strings.Contains(args, "network_block_egress_v4"):
+				if strings.Contains(args, "timeout") {
+					return execResult{ExitCode: 1, Err: errors.New("exit status 1"), Stderr: "File exists"}
+				}
+			case strings.Contains(args, "delete element") && strings.Contains(args, "network_block_egress_v4"):
+				return execResult{ExitCode: 1, Err: errors.New("exit status 1"), Stderr: "No such file or directory"}
+			}
+			return execResult{ExitCode: 0}
+		},
+	}
+	exec := &commandExecutor{
+		logger:      slog.Default(),
+		timeout:     time.Second,
+		runner:      runner,
+		outputLimit: 4096,
+	}
+
+	reply := exec.handle(context.Background(), commandRequest{
+		RunID:      "run-refresh-1",
+		StepID:     "step-refresh-1",
+		ActionType: "network_block",
+		Target:     "140.82.112.22",
+		Params: map[string]any{
+			"direction":          "egress",
+			"duration_ms":        60000,
+			"response_action_id": "uiact_refresh_1",
+			"node_id":            "node-1",
+		},
+	})
+	if reply.Status != "ok" || reply.ExitCode != 0 {
 		t.Fatalf("unexpected reply: %#v", reply)
 	}
 }
@@ -126,9 +299,6 @@ func TestValidationFailureIsSafe(t *testing.T) {
 		logger:  slog.Default(),
 		timeout: time.Second,
 		runner:  &fakeRunner{},
-		allowlist: map[string]execSpec{
-			"network_block": {DryRun: true},
-		},
 	}
 	reply := exec.handle(context.Background(), commandRequest{
 		RunID:      "run-1",
@@ -136,7 +306,7 @@ func TestValidationFailureIsSafe(t *testing.T) {
 		ActionType: "network_block",
 		Target:     "not-an-ip",
 	})
-	if reply.Status != "error" || reply.ErrorClass != "allowlist_denied" {
+	if reply.Status != "error" || reply.ErrorClass != safeDeniedClass {
 		t.Fatalf("unexpected validation reply: %#v", reply)
 	}
 }
@@ -324,6 +494,30 @@ func TestHaltLateralMovementFallsBackToMarkerWithoutTargets(t *testing.T) {
 	}
 	if !strings.Contains(reply.Stdout, "mode=marker reason=no_scoped_targets") {
 		t.Fatalf("expected marker fallback marker in stdout, got %q", reply.Stdout)
+	}
+}
+
+func TestHaltLateralMovementFallsBackToMarkerForPublicTargets(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("RSIEM_AGENT_LATERAL_CONTROL_MODE", "firewall")
+	t.Setenv("RSIEM_AGENT_RESPONSE_ACTION_ROOT", filepath.Join(base, "response-actions"))
+
+	exec := newCommandExecutor(slog.Default(), quarantinePolicy{})
+	reply := exec.handle(context.Background(), commandRequest{
+		RunID:      "run-lateral-public",
+		StepID:     "step-1",
+		ActionType: "agent_command",
+		Params: map[string]any{
+			"command":          "halt_lateral_movement",
+			"dst_ip":           "140.82.112.22",
+			"top_destinations": "140.82.112.22,127.0.0.1",
+		},
+	})
+	if reply.Status != "ok" || reply.ExitCode != 0 {
+		t.Fatalf("unexpected fallback reply: %#v", reply)
+	}
+	if !strings.Contains(reply.Stdout, "mode=marker reason=no_scoped_targets") {
+		t.Fatalf("expected marker fallback for public targets, got %q", reply.Stdout)
 	}
 }
 

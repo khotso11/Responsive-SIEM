@@ -505,18 +505,26 @@ type roeRuntime struct {
 }
 
 type roeDBRecord struct {
-	EventTsUnixMs int64
-	RecvTsUnixMs  int64
-	NodeID        string
-	SourceType    string
-	EventType     string
-	SrcIP         string
-	DstIP         string
-	UserName      string
-	Severity      string
-	RuleID        string
-	EventIdemKey  string
-	RawLineSHA256 string
+	EventTsUnixMs  int64
+	RecvTsUnixMs   int64
+	NodeID         string
+	SourceType     string
+	EventType      string
+	SrcIP          string
+	DstIP          string
+	DstPort        int
+	ProtocolFamily string
+	UserName       string
+	Severity       string
+	RuleID         string
+	ExecPath       string
+	Comm           string
+	Cmdline        string
+	DNSName        string
+	FileSHA256     string
+	ExecSHA256     string
+	EventIdemKey   string
+	RawLineSHA256  string
 }
 
 type roeDBSink struct {
@@ -4289,13 +4297,29 @@ CREATE TABLE IF NOT EXISTS normalized_events (
   event_type TEXT NOT NULL,
   src_ip INET NULL,
   dst_ip INET NULL,
+  dst_port INT NULL,
+  protocol_family TEXT NULL,
   user_name TEXT NULL,
   severity TEXT NULL,
   rule_id TEXT NULL,
+  exec_path TEXT NULL,
+  comm TEXT NULL,
+  cmdline TEXT NULL,
+  dns_name TEXT NULL,
+  file_sha256 TEXT NULL,
+  exec_sha256 TEXT NULL,
   event_idem_key TEXT NOT NULL,
   raw_line_sha256 TEXT NULL
 );
 ALTER TABLE normalized_events ADD COLUMN IF NOT EXISTS dst_ip INET NULL;
+ALTER TABLE normalized_events ADD COLUMN IF NOT EXISTS dst_port INT NULL;
+ALTER TABLE normalized_events ADD COLUMN IF NOT EXISTS protocol_family TEXT NULL;
+ALTER TABLE normalized_events ADD COLUMN IF NOT EXISTS exec_path TEXT NULL;
+ALTER TABLE normalized_events ADD COLUMN IF NOT EXISTS comm TEXT NULL;
+ALTER TABLE normalized_events ADD COLUMN IF NOT EXISTS cmdline TEXT NULL;
+ALTER TABLE normalized_events ADD COLUMN IF NOT EXISTS dns_name TEXT NULL;
+ALTER TABLE normalized_events ADD COLUMN IF NOT EXISTS file_sha256 TEXT NULL;
+ALTER TABLE normalized_events ADD COLUMN IF NOT EXISTS exec_sha256 TEXT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS normalized_events_event_idem_key_uidx ON normalized_events(event_idem_key);
 CREATE INDEX IF NOT EXISTS normalized_events_event_ts_idx ON normalized_events(event_ts_unix_ms);
 CREATE INDEX IF NOT EXISTS normalized_events_node_id_idx ON normalized_events(node_id);
@@ -4359,24 +4383,12 @@ func (s *roeDBSink) Insert(rec roeDBRecord) error {
 	const q = `
 INSERT INTO normalized_events (
   event_ts_unix_ms, recv_ts_unix_ms, node_id, source_type, event_type,
-  src_ip, dst_ip, user_name, severity, rule_id, event_idem_key, raw_line_sha256
-) VALUES ($1,$2,$3,$4,$5,NULLIF($6,'')::inet,NULLIF($7,'')::inet,NULLIF($8,''),$9,$10,$11,$12)
+  src_ip, dst_ip, dst_port, protocol_family, user_name, severity, rule_id,
+  exec_path, comm, cmdline, dns_name, file_sha256, exec_sha256, event_idem_key, raw_line_sha256
+) VALUES ($1,$2,$3,$4,$5,CAST($6 AS inet),CAST($7 AS inet),$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
 ON CONFLICT (event_idem_key) DO NOTHING;
 `
-	_, err := s.db.ExecContext(ctx, q,
-		rec.EventTsUnixMs,
-		rec.RecvTsUnixMs,
-		rec.NodeID,
-		rec.SourceType,
-		rec.EventType,
-		rec.SrcIP,
-		rec.DstIP,
-		rec.UserName,
-		rec.Severity,
-		rec.RuleID,
-		rec.EventIdemKey,
-		rec.RawLineSHA256,
-	)
+	_, err := s.db.ExecContext(ctx, q, normalizedEventInsertArgs(rec)...)
 	if err == nil {
 		return nil
 	}
@@ -4388,6 +4400,46 @@ ON CONFLICT (event_idem_key) DO NOTHING;
 		slog.String("event_idem_key", rec.EventIdemKey),
 	)
 	return nil
+}
+
+func normalizedEventInsertArgs(rec roeDBRecord) []any {
+	return []any{
+		rec.EventTsUnixMs,
+		rec.RecvTsUnixMs,
+		strings.TrimSpace(rec.NodeID),
+		strings.TrimSpace(rec.SourceType),
+		strings.TrimSpace(rec.EventType),
+		nullableTrimmedString(rec.SrcIP),
+		nullableTrimmedString(rec.DstIP),
+		nullableInt(rec.DstPort),
+		nullableTrimmedString(rec.ProtocolFamily),
+		nullableTrimmedString(rec.UserName),
+		nullableTrimmedString(rec.Severity),
+		nullableTrimmedString(rec.RuleID),
+		nullableTrimmedString(rec.ExecPath),
+		nullableTrimmedString(rec.Comm),
+		nullableTrimmedString(rec.Cmdline),
+		nullableTrimmedString(rec.DNSName),
+		nullableTrimmedString(rec.FileSHA256),
+		nullableTrimmedString(rec.ExecSHA256),
+		nullableTrimmedString(rec.EventIdemKey),
+		nullableTrimmedString(rec.RawLineSHA256),
+	}
+}
+
+func nullableTrimmedString(value string) any {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return nil
+	}
+	return trimmed
+}
+
+func nullableInt(value int) any {
+	if value == 0 {
+		return nil
+	}
+	return value
 }
 
 func (r *roeRuntime) persistNormalizedEvent(trigger responseTrigger, raw []byte) error {
@@ -4445,18 +4497,26 @@ func buildROEDBRecord(trigger responseTrigger, raw []byte) roeDBRecord {
 	}
 	rawHash := sha256.Sum256(raw)
 	return roeDBRecord{
-		EventTsUnixMs: eventTs,
-		RecvTsUnixMs:  recvTs,
-		NodeID:        nodeID,
-		SourceType:    sourceType,
-		EventType:     eventType,
-		SrcIP:         strings.TrimSpace(trigger.SrcIP),
-		DstIP:         strings.TrimSpace(trigger.DstIP),
-		UserName:      strings.TrimSpace(trigger.UserName),
-		Severity:      strings.TrimSpace(trigger.Severity),
-		RuleID:        strings.TrimSpace(trigger.RuleID),
-		EventIdemKey:  eventID,
-		RawLineSHA256: hex.EncodeToString(rawHash[:]),
+		EventTsUnixMs:  eventTs,
+		RecvTsUnixMs:   recvTs,
+		NodeID:         nodeID,
+		SourceType:     sourceType,
+		EventType:      eventType,
+		SrcIP:          strings.TrimSpace(trigger.SrcIP),
+		DstIP:          strings.TrimSpace(trigger.DstIP),
+		DstPort:        trigger.DstPort,
+		ProtocolFamily: strings.TrimSpace(trigger.ProtocolFamily),
+		UserName:       strings.TrimSpace(trigger.UserName),
+		Severity:       strings.TrimSpace(trigger.Severity),
+		RuleID:         strings.TrimSpace(trigger.RuleID),
+		ExecPath:       strings.TrimSpace(trigger.ExecPath),
+		Comm:           strings.TrimSpace(trigger.Comm),
+		Cmdline:        strings.TrimSpace(trigger.Cmdline),
+		DNSName:        strings.TrimSpace(trigger.DNSName),
+		FileSHA256:     strings.TrimSpace(trigger.FileSHA256),
+		ExecSHA256:     strings.TrimSpace(trigger.ExecSHA256),
+		EventIdemKey:   eventID,
+		RawLineSHA256:  hex.EncodeToString(rawHash[:]),
 	}
 }
 

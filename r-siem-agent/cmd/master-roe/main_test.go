@@ -127,6 +127,83 @@ policies:
 	}
 }
 
+func TestBuildROEDBRecordPreservesSearchableEventContext(t *testing.T) {
+	rec := buildROEDBRecord(responseTrigger{
+		NodeID:         "node-1",
+		SourceType:     "auditd_connect",
+		EventType:      "network_connection",
+		SrcIP:          "172.30.50.1",
+		DstIP:          "172.30.50.14",
+		DstPort:        5985,
+		ProtocolFamily: "winrm",
+		UserName:       "khotso",
+		Severity:       "high",
+		RuleID:         "R-NET-INTERNAL-WINRM-SCAN",
+		ExecPath:       "/usr/bin/nmap",
+		Comm:           "nmap",
+		Cmdline:        "/usr/bin/nmap -Pn -n -p 5985 172.30.50.14",
+		DNSName:        "dc.lab.internal",
+		FileSHA256:     "file-sha",
+		ExecSHA256:     "exec-sha",
+		EventIdemKey:   "evt-1",
+	}, []byte(`{"msg":"proof"}`))
+	if rec.DstPort != 5985 || rec.ProtocolFamily != "winrm" {
+		t.Fatalf("network context not preserved: %+v", rec)
+	}
+	if rec.ExecPath != "/usr/bin/nmap" || rec.Comm != "nmap" || rec.Cmdline == "" {
+		t.Fatalf("process context not preserved: %+v", rec)
+	}
+	if rec.DNSName != "dc.lab.internal" || rec.FileSHA256 != "file-sha" || rec.ExecSHA256 != "exec-sha" {
+		t.Fatalf("observable context not preserved: %+v", rec)
+	}
+	if rec.RawLineSHA256 == "" {
+		t.Fatalf("raw_line_sha256 missing: %+v", rec)
+	}
+}
+
+func TestNormalizedEventInsertArgsPreserveSearchableContext(t *testing.T) {
+	args := normalizedEventInsertArgs(roeDBRecord{
+		EventTsUnixMs:  1,
+		RecvTsUnixMs:   2,
+		NodeID:         "node-1",
+		SourceType:     "proc_net",
+		EventType:      "network_connection",
+		SrcIP:          "172.30.50.1",
+		DstIP:          "172.30.50.14",
+		DstPort:        5985,
+		ProtocolFamily: "winrm",
+		UserName:       "khotso",
+		Severity:       "high",
+		RuleID:         "R-NET-INTERNAL-WINRM-SCAN",
+		ExecPath:       "/usr/bin/nmap",
+		Comm:           "nmap",
+		Cmdline:        "/usr/bin/nmap -Pn -n -p 5985 172.30.50.14",
+		DNSName:        "dc.lab.internal",
+		FileSHA256:     "file-sha",
+		ExecSHA256:     "exec-sha",
+		EventIdemKey:   "evt-1",
+		RawLineSHA256:  "raw-1",
+	})
+	if got := args[7]; got != 5985 {
+		t.Fatalf("dst_port arg=%v, want 5985", got)
+	}
+	if got := args[8]; got != "winrm" {
+		t.Fatalf("protocol_family arg=%v, want winrm", got)
+	}
+	if got := args[12]; got != "/usr/bin/nmap" {
+		t.Fatalf("exec_path arg=%v, want /usr/bin/nmap", got)
+	}
+	if got := args[13]; got != "nmap" {
+		t.Fatalf("comm arg=%v, want nmap", got)
+	}
+	if got := args[14]; got != "/usr/bin/nmap -Pn -n -p 5985 172.30.50.14" {
+		t.Fatalf("cmdline arg=%v", got)
+	}
+	if got := args[15]; got != "dc.lab.internal" {
+		t.Fatalf("dns_name arg=%v, want dc.lab.internal", got)
+	}
+}
+
 func TestEvaluateApprovalUsesCriticalAssetRule(t *testing.T) {
 	cfg, err := parseROEConfig([]byte(`
 policies:

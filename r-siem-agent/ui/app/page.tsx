@@ -386,7 +386,7 @@ export default function DashboardPage() {
   };
 
   return (
-    <section className="flex h-full min-h-0 flex-col gap-4 overflow-auto">
+    <section className="flex h-full min-h-0 flex-col gap-4">
       <div>
         <div className="flex items-center justify-between gap-3">
           <div>
@@ -530,7 +530,10 @@ export default function DashboardPage() {
             </div>
 
             <div className="panel-elevated p-4">
-              <h3 className="mb-3 text-[16px] font-semibold">Live Incidents</h3>
+              <div className="mb-3">
+                <h3 className="text-[16px] font-semibold">Threat Tray</h3>
+                <p className="text-xs text-ink-300">Analyst-facing queue of live runs, approvals, and one-click pivots into the investigation workspace.</p>
+              </div>
               {liveIncidents.length === 0 ? <EmptyState title="No incidents" /> : null}
               <div className="max-h-[620px] space-y-2 overflow-auto">
                 {liveIncidents.map((run) => (

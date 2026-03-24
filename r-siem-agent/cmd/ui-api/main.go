@@ -117,6 +117,11 @@ type app struct {
 
 	ruleSeverityByID   map[string]string
 	playbookApprovalBy map[string]string
+	logicRulesByID     map[string]logicRuleDefinition
+	logicPlaybooksByID map[string]logicPlaybookDefinition
+	approvalRulesByID  map[string]logicApprovalRuleDefinition
+	approvalTimeoutMs  int64
+	defaultAutoMinConf int
 	retentionRules     []retentionRule
 	defaultAssetEnv    string
 	assetByNodeID      map[string]assetInventoryEntry
@@ -143,17 +148,69 @@ type identityInventoryEntry struct {
 type dashboardHintsConfig struct {
 	RCE struct {
 		Rules []struct {
-			ID       string `yaml:"id"`
-			Severity string `yaml:"severity"`
+			ID        string `yaml:"id"`
+			Enabled   bool   `yaml:"enabled"`
+			Kind      string `yaml:"kind"`
+			Severity  string `yaml:"severity"`
+			GroupBy   string `yaml:"group_by"`
+			WindowMs  int64  `yaml:"window_ms"`
+			Threshold int    `yaml:"threshold"`
+			When      struct {
+				Type   string         `yaml:"type"`
+				Fields map[string]any `yaml:"fields"`
+			} `yaml:"when"`
+			Steps []struct {
+				Type string `yaml:"type"`
+			} `yaml:"steps"`
+			Predicates []struct {
+				Type   string         `yaml:"type"`
+				Fields map[string]any `yaml:"fields"`
+			} `yaml:"predicates"`
 		} `yaml:"rules"`
 	} `yaml:"rce"`
 	Playbooks []struct {
-		ID                 string `yaml:"id"`
+		ID        string `yaml:"id"`
+		Version   int    `yaml:"version"`
+		Enabled   bool   `yaml:"enabled"`
+		Selectors struct {
+			RuleIDs []string `yaml:"rule_ids"`
+		} `yaml:"selectors"`
 		PolicyRequirements struct {
-			Approval string `yaml:"approval"`
+			Approval                     string `yaml:"approval"`
+			MaxBlastRadius               int    `yaml:"max_blast_radius"`
+			AutoMinConfidence            int    `yaml:"auto_min_confidence"`
+			AutoMaxBlastRadius           int    `yaml:"auto_max_blast_radius"`
+			AutoMaxSeverity              string `yaml:"auto_max_severity"`
+			RequireApprovalForPrivileged bool   `yaml:"require_approval_for_privileged"`
+			RequireApprovalForLocalSrc   bool   `yaml:"require_approval_for_local_src"`
+			RequireIdentityContext       bool   `yaml:"require_identity_context"`
+			DefaultContainmentDurationMs int64  `yaml:"default_containment_duration_ms"`
+			MaxContainmentDurationMs     int64  `yaml:"max_containment_duration_ms"`
 		} `yaml:"policy_requirements"`
+		Steps []struct {
+			Name          string         `yaml:"name"`
+			ActionType    string         `yaml:"action_type"`
+			Reversibility string         `yaml:"reversibility"`
+			TimeoutMs     int64          `yaml:"timeout_ms"`
+			Retries       int            `yaml:"retries"`
+			BackoffMs     int64          `yaml:"backoff_ms"`
+			TargetFrom    string         `yaml:"target_from"`
+			Params        map[string]any `yaml:"params"`
+		} `yaml:"steps"`
 	} `yaml:"playbooks"`
 	Policies struct {
+		Approvals struct {
+			TimeoutMs                int64 `yaml:"timeout_ms"`
+			DefaultAutoMinConfidence int   `yaml:"default_auto_min_confidence"`
+			Rules                    []struct {
+				ID       string         `yaml:"id"`
+				When     map[string]any `yaml:"when"`
+				Decision struct {
+					Required bool   `yaml:"required"`
+					Reason   string `yaml:"reason"`
+				} `yaml:"decision"`
+			} `yaml:"rules"`
+		} `yaml:"approvals"`
 		Assets struct {
 			DefaultEnvironment string `yaml:"default_environment"`
 			Nodes              []struct {
@@ -206,6 +263,146 @@ type retentionRule struct {
 	Class              string
 	ArchiveAfterDays   int
 	PurgeAfterDays     int
+}
+
+type logicRuleDefinition struct {
+	ID         string
+	Enabled    bool
+	Kind       string
+	Severity   string
+	GroupBy    string
+	WindowMs   int64
+	Threshold  int
+	WhenType   string
+	Conditions []string
+	Sequence   []string
+	Predicates []string
+}
+
+type logicPlaybookStepDefinition struct {
+	Name          string
+	ActionType    string
+	Reversibility string
+	TimeoutMs     int64
+	Retries       int
+	BackoffMs     int64
+	TargetFrom    string
+	ParamKeys     []string
+}
+
+type logicPlaybookDefinition struct {
+	ID                           string
+	Version                      int
+	Enabled                      bool
+	SelectorRuleIDs              []string
+	ApprovalMode                 string
+	MaxBlastRadius               int
+	AutoMinConfidence            int
+	AutoMaxBlastRadius           int
+	AutoMaxSeverity              string
+	RequireApprovalForPrivileged bool
+	RequireApprovalForLocalSrc   bool
+	RequireIdentityContext       bool
+	DefaultContainmentDurationMs int64
+	MaxContainmentDurationMs     int64
+	Steps                        []logicPlaybookStepDefinition
+}
+
+type logicApprovalRuleDefinition struct {
+	ID         string
+	Conditions []string
+	Required   bool
+	Reason     string
+}
+
+type incidentLogicRuleResponse struct {
+	ID         string   `json:"id"`
+	Enabled    bool     `json:"enabled"`
+	Kind       string   `json:"kind"`
+	Severity   string   `json:"severity"`
+	GroupBy    string   `json:"group_by,omitempty"`
+	WindowMs   int64    `json:"window_ms,omitempty"`
+	Threshold  int      `json:"threshold,omitempty"`
+	WhenType   string   `json:"when_type,omitempty"`
+	Conditions []string `json:"conditions,omitempty"`
+	Sequence   []string `json:"sequence,omitempty"`
+	Predicates []string `json:"predicates,omitempty"`
+}
+
+type incidentLogicPlaybookStepResponse struct {
+	Name          string   `json:"name"`
+	ActionType    string   `json:"action_type"`
+	Reversibility string   `json:"reversibility,omitempty"`
+	TimeoutMs     int64    `json:"timeout_ms,omitempty"`
+	Retries       int      `json:"retries,omitempty"`
+	BackoffMs     int64    `json:"backoff_ms,omitempty"`
+	TargetFrom    string   `json:"target_from,omitempty"`
+	ParamKeys     []string `json:"param_keys,omitempty"`
+}
+
+type incidentLogicPlaybookResponse struct {
+	ID                           string                              `json:"id"`
+	Version                      int                                 `json:"version,omitempty"`
+	Enabled                      bool                                `json:"enabled"`
+	SelectorRuleIDs              []string                            `json:"selector_rule_ids,omitempty"`
+	ApprovalMode                 string                              `json:"approval_mode,omitempty"`
+	MaxBlastRadius               int                                 `json:"max_blast_radius,omitempty"`
+	AutoMinConfidence            int                                 `json:"auto_min_confidence,omitempty"`
+	AutoMaxBlastRadius           int                                 `json:"auto_max_blast_radius,omitempty"`
+	AutoMaxSeverity              string                              `json:"auto_max_severity,omitempty"`
+	RequireApprovalForPrivileged bool                                `json:"require_approval_for_privileged,omitempty"`
+	RequireApprovalForLocalSrc   bool                                `json:"require_approval_for_local_src,omitempty"`
+	RequireIdentityContext       bool                                `json:"require_identity_context,omitempty"`
+	DefaultContainmentDurationMs int64                               `json:"default_containment_duration_ms,omitempty"`
+	MaxContainmentDurationMs     int64                               `json:"max_containment_duration_ms,omitempty"`
+	Steps                        []incidentLogicPlaybookStepResponse `json:"steps,omitempty"`
+}
+
+type incidentLogicApprovalRuleResponse struct {
+	ID         string   `json:"id"`
+	Conditions []string `json:"conditions,omitempty"`
+	Required   bool     `json:"required"`
+	Reason     string   `json:"reason,omitempty"`
+}
+
+type incidentLogicPolicyResponse struct {
+	ApprovalMode             string                             `json:"approval_mode,omitempty"`
+	ApprovalRuleID           string                             `json:"approval_rule_id,omitempty"`
+	ApprovalRule             *incidentLogicApprovalRuleResponse `json:"approval_rule,omitempty"`
+	ApprovalReason           string                             `json:"approval_reason,omitempty"`
+	PlaybookReversibility    string                             `json:"playbook_reversibility,omitempty"`
+	AllowlistRuleID          string                             `json:"allowlist_rule_id,omitempty"`
+	ApprovalTimeoutMs        int64                              `json:"approval_timeout_ms,omitempty"`
+	DefaultAutoMinConfidence int                                `json:"default_auto_min_confidence,omitempty"`
+}
+
+type incidentLogicScopeResponse struct {
+	NodeID          string   `json:"node_id,omitempty"`
+	TargetAgentID   string   `json:"target_agent_id,omitempty"`
+	SourceType      string   `json:"source_type,omitempty"`
+	EventType       string   `json:"event_type,omitempty"`
+	UserName        string   `json:"user_name,omitempty"`
+	SrcIP           string   `json:"src_ip,omitempty"`
+	DstIP           string   `json:"dst_ip,omitempty"`
+	DstPort         int      `json:"dst_port,omitempty"`
+	ProtocolFamily  string   `json:"protocol_family,omitempty"`
+	TopDestinations []string `json:"top_destinations,omitempty"`
+	Comm            string   `json:"comm,omitempty"`
+	ExecPath        string   `json:"exec_path,omitempty"`
+	Cmdline         string   `json:"cmdline,omitempty"`
+	DNSName         string   `json:"dns_name,omitempty"`
+	Target          string   `json:"target,omitempty"`
+	FileSHA256      string   `json:"file_sha256,omitempty"`
+	ExecSHA256      string   `json:"exec_sha256,omitempty"`
+}
+
+type incidentLogicResponse struct {
+	RunID    string                        `json:"run_id"`
+	Rule     incidentLogicRuleResponse     `json:"rule"`
+	Playbook incidentLogicPlaybookResponse `json:"playbook"`
+	Policy   incidentLogicPolicyResponse   `json:"policy"`
+	Scope    incidentLogicScopeResponse    `json:"scope"`
+	Source   string                        `json:"source"`
 }
 
 func (a *app) natsReadyLocked() bool {
@@ -506,17 +703,102 @@ type inotifyAttribution struct {
 }
 
 type eventRow struct {
-	EventTSUnixMs int64  `json:"event_ts_unix_ms"`
-	RecvTSUnixMs  int64  `json:"recv_ts_unix_ms"`
-	NodeID        string `json:"node_id"`
-	SourceType    string `json:"source_type"`
-	EventType     string `json:"event_type"`
-	SrcIP         string `json:"src_ip,omitempty"`
-	DstIP         string `json:"dst_ip,omitempty"`
-	UserName      string `json:"user_name,omitempty"`
-	Severity      string `json:"severity,omitempty"`
-	RuleID        string `json:"rule_id,omitempty"`
-	EventIdemKey  string `json:"event_idem_key"`
+	EventTSUnixMs  int64  `json:"event_ts_unix_ms"`
+	RecvTSUnixMs   int64  `json:"recv_ts_unix_ms"`
+	NodeID         string `json:"node_id"`
+	SourceType     string `json:"source_type"`
+	EventType      string `json:"event_type"`
+	SrcIP          string `json:"src_ip,omitempty"`
+	DstIP          string `json:"dst_ip,omitempty"`
+	DstPort        int    `json:"dst_port,omitempty"`
+	ProtocolFamily string `json:"protocol_family,omitempty"`
+	UserName       string `json:"user_name,omitempty"`
+	Severity       string `json:"severity,omitempty"`
+	RuleID         string `json:"rule_id,omitempty"`
+	ExecPath       string `json:"exec_path,omitempty"`
+	Comm           string `json:"comm,omitempty"`
+	Cmdline        string `json:"cmdline,omitempty"`
+	DNSName        string `json:"dns_name,omitempty"`
+	FileSHA256     string `json:"file_sha256,omitempty"`
+	ExecSHA256     string `json:"exec_sha256,omitempty"`
+	EventIdemKey   string `json:"event_idem_key"`
+	RawLineSHA256  string `json:"raw_line_sha256,omitempty"`
+}
+
+type eventSearchResponse struct {
+	Items            []eventRow `json:"items"`
+	Count            int        `json:"count"`
+	Total            int        `json:"total"`
+	Page             int        `json:"page"`
+	Limit            int        `json:"limit"`
+	Sort             string     `json:"sort"`
+	Source           string     `json:"source"`
+	AvailableFilters []string   `json:"available_filters"`
+	Query            any        `json:"query"`
+}
+
+type entityProfileSummary struct {
+	FirstSeenUnixMs int64    `json:"first_seen_unix_ms,omitempty"`
+	LastSeenUnixMs  int64    `json:"last_seen_unix_ms,omitempty"`
+	TotalEvents     int      `json:"total_events"`
+	Detections      int      `json:"detections"`
+	Nodes           []string `json:"nodes,omitempty"`
+	SourceTypes     []string `json:"source_types,omitempty"`
+	EventTypes      []string `json:"event_types,omitempty"`
+	Rules           []string `json:"rules,omitempty"`
+}
+
+type entityProfileResponse struct {
+	Kind            string     `json:"kind"`
+	Value           string     `json:"value"`
+	Summary         any        `json:"summary"`
+	RecentEvents    []eventRow `json:"recent_events"`
+	RecentIncidents []incident `json:"recent_incidents"`
+	CountEvents     int        `json:"count_events"`
+	CountIncidents  int        `json:"count_incidents"`
+	Source          string     `json:"source"`
+}
+
+type responseHistoryItem struct {
+	TSUnixMs   int64          `json:"ts_unix_ms"`
+	TS         string         `json:"ts,omitempty"`
+	Stage      string         `json:"stage"`
+	Label      string         `json:"label"`
+	Status     string         `json:"status,omitempty"`
+	Actor      string         `json:"actor,omitempty"`
+	Decision   string         `json:"decision,omitempty"`
+	StepID     string         `json:"step_id,omitempty"`
+	StepIndex  int            `json:"step_index,omitempty"`
+	ActionType string         `json:"action_type,omitempty"`
+	Lane       string         `json:"lane,omitempty"`
+	Details    map[string]any `json:"details,omitempty"`
+	Source     string         `json:"source"`
+}
+
+type responseHistoryResponse struct {
+	RunID  string                `json:"run_id"`
+	Items  []responseHistoryItem `json:"items"`
+	Count  int                   `json:"count"`
+	Source string                `json:"source"`
+}
+
+type investigationProviderCatalogEntry struct {
+	Provider            string   `json:"provider"`
+	Label               string   `json:"label"`
+	Enabled             bool     `json:"enabled"`
+	APIKeyConfigured    bool     `json:"api_key_configured"`
+	EnvVar              string   `json:"env_var"`
+	SupportedKinds      []string `json:"supported_kinds"`
+	LastStatus          string   `json:"last_status,omitempty"`
+	LastVerdict         string   `json:"last_verdict,omitempty"`
+	LastSummary         string   `json:"last_summary,omitempty"`
+	LastFetchedAtUnixMs int64    `json:"last_fetched_at_unix_ms,omitempty"`
+}
+
+type investigationProvidersResponse struct {
+	Items  []investigationProviderCatalogEntry `json:"items"`
+	Count  int                                 `json:"count"`
+	Source string                              `json:"source"`
 }
 
 type endpointSummary struct {
@@ -527,6 +809,30 @@ type endpointSummary struct {
 	SourceTypeDist    map[string]int `json:"source_type_distribution"`
 	DerivedFrom       string         `json:"derived_from"`
 	SourceTypeSamples []string       `json:"source_types,omitempty"`
+}
+
+type namedCount struct {
+	Value string `json:"value"`
+	Count int    `json:"count"`
+}
+
+type endpointDetailSummary struct {
+	NodeID            string         `json:"node_id"`
+	WindowFromUnixMs  int64          `json:"window_from_unix_ms"`
+	WindowToUnixMs    int64          `json:"window_to_unix_ms"`
+	FirstSeenUnixMs   int64          `json:"first_seen_unix_ms,omitempty"`
+	LastSeenUnixMs    int64          `json:"last_seen_unix_ms,omitempty"`
+	TotalEvents       int            `json:"total_events"`
+	DetectionCount    int            `json:"detection_count"`
+	ActiveActionCount int            `json:"active_action_count"`
+	RecentRunCount    int            `json:"recent_run_count"`
+	SourceTypeDist    map[string]int `json:"source_type_distribution,omitempty"`
+	EventTypeDist     map[string]int `json:"event_type_distribution,omitempty"`
+	SeverityDist      map[string]int `json:"severity_distribution,omitempty"`
+	TopUsers          []namedCount   `json:"top_users,omitempty"`
+	TopRules          []namedCount   `json:"top_rules,omitempty"`
+	TopDestinations   []namedCount   `json:"top_destinations,omitempty"`
+	TopDomains        []namedCount   `json:"top_domains,omitempty"`
 }
 
 type endpointGeoConfigEntry struct {
@@ -704,12 +1010,16 @@ func main() {
 		users:              map[string]uiUser{},
 		ruleSeverityByID:   map[string]string{},
 		playbookApprovalBy: map[string]string{},
+		logicRulesByID:     map[string]logicRuleDefinition{},
+		logicPlaybooksByID: map[string]logicPlaybookDefinition{},
+		approvalRulesByID:  map[string]logicApprovalRuleDefinition{},
 		retentionRules:     nil,
 		assetByNodeID:      map[string]assetInventoryEntry{},
 		assetByTargetAgent: map[string]assetInventoryEntry{},
 		identityByUser:     map[string]identityInventoryEntry{},
 	}
-	a.ruleSeverityByID, a.playbookApprovalBy, a.retentionRules, a.defaultAssetEnv, a.assetByNodeID, a.assetByTargetAgent, a.identityByUser = loadDashboardHints(cfg.MasterConfig)
+	a.ruleSeverityByID, a.playbookApprovalBy, a.retentionRules, a.defaultAssetEnv, a.assetByNodeID, a.assetByTargetAgent, a.identityByUser,
+		a.logicRulesByID, a.logicPlaybooksByID, a.approvalRulesByID, a.approvalTimeoutMs, a.defaultAutoMinConf = loadDashboardHints(cfg.MasterConfig)
 	if err := a.loadUsers(); err != nil {
 		fmt.Fprintf(os.Stderr, "load ui users: %v\n", err)
 		os.Exit(1)
@@ -751,6 +1061,12 @@ func main() {
 	mux.HandleFunc("GET /api/dashboard/top/entities", a.withAuthRole(a.handleDashboardTopEntities, "analyst"))
 	mux.HandleFunc("GET /api/incidents", a.withAuthRole(a.handleIncidents, "analyst"))
 	mux.HandleFunc("GET /api/incidents/{run_id}", a.withAuthRole(a.handleIncidentDetail, "analyst"))
+	mux.HandleFunc("GET /api/incidents/{run_id}/logic", a.withAuthRole(a.handleIncidentLogic, "analyst"))
+	mux.HandleFunc("GET /api/incidents/{run_id}/response-history", a.withAuthRole(a.handleIncidentResponseHistory, "analyst"))
+	mux.HandleFunc("GET /api/incidents/{run_id}/actions", a.withAuthRole(a.handleIncidentActions, "analyst"))
+	mux.HandleFunc("POST /api/incidents/{run_id}/actions", a.withAuthRole(a.handleIncidentLaunchAction, "analyst"))
+	mux.HandleFunc("POST /api/incidents/{run_id}/actions/{action_id}/clear", a.withAuthRole(a.handleIncidentClearAction, "analyst"))
+	mux.HandleFunc("GET /api/actions", a.withAuthRole(a.handleFleetActions, "analyst"))
 	mux.HandleFunc("POST /api/incidents/{run_id}/approve", a.withAuthRole(a.handleIncidentApprove, "analyst"))
 	mux.HandleFunc("POST /api/incidents/{run_id}/reject", a.withAuthRole(a.handleIncidentReject, "analyst"))
 	mux.HandleFunc("POST /api/incidents/{run_id}/reissue", a.withAuthRole(a.handleIncidentReissue, "analyst"))
@@ -765,15 +1081,31 @@ func main() {
 	mux.HandleFunc("GET /api/incidents/{run_id}/report", a.withAuthRole(a.handleIncidentReport, "analyst"))
 	mux.HandleFunc("GET /api/reports/soc/operations", a.withAuthRole(a.handleSOCOperationsReport, "analyst"))
 	mux.HandleFunc("GET /api/search", a.withAuthRole(a.handleSearch, "analyst"))
+	mux.HandleFunc("GET /api/search/events", a.withAuthRole(a.handleSearchEvents, "analyst"))
+	mux.HandleFunc("GET /api/entities/ip/{ip}", a.withAuthRole(a.handleEntityIP, "analyst"))
+	mux.HandleFunc("GET /api/entities/user/{user}", a.withAuthRole(a.handleEntityUser, "analyst"))
 	mux.HandleFunc("GET /api/stream", a.withAuthRole(a.handleStream, "analyst"))
 	mux.HandleFunc("GET /api/endpoints", a.withAuthRole(a.handleEndpoints, "analyst"))
 	mux.HandleFunc("GET /api/endpoints/geo", a.withAuthRole(a.handleEndpointsGeo, "analyst"))
+	mux.HandleFunc("GET /api/endpoints/{node_id}/summary", a.withAuthRole(a.handleEndpointSummary, "analyst"))
 	mux.HandleFunc("GET /api/endpoints/{node_id}/events", a.withAuthRole(a.handleEndpointEvents, "analyst"))
 	mux.HandleFunc("GET /api/endpoints/{node_id}/runs", a.withAuthRole(a.handleEndpointRuns, "analyst"))
+	mux.HandleFunc("GET /api/endpoints/{node_id}/actions", a.withAuthRole(a.handleEndpointActions, "analyst"))
+	mux.HandleFunc("POST /api/endpoints/{node_id}/actions", a.withAuthRole(a.handleEndpointLaunchAction, "analyst"))
+	mux.HandleFunc("POST /api/endpoints/{node_id}/actions/{action_id}/clear", a.withAuthRole(a.handleEndpointClearAction, "analyst"))
 	mux.HandleFunc("POST /api/endpoints/{node_id}/targeted-test", a.withAuthRole(a.handleEndpointTargetedTest, "analyst"))
 	mux.HandleFunc("GET /api/audit", a.withAuthRole(a.handleAudit, "analyst"))
 	mux.HandleFunc("GET /api/artifacts", a.withAuthRole(a.handleArtifacts, "analyst"))
 	mux.HandleFunc("GET /api/artifact", a.withAuthRole(a.handleArtifactDownload, "analyst"))
+	mux.HandleFunc("GET /api/investigation/providers", a.withAuthRole(a.handleInvestigationProviders, "analyst"))
+	mux.HandleFunc("GET /api/models", a.withAuthRole(a.handleModelCatalog, "admin"))
+	mux.HandleFunc("GET /api/models/proposals", a.withAuthRole(a.handleModelProposals, "admin"))
+	mux.HandleFunc("GET /api/models/{kind}/{id}", a.withAuthRole(a.handleModelDetail, "admin"))
+	mux.HandleFunc("POST /api/models/{kind}/{id}/validate", a.withAuthRole(a.handleModelValidate, "admin"))
+	mux.HandleFunc("POST /api/models/{kind}/{id}/propose", a.withAuthRole(a.handleModelPropose, "admin"))
+	mux.HandleFunc("POST /api/models/proposals/{proposal_id}/approve", a.withAuthRole(a.handleModelApprove, "admin"))
+	mux.HandleFunc("POST /api/models/proposals/{proposal_id}/reject", a.withAuthRole(a.handleModelReject, "admin"))
+	mux.HandleFunc("POST /api/models/proposals/{proposal_id}/apply", a.withAuthRole(a.handleModelApply, "admin"))
 	mux.HandleFunc("GET /api/users", a.withAuthRole(a.handleAdminUsersList, "admin"))
 	mux.HandleFunc("POST /api/users", a.withAuthRole(a.handleAdminUsersUpsert, "admin"))
 	mux.HandleFunc("POST /api/users/{id}/disable", a.withAuthRole(a.handleAdminUsersDisable, "admin"))
@@ -864,32 +1196,94 @@ func normalizeInventoryKey(v string) string {
 	return strings.ToLower(strings.TrimSpace(v))
 }
 
-func loadDashboardHints(path string) (map[string]string, map[string]string, []retentionRule, string, map[string]assetInventoryEntry, map[string]assetInventoryEntry, map[string]identityInventoryEntry) {
+func loadDashboardHints(path string) (
+	map[string]string,
+	map[string]string,
+	[]retentionRule,
+	string,
+	map[string]assetInventoryEntry,
+	map[string]assetInventoryEntry,
+	map[string]identityInventoryEntry,
+	map[string]logicRuleDefinition,
+	map[string]logicPlaybookDefinition,
+	map[string]logicApprovalRuleDefinition,
+	int64,
+	int,
+) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return map[string]string{}, map[string]string{}, defaultRetentionRules(), "", map[string]assetInventoryEntry{}, map[string]assetInventoryEntry{}, map[string]identityInventoryEntry{}
+		return map[string]string{}, map[string]string{}, defaultRetentionRules(), "", map[string]assetInventoryEntry{}, map[string]assetInventoryEntry{}, map[string]identityInventoryEntry{}, map[string]logicRuleDefinition{}, map[string]logicPlaybookDefinition{}, map[string]logicApprovalRuleDefinition{}, defaultApprovalTimeout, 70
 	}
 	var cfg dashboardHintsConfig
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return map[string]string{}, map[string]string{}, defaultRetentionRules(), "", map[string]assetInventoryEntry{}, map[string]assetInventoryEntry{}, map[string]identityInventoryEntry{}
+		return map[string]string{}, map[string]string{}, defaultRetentionRules(), "", map[string]assetInventoryEntry{}, map[string]assetInventoryEntry{}, map[string]identityInventoryEntry{}, map[string]logicRuleDefinition{}, map[string]logicPlaybookDefinition{}, map[string]logicApprovalRuleDefinition{}, defaultApprovalTimeout, 70
 	}
 	ruleSeverityByID := make(map[string]string, len(cfg.RCE.Rules))
+	logicRulesByID := make(map[string]logicRuleDefinition, len(cfg.RCE.Rules))
 	for _, rule := range cfg.RCE.Rules {
 		id := strings.TrimSpace(rule.ID)
 		sev := strings.ToLower(strings.TrimSpace(rule.Severity))
-		if id == "" || sev == "" {
+		if id == "" {
 			continue
 		}
-		ruleSeverityByID[id] = sev
+		if sev != "" {
+			ruleSeverityByID[id] = sev
+		}
+		logicRulesByID[id] = logicRuleDefinition{
+			ID:         id,
+			Enabled:    rule.Enabled,
+			Kind:       strings.TrimSpace(rule.Kind),
+			Severity:   sev,
+			GroupBy:    strings.TrimSpace(rule.GroupBy),
+			WindowMs:   rule.WindowMs,
+			Threshold:  rule.Threshold,
+			WhenType:   strings.TrimSpace(rule.When.Type),
+			Conditions: stringifyConditions(rule.When.Fields),
+			Sequence:   extractSequenceTypes(rule.Steps),
+			Predicates: extractPredicateSummaries(rule.Predicates),
+		}
 	}
 	playbookApprovalBy := make(map[string]string, len(cfg.Playbooks))
+	logicPlaybooksByID := make(map[string]logicPlaybookDefinition, len(cfg.Playbooks))
 	for _, pb := range cfg.Playbooks {
 		id := strings.TrimSpace(pb.ID)
 		approval := strings.ToLower(strings.TrimSpace(pb.PolicyRequirements.Approval))
-		if id == "" || approval == "" {
+		if id == "" {
 			continue
 		}
-		playbookApprovalBy[id] = approval
+		if approval != "" {
+			playbookApprovalBy[id] = approval
+		}
+		logicPlaybooksByID[id] = logicPlaybookDefinition{
+			ID:                           id,
+			Version:                      pb.Version,
+			Enabled:                      pb.Enabled,
+			SelectorRuleIDs:              append([]string(nil), pb.Selectors.RuleIDs...),
+			ApprovalMode:                 approval,
+			MaxBlastRadius:               pb.PolicyRequirements.MaxBlastRadius,
+			AutoMinConfidence:            pb.PolicyRequirements.AutoMinConfidence,
+			AutoMaxBlastRadius:           pb.PolicyRequirements.AutoMaxBlastRadius,
+			AutoMaxSeverity:              strings.TrimSpace(pb.PolicyRequirements.AutoMaxSeverity),
+			RequireApprovalForPrivileged: pb.PolicyRequirements.RequireApprovalForPrivileged,
+			RequireApprovalForLocalSrc:   pb.PolicyRequirements.RequireApprovalForLocalSrc,
+			RequireIdentityContext:       pb.PolicyRequirements.RequireIdentityContext,
+			DefaultContainmentDurationMs: pb.PolicyRequirements.DefaultContainmentDurationMs,
+			MaxContainmentDurationMs:     pb.PolicyRequirements.MaxContainmentDurationMs,
+			Steps:                        buildLogicPlaybookSteps(pb.Steps),
+		}
+	}
+	approvalRulesByID := make(map[string]logicApprovalRuleDefinition, len(cfg.Policies.Approvals.Rules))
+	for _, rule := range cfg.Policies.Approvals.Rules {
+		id := strings.TrimSpace(rule.ID)
+		if id == "" {
+			continue
+		}
+		approvalRulesByID[id] = logicApprovalRuleDefinition{
+			ID:         id,
+			Conditions: stringifyConditions(rule.When),
+			Required:   rule.Decision.Required,
+			Reason:     strings.TrimSpace(rule.Decision.Reason),
+		}
 	}
 	retentionRules := make([]retentionRule, 0, len(cfg.Policies.Retention.Rules))
 	for _, rule := range cfg.Policies.Retention.Rules {
@@ -944,7 +1338,114 @@ func loadDashboardHints(path string) (map[string]string, map[string]string, []re
 			ServiceAccount: user.ServiceAccount,
 		}
 	}
-	return ruleSeverityByID, playbookApprovalBy, retentionRules, defaultAssetEnv, assetByNodeID, assetByTargetAgent, identityByUser
+	approvalTimeoutMs := cfg.Policies.Approvals.TimeoutMs
+	if approvalTimeoutMs <= 0 {
+		approvalTimeoutMs = defaultApprovalTimeout
+	}
+	defaultAutoMinConf := cfg.Policies.Approvals.DefaultAutoMinConfidence
+	if defaultAutoMinConf <= 0 {
+		defaultAutoMinConf = 70
+	}
+
+	return ruleSeverityByID, playbookApprovalBy, retentionRules, defaultAssetEnv, assetByNodeID, assetByTargetAgent, identityByUser, logicRulesByID, logicPlaybooksByID, approvalRulesByID, approvalTimeoutMs, defaultAutoMinConf
+}
+
+func stringifyConditions(input map[string]any) []string {
+	if len(input) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(input))
+	for key := range input {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, len(keys))
+	for _, key := range keys {
+		value := input[key]
+		switch typed := value.(type) {
+		case []any:
+			parts := make([]string, 0, len(typed))
+			for _, item := range typed {
+				parts = append(parts, fmt.Sprint(item))
+			}
+			out = append(out, fmt.Sprintf("%s in [%s]", key, strings.Join(parts, ", ")))
+		case []string:
+			out = append(out, fmt.Sprintf("%s in [%s]", key, strings.Join(typed, ", ")))
+		default:
+			out = append(out, fmt.Sprintf("%s=%v", key, value))
+		}
+	}
+	return out
+}
+
+func extractSequenceTypes(steps []struct {
+	Type string `yaml:"type"`
+}) []string {
+	if len(steps) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(steps))
+	for _, step := range steps {
+		if value := strings.TrimSpace(step.Type); value != "" {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+func extractPredicateSummaries(predicates []struct {
+	Type   string         `yaml:"type"`
+	Fields map[string]any `yaml:"fields"`
+}) []string {
+	if len(predicates) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(predicates))
+	for _, predicate := range predicates {
+		parts := []string{}
+		if value := strings.TrimSpace(predicate.Type); value != "" {
+			parts = append(parts, "type="+value)
+		}
+		parts = append(parts, stringifyConditions(predicate.Fields)...)
+		if len(parts) > 0 {
+			out = append(out, strings.Join(parts, "; "))
+		}
+	}
+	return out
+}
+
+func buildLogicPlaybookSteps(steps []struct {
+	Name          string         `yaml:"name"`
+	ActionType    string         `yaml:"action_type"`
+	Reversibility string         `yaml:"reversibility"`
+	TimeoutMs     int64          `yaml:"timeout_ms"`
+	Retries       int            `yaml:"retries"`
+	BackoffMs     int64          `yaml:"backoff_ms"`
+	TargetFrom    string         `yaml:"target_from"`
+	Params        map[string]any `yaml:"params"`
+}) []logicPlaybookStepDefinition {
+	if len(steps) == 0 {
+		return nil
+	}
+	out := make([]logicPlaybookStepDefinition, 0, len(steps))
+	for _, step := range steps {
+		paramKeys := make([]string, 0, len(step.Params))
+		for key := range step.Params {
+			paramKeys = append(paramKeys, key)
+		}
+		sort.Strings(paramKeys)
+		out = append(out, logicPlaybookStepDefinition{
+			Name:          strings.TrimSpace(step.Name),
+			ActionType:    strings.TrimSpace(step.ActionType),
+			Reversibility: strings.TrimSpace(step.Reversibility),
+			TimeoutMs:     step.TimeoutMs,
+			Retries:       step.Retries,
+			BackoffMs:     step.BackoffMs,
+			TargetFrom:    strings.TrimSpace(step.TargetFrom),
+			ParamKeys:     paramKeys,
+		})
+	}
+	return out
 }
 
 func defaultRetentionRules() []retentionRule {
@@ -1194,6 +1695,11 @@ func (a *app) handleMeta(w http.ResponseWriter, _ *http.Request) {
 			{"method": "GET", "path": "/api/dashboard/top/entities", "summary": "Top src_ip/user/node entities", "query": []string{"window"}},
 			{"method": "GET", "path": "/api/incidents", "summary": "List incidents", "query": []string{"status", "severity", "lane", "playbook_id", "rule_id", "node_id", "lifecycle", "environment", "view=active|archived|all", "from", "to", "q", "limit", "page", "sort"}},
 			{"method": "GET", "path": "/api/incidents/{run_id}", "summary": "Incident detail"},
+			{"method": "GET", "path": "/api/incidents/{run_id}/logic", "summary": "Resolved rule/playbook/policy logic for incident"},
+			{"method": "GET", "path": "/api/incidents/{run_id}/actions", "summary": "Incident-scoped response actions with pending/active/cleared/expired lifecycle"},
+			{"method": "POST", "path": "/api/incidents/{run_id}/actions", "summary": "Launch a manual response action for an incident", "body": map[string]string{"action_name": "block_all_outgoing|block_all_incoming|block_matching_connections|quarantine_device|enforce_pattern_of_life", "duration_ms": "integer", "reason": "string", "reference": "optional string", "target": "optional override target (IP, CIDR, or DNS hostname)"}},
+			{"method": "POST", "path": "/api/incidents/{run_id}/actions/{action_id}/clear", "summary": "Clear a manual response action if the action family supports restore", "body": map[string]string{"reason": "string", "reference": "optional string"}},
+			{"method": "GET", "path": "/api/actions", "summary": "Fleet-wide response action ledger across incident and endpoint scopes", "query": []string{"scope_type", "bucket", "run_id", "node_id", "action_name", "q", "page", "limit"}},
 			{"method": "POST", "path": "/api/incidents/{run_id}/approve", "summary": "Approve/reject FAST action", "body": map[string]string{"decision": "approve|reject|deny", "actor": "string"}},
 			{"method": "POST", "path": "/api/incidents/{run_id}/reject", "summary": "Reject FAST action", "body": map[string]string{"actor": "string"}},
 			{"method": "POST", "path": "/api/incidents/{run_id}/reissue", "summary": "Re-issue a fresh response trigger for MANUAL_REVIEW_REQUIRED runs", "body": map[string]string{"actor": "string", "reason": "string"}},
@@ -1204,11 +1710,24 @@ func (a *app) handleMeta(w http.ResponseWriter, _ *http.Request) {
 			{"method": "GET", "path": "/api/incidents/{run_id}/report", "summary": "Incident report download", "query": []string{"format=json|html|pdf"}},
 			{"method": "GET", "path": "/api/reports/soc/operations", "summary": "SOC operations report download", "query": []string{"window", "bucket", "format=json|html|pdf"}},
 			{"method": "GET", "path": "/api/search", "summary": "Global search across incidents and events", "query": []string{"q", "from", "to", "limit"}},
+			{"method": "GET", "path": "/api/search/events", "summary": "Fielded analyst search across normalized events", "query": []string{"q", "from", "to", "node_id", "user_name", "src_ip", "dst_ip", "dst_port", "protocol_family", "source_type", "event_type", "rule_id", "severity", "comm", "exec_path", "cmdline", "dns_name", "file_sha256", "exec_sha256", "event_idem_key", "raw_line_sha256", "page", "limit", "sort"}},
+			{"method": "GET", "path": "/api/models", "summary": "List editable rule/playbook/approval models (admin only)"},
+			{"method": "GET", "path": "/api/models/{kind}/{id}", "summary": "Load editable model detail (admin only)"},
+			{"method": "POST", "path": "/api/models/{kind}/{id}/validate", "summary": "Validate a staged model change (admin only)"},
+			{"method": "POST", "path": "/api/models/{kind}/{id}/propose", "summary": "Create a model change proposal (admin only)"},
+			{"method": "GET", "path": "/api/models/proposals", "summary": "List pending/applied model change proposals (admin only)"},
+			{"method": "POST", "path": "/api/models/proposals/{proposal_id}/approve", "summary": "Approve a pending model proposal with dual control (admin only)"},
+			{"method": "POST", "path": "/api/models/proposals/{proposal_id}/reject", "summary": "Reject an open model proposal (admin only)"},
+			{"method": "POST", "path": "/api/models/proposals/{proposal_id}/apply", "summary": "Apply a validated model proposal to configs/master.yaml (admin only)"},
 			{"method": "GET", "path": "/api/stream", "summary": "SSE refresh hints and approval queue counts"},
 			{"method": "GET", "path": "/api/endpoints", "summary": "Endpoint summaries"},
 			{"method": "GET", "path": "/api/endpoints/geo", "summary": "Endpoint summaries with geo posture", "query": []string{"window"}},
+			{"method": "GET", "path": "/api/endpoints/{node_id}/summary", "summary": "Endpoint summary with event counts, top destinations/domains, and active action counts", "query": []string{"from", "to"}},
 			{"method": "GET", "path": "/api/endpoints/{node_id}/events", "summary": "Recent endpoint events", "query": []string{"from", "to", "limit"}},
 			{"method": "GET", "path": "/api/endpoints/{node_id}/runs", "summary": "Recent runs affecting endpoint", "query": []string{"limit"}},
+			{"method": "GET", "path": "/api/endpoints/{node_id}/actions", "summary": "Endpoint-scoped response actions with active/cleared/expired lifecycle"},
+			{"method": "POST", "path": "/api/endpoints/{node_id}/actions", "summary": "Launch a manual response action for an endpoint", "body": map[string]string{"action_name": "block_all_outgoing|block_all_incoming|block_matching_connections|quarantine_device", "duration_ms": "integer", "reason": "string", "reference": "optional string", "target": "optional override target (IP, CIDR, or DNS hostname)"}},
+			{"method": "POST", "path": "/api/endpoints/{node_id}/actions/{action_id}/clear", "summary": "Clear an endpoint response action if the action family supports restore", "body": map[string]string{"reason": "string", "reference": "optional string"}},
 			{"method": "POST", "path": "/api/endpoints/{node_id}/targeted-test", "summary": "Publish harmless targeted step", "body": map[string]string{"actor": "string", "target_agent_id": "string (optional)"}},
 			{"method": "GET", "path": "/api/audit", "summary": "Approvals and key actions audit"},
 			{"method": "GET", "path": "/api/users", "summary": "List UI users (admin only)"},
@@ -1449,6 +1968,359 @@ func (a *app) handleIncidentDetail(w http.ResponseWriter, r *http.Request) {
 		"annotations": a.loadIncidentAnnotations(runID),
 		"source":      "exports",
 	})
+}
+
+func (a *app) handleIncidentLogic(w http.ResponseWriter, r *http.Request) {
+	runID := strings.TrimSpace(r.PathValue("run_id"))
+	if runID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing run_id"})
+		return
+	}
+
+	runs, stepsByRun, created := a.loadState()
+	var found *incident
+	for i := range runs {
+		if runs[i].RunID == runID {
+			r := runs[i]
+			if meta, ok := created[r.RunID]; ok {
+				if r.RuleID == "" {
+					r.RuleID = meta.RuleID
+				}
+				if r.PlaybookID == "" {
+					r.PlaybookID = meta.PlaybookID
+				}
+				if r.PlaybookVersion == "" {
+					r.PlaybookVersion = meta.PlaybookVersion
+				}
+				if r.Severity == "" {
+					r.Severity = meta.Severity
+				}
+			}
+			if steps := stepsByRun[r.RunID]; len(steps) > 0 && r.Lane == "" {
+				r.Lane = strings.ToUpper(steps[0].Lane)
+			}
+			found = &r
+			break
+		}
+	}
+	if found == nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "run not found"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, a.buildIncidentLogic(*found))
+}
+
+func (a *app) handleIncidentResponseHistory(w http.ResponseWriter, r *http.Request) {
+	runID := strings.TrimSpace(r.PathValue("run_id"))
+	if runID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing run_id"})
+		return
+	}
+	runs, stepsByRun, created := a.loadState()
+	found := findIncidentByRunID(runs, runID)
+	if found == nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "run not found"})
+		return
+	}
+	enriched := enrichIncidentFromCreatedMeta(*found, created[runID])
+	items := a.loadResponseHistory(enriched, stepsByRun[runID])
+	writeJSON(w, http.StatusOK, responseHistoryResponse{
+		RunID:  runID,
+		Items:  items,
+		Count:  len(items),
+		Source: "master_log+ui_state+steps",
+	})
+}
+
+func (a *app) handleEntityIP(w http.ResponseWriter, r *http.Request) {
+	ip := strings.TrimSpace(r.PathValue("ip"))
+	if ip == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing ip"})
+		return
+	}
+	resp, err := a.loadEntityIPProfile(r.Context(), ip)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (a *app) handleEntityUser(w http.ResponseWriter, r *http.Request) {
+	user := strings.TrimSpace(r.PathValue("user"))
+	if user == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing user"})
+		return
+	}
+	resp, err := a.loadEntityUserProfile(r.Context(), user)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (a *app) buildIncidentLogic(run incident) incidentLogicResponse {
+	ruleDef, hasRule := a.logicRulesByID[strings.TrimSpace(run.RuleID)]
+	playbookDef, hasPlaybook := a.logicPlaybooksByID[strings.TrimSpace(run.PlaybookID)]
+	approvalDef, hasApprovalRule := a.approvalRulesByID[strings.TrimSpace(run.ApprovalPolicyRuleID)]
+
+	resp := incidentLogicResponse{
+		RunID: run.RunID,
+		Rule: incidentLogicRuleResponse{
+			ID:         run.RuleID,
+			Enabled:    hasRule && ruleDef.Enabled,
+			Kind:       chooseNonEmpty(ruleDef.Kind, run.EventType),
+			Severity:   chooseNonEmpty(ruleDef.Severity, strings.ToLower(strings.TrimSpace(run.Severity))),
+			GroupBy:    ruleDef.GroupBy,
+			WindowMs:   ruleDef.WindowMs,
+			Threshold:  ruleDef.Threshold,
+			WhenType:   ruleDef.WhenType,
+			Conditions: append([]string(nil), ruleDef.Conditions...),
+			Sequence:   append([]string(nil), ruleDef.Sequence...),
+			Predicates: append([]string(nil), ruleDef.Predicates...),
+		},
+		Playbook: incidentLogicPlaybookResponse{
+			ID:                           run.PlaybookID,
+			Version:                      playbookDef.Version,
+			Enabled:                      !hasPlaybook || playbookDef.Enabled,
+			SelectorRuleIDs:              append([]string(nil), playbookDef.SelectorRuleIDs...),
+			ApprovalMode:                 chooseNonEmpty(playbookDef.ApprovalMode, run.ApprovalPolicyMode),
+			MaxBlastRadius:               playbookDef.MaxBlastRadius,
+			AutoMinConfidence:            playbookDef.AutoMinConfidence,
+			AutoMaxBlastRadius:           playbookDef.AutoMaxBlastRadius,
+			AutoMaxSeverity:              playbookDef.AutoMaxSeverity,
+			RequireApprovalForPrivileged: playbookDef.RequireApprovalForPrivileged,
+			RequireApprovalForLocalSrc:   playbookDef.RequireApprovalForLocalSrc,
+			RequireIdentityContext:       playbookDef.RequireIdentityContext,
+			DefaultContainmentDurationMs: playbookDef.DefaultContainmentDurationMs,
+			MaxContainmentDurationMs:     playbookDef.MaxContainmentDurationMs,
+			Steps:                        buildIncidentLogicPlaybookSteps(playbookDef.Steps),
+		},
+		Policy: incidentLogicPolicyResponse{
+			ApprovalMode:             chooseNonEmpty(run.ApprovalPolicyMode, playbookDef.ApprovalMode),
+			ApprovalRuleID:           run.ApprovalPolicyRuleID,
+			ApprovalReason:           run.ApprovalPolicyReason,
+			PlaybookReversibility:    run.PlaybookReversibility,
+			AllowlistRuleID:          run.AllowlistRuleID,
+			ApprovalTimeoutMs:        a.approvalTimeoutMs,
+			DefaultAutoMinConfidence: a.defaultAutoMinConf,
+		},
+		Scope: incidentLogicScopeResponse{
+			NodeID:          run.NodeID,
+			TargetAgentID:   run.TargetAgentID,
+			SourceType:      run.SourceType,
+			EventType:       run.EventType,
+			UserName:        run.User,
+			SrcIP:           run.SrcIP,
+			DstIP:           run.DstIP,
+			DstPort:         run.DstPort,
+			ProtocolFamily:  run.ProtocolFamily,
+			TopDestinations: append([]string(nil), run.TopDestinations...),
+			Comm:            run.Comm,
+			ExecPath:        run.ExecPath,
+			Cmdline:         run.Cmdline,
+			DNSName:         run.DNSName,
+			Target:          run.Target,
+			FileSHA256:      run.FileSHA256,
+			ExecSHA256:      run.ExecSHA256,
+		},
+		Source: "master_config+incident",
+	}
+	if !hasRule {
+		resp.Rule.Enabled = false
+		resp.Rule.Kind = chooseNonEmpty(resp.Rule.Kind, "unknown")
+	}
+	if hasApprovalRule {
+		resp.Policy.ApprovalRule = &incidentLogicApprovalRuleResponse{
+			ID:         approvalDef.ID,
+			Conditions: append([]string(nil), approvalDef.Conditions...),
+			Required:   approvalDef.Required,
+			Reason:     approvalDef.Reason,
+		}
+	}
+	return resp
+}
+
+func (a *app) loadResponseHistory(run incident, steps []stepResult) []responseHistoryItem {
+	items := make([]responseHistoryItem, 0, len(steps)+16)
+
+	appendItem := func(item responseHistoryItem) {
+		if item.TSUnixMs == 0 && strings.TrimSpace(item.TS) != "" {
+			item.TSUnixMs = logTimeUnixMs(item.TS)
+		}
+		items = append(items, item)
+	}
+
+	if run.LastUpdatedAtUnixMs > 0 {
+		appendItem(responseHistoryItem{
+			TSUnixMs: run.LastUpdatedAtUnixMs,
+			Stage:    "run",
+			Label:    "Current run state",
+			Status:   run.Status,
+			Details: map[string]any{
+				"rule_id":            run.RuleID,
+				"playbook_id":        run.PlaybookID,
+				"approval_mode":      run.ApprovalPolicyMode,
+				"failed_safe_reason": run.FailedSafeReason,
+			},
+			Source: "incident_state",
+		})
+	}
+
+	_ = scanJSONLines(a.cfg.MasterLogPath, func(obj map[string]any) {
+		if strVal(obj["run_id"]) != run.RunID {
+			return
+		}
+		msg := strVal(obj["msg"])
+		if !responseHistoryMasterMsg(msg) {
+			return
+		}
+		details := map[string]any{}
+		for k, v := range obj {
+			switch k {
+			case "time", "msg", "run_id", "actor", "decision", "status":
+			default:
+				details[k] = v
+			}
+		}
+		appendItem(responseHistoryItem{
+			TS:       strVal(obj["time"]),
+			Stage:    responseHistoryStage(msg),
+			Label:    strings.ReplaceAll(msg, "_", " "),
+			Status:   chooseNonEmpty(strVal(obj["status"]), strings.ToUpper(msg)),
+			Actor:    strVal(obj["actor"]),
+			Decision: strVal(obj["decision"]),
+			Details:  details,
+			Source:   "master_log",
+		})
+	})
+
+	for _, step := range steps {
+		appendItem(responseHistoryItem{
+			TSUnixMs:   step.FinishedAtMs,
+			Stage:      "step",
+			Label:      fmt.Sprintf("Step %d %s", step.StepIndex, strings.ToLower(step.Status)),
+			Status:     step.Status,
+			Actor:      step.Actor,
+			StepID:     step.StepID,
+			StepIndex:  step.StepIndex,
+			ActionType: step.ActionType,
+			Lane:       step.Lane,
+			Details: map[string]any{
+				"target":             step.Target,
+				"target_agent_id":    step.TargetAgentID,
+				"attempt":            step.Attempt,
+				"last_error":         step.LastError,
+				"allowlist_rule_id":  step.AllowlistRuleID,
+				"guardrail_rule_ids": step.GuardrailRuleIDs,
+				"receipt":            step.Receipt,
+			},
+			Source: "steps_export",
+		})
+	}
+
+	appendStateItems := func(path string) {
+		_ = scanJSONLines(path, func(obj map[string]any) {
+			if strVal(obj["run_id"]) != run.RunID {
+				return
+			}
+			action := strVal(obj["action"])
+			if action == "" {
+				return
+			}
+			details := map[string]any{}
+			for _, key := range []string{"assignee", "note", "method", "reference", "reason", "scope", "result", "action_name", "label", "target", "direction", "execution_mode"} {
+				if value := strVal(obj[key]); value != "" {
+					details[key] = value
+				}
+			}
+			appendItem(responseHistoryItem{
+				TS:      strVal(obj["ts"]),
+				Stage:   "analyst",
+				Label:   strings.ReplaceAll(action, "_", " "),
+				Status:  strVal(obj["status"]),
+				Actor:   strVal(obj["actor"]),
+				Details: details,
+				Source:  "ui_state",
+			})
+		})
+	}
+
+	appendStateItems(a.assignmentsStatePath())
+	appendStateItems(a.notesStatePath())
+	appendStateItems(a.identityStatePath())
+	appendStateItems(a.responseActionsStatePath())
+
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].TSUnixMs == items[j].TSUnixMs {
+			if items[i].StepIndex == items[j].StepIndex {
+				return items[i].Label < items[j].Label
+			}
+			return items[i].StepIndex < items[j].StepIndex
+		}
+		return items[i].TSUnixMs < items[j].TSUnixMs
+	})
+	return items
+}
+
+func responseHistoryMasterMsg(msg string) bool {
+	switch msg {
+	case "response_run_created",
+		"approval_policy_evaluated",
+		"response_run_waiting_approval",
+		"approval_requested",
+		"approval_received",
+		"approval_approved",
+		"approval_denied",
+		"approval_timed_out",
+		"response_run_manual_review_required",
+		"response_run_updated",
+		"response_run_rejected",
+		"response_run_partial_completion",
+		"response_result_applied",
+		"response_step_result_received",
+		"response_run_corroborated":
+		return true
+	default:
+		return false
+	}
+}
+
+func responseHistoryStage(msg string) string {
+	switch msg {
+	case "response_run_created", "response_run_updated", "response_run_rejected", "response_run_manual_review_required", "response_run_partial_completion":
+		return "run"
+	case "approval_policy_evaluated", "response_run_waiting_approval", "approval_requested", "approval_received", "approval_approved", "approval_denied", "approval_timed_out":
+		return "approval"
+	case "response_result_applied", "response_step_result_received":
+		return "execution"
+	case "response_run_corroborated":
+		return "corroboration"
+	default:
+		return "event"
+	}
+}
+
+func buildIncidentLogicPlaybookSteps(in []logicPlaybookStepDefinition) []incidentLogicPlaybookStepResponse {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]incidentLogicPlaybookStepResponse, 0, len(in))
+	for _, step := range in {
+		out = append(out, incidentLogicPlaybookStepResponse{
+			Name:          step.Name,
+			ActionType:    step.ActionType,
+			Reversibility: step.Reversibility,
+			TimeoutMs:     step.TimeoutMs,
+			Retries:       step.Retries,
+			BackoffMs:     step.BackoffMs,
+			TargetFrom:    step.TargetFrom,
+			ParamKeys:     append([]string(nil), step.ParamKeys...),
+		})
+	}
+	return out
 }
 
 func (a *app) handleIncidentApprove(w http.ResponseWriter, r *http.Request) {
@@ -2669,6 +3541,301 @@ func buildInvestigationProviderSummaries(in []investigationProviderResult) []inv
 		return out[i].FetchedAtUnixMs > out[j].FetchedAtUnixMs
 	})
 	return out
+}
+
+func (a *app) handleInvestigationProviders(w http.ResponseWriter, r *http.Request) {
+	resp, err := a.loadInvestigationProviders(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (a *app) loadInvestigationProviders(ctx context.Context) (investigationProvidersResponse, error) {
+	resp := investigationProvidersResponse{Items: []investigationProviderCatalogEntry{}, Source: "env"}
+	type providerMeta struct {
+		label          string
+		envVar         string
+		supportedKinds []string
+	}
+	catalog := map[string]providerMeta{
+		"abuseipdb":  {label: "AbuseIPDB", envVar: "ABUSEIPDB_API_KEY", supportedKinds: []string{"ip"}},
+		"virustotal": {label: "VirusTotal", envVar: "VT_API_KEY", supportedKinds: []string{"ip", "domain", "url", "sha256"}},
+		"greynoise":  {label: "GreyNoise", envVar: "GREYNOISE_API_KEY", supportedKinds: []string{"ip"}},
+		"urlscan":    {label: "urlscan", envVar: "URLSCAN_API_KEY", supportedKinds: []string{"domain", "url"}},
+	}
+	enabled := parseEnabledProvidersLocal(os.Getenv("INVESTIGATION_ENABLED_PROVIDERS"))
+	enabledSet := make(map[string]struct{}, len(enabled))
+	for _, name := range enabled {
+		enabledSet[strings.ToLower(strings.TrimSpace(name))] = struct{}{}
+	}
+
+	latestByProvider := map[string]investigationProviderCatalogEntry{}
+	if a.db != nil {
+		rows, err := a.db.QueryContext(ctx, `
+SELECT DISTINCT ON (provider) provider, status, provider_verdict, summary, fetched_at_unix_ms
+FROM observable_enrichments
+ORDER BY provider, fetched_at_unix_ms DESC
+`)
+		if err != nil {
+			return resp, err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var item investigationProviderCatalogEntry
+			if err := rows.Scan(&item.Provider, &item.LastStatus, &item.LastVerdict, &item.LastSummary, &item.LastFetchedAtUnixMs); err == nil {
+				latestByProvider[strings.ToLower(strings.TrimSpace(item.Provider))] = item
+			}
+		}
+		resp.Source = "env+db"
+	}
+
+	names := make([]string, 0, len(catalog))
+	for name := range catalog {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		meta := catalog[name]
+		item := investigationProviderCatalogEntry{
+			Provider:         name,
+			Label:            meta.label,
+			EnvVar:           meta.envVar,
+			APIKeyConfigured: strings.TrimSpace(os.Getenv(meta.envVar)) != "",
+			SupportedKinds:   append([]string(nil), meta.supportedKinds...),
+			Enabled:          len(enabledSet) == 0,
+		}
+		if len(enabledSet) > 0 {
+			_, item.Enabled = enabledSet[name]
+		}
+		if latest, ok := latestByProvider[name]; ok {
+			item.LastStatus = latest.LastStatus
+			item.LastVerdict = latest.LastVerdict
+			item.LastSummary = latest.LastSummary
+			item.LastFetchedAtUnixMs = latest.LastFetchedAtUnixMs
+		}
+		resp.Items = append(resp.Items, item)
+	}
+	resp.Count = len(resp.Items)
+	return resp, nil
+}
+
+func parseEnabledProvidersLocal(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	seen := map[string]struct{}{}
+	for _, part := range parts {
+		value := strings.ToLower(strings.TrimSpace(part))
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (a *app) loadEntityIPProfile(ctx context.Context, ip string) (entityProfileResponse, error) {
+	resp := entityProfileResponse{
+		Kind:            "ip",
+		Value:           ip,
+		RecentEvents:    []eventRow{},
+		RecentIncidents: []incident{},
+		Source:          "exports",
+	}
+	runs, _, created := a.loadState()
+	for _, run := range runs {
+		run = enrichIncidentFromCreatedMeta(run, created[run.RunID])
+		if sameIPHost(run.SrcIP, ip) || sameIPHost(run.DstIP, ip) {
+			resp.RecentIncidents = append(resp.RecentIncidents, run)
+		}
+	}
+	resp.CountIncidents = len(resp.RecentIncidents)
+	sort.SliceStable(resp.RecentIncidents, func(i, j int) bool {
+		if resp.RecentIncidents[i].LastUpdatedAtUnixMs == resp.RecentIncidents[j].LastUpdatedAtUnixMs {
+			return resp.RecentIncidents[i].RunID < resp.RecentIncidents[j].RunID
+		}
+		return resp.RecentIncidents[i].LastUpdatedAtUnixMs > resp.RecentIncidents[j].LastUpdatedAtUnixMs
+	})
+	if len(resp.RecentIncidents) > 25 {
+		resp.RecentIncidents = resp.RecentIncidents[:25]
+	}
+	if a.db == nil {
+		resp.Summary = entityProfileSummary{}
+		return resp, nil
+	}
+	summary, events, err := a.loadEntityIPDB(ctx, ip)
+	if err != nil {
+		return resp, err
+	}
+	resp.Summary = summary
+	resp.RecentEvents = events
+	resp.CountEvents = summary.TotalEvents
+	resp.Source = "db+exports"
+	return resp, nil
+}
+
+func (a *app) loadEntityUserProfile(ctx context.Context, user string) (entityProfileResponse, error) {
+	resp := entityProfileResponse{
+		Kind:            "user",
+		Value:           user,
+		RecentEvents:    []eventRow{},
+		RecentIncidents: []incident{},
+		Source:          "exports",
+	}
+	runs, _, created := a.loadState()
+	for _, run := range runs {
+		run = enrichIncidentFromCreatedMeta(run, created[run.RunID])
+		if strings.EqualFold(strings.TrimSpace(run.User), strings.TrimSpace(user)) {
+			resp.RecentIncidents = append(resp.RecentIncidents, run)
+		}
+	}
+	resp.CountIncidents = len(resp.RecentIncidents)
+	sort.SliceStable(resp.RecentIncidents, func(i, j int) bool {
+		if resp.RecentIncidents[i].LastUpdatedAtUnixMs == resp.RecentIncidents[j].LastUpdatedAtUnixMs {
+			return resp.RecentIncidents[i].RunID < resp.RecentIncidents[j].RunID
+		}
+		return resp.RecentIncidents[i].LastUpdatedAtUnixMs > resp.RecentIncidents[j].LastUpdatedAtUnixMs
+	})
+	if len(resp.RecentIncidents) > 25 {
+		resp.RecentIncidents = resp.RecentIncidents[:25]
+	}
+	if a.db == nil {
+		resp.Summary = entityProfileSummary{}
+		return resp, nil
+	}
+	summary, events, err := a.loadEntityUserDB(ctx, user)
+	if err != nil {
+		return resp, err
+	}
+	resp.Summary = summary
+	resp.RecentEvents = events
+	resp.CountEvents = summary.TotalEvents
+	resp.Source = "db+exports"
+	return resp, nil
+}
+
+func (a *app) loadEntityIPDB(ctx context.Context, ip string) (entityProfileSummary, []eventRow, error) {
+	const where = `((src_ip IS NOT NULL AND host(src_ip)=host($1::inet)) OR (dst_ip IS NOT NULL AND host(dst_ip)=host($1::inet)))`
+	return a.loadEntityDBCommon(ctx, where, ip)
+}
+
+func (a *app) loadEntityUserDB(ctx context.Context, user string) (entityProfileSummary, []eventRow, error) {
+	const where = `(LOWER(COALESCE(user_name,'')) = LOWER($1))`
+	return a.loadEntityDBCommon(ctx, where, user)
+}
+
+func (a *app) loadEntityDBCommon(ctx context.Context, where string, arg any) (entityProfileSummary, []eventRow, error) {
+	summary := entityProfileSummary{}
+	if err := a.db.QueryRowContext(ctx, `
+SELECT COALESCE(MIN(event_ts_unix_ms),0), COALESCE(MAX(event_ts_unix_ms),0), COUNT(*), COUNT(DISTINCT NULLIF(rule_id,''))
+FROM normalized_events
+WHERE `+where, arg).Scan(&summary.FirstSeenUnixMs, &summary.LastSeenUnixMs, &summary.TotalEvents, &summary.Detections); err != nil {
+		return summary, nil, err
+	}
+	loadDistinct := func(query string) ([]string, error) {
+		rows, err := a.db.QueryContext(ctx, query, arg)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		out := []string{}
+		for rows.Next() {
+			var value string
+			if err := rows.Scan(&value); err == nil && strings.TrimSpace(value) != "" {
+				out = append(out, value)
+			}
+		}
+		return out, nil
+	}
+	var err error
+	if summary.Nodes, err = loadDistinct(`SELECT DISTINCT node_id FROM normalized_events WHERE ` + where + ` AND COALESCE(node_id,'') <> '' ORDER BY node_id LIMIT 12`); err != nil {
+		return summary, nil, err
+	}
+	if summary.SourceTypes, err = loadDistinct(`SELECT DISTINCT source_type FROM normalized_events WHERE ` + where + ` AND COALESCE(source_type,'') <> '' ORDER BY source_type LIMIT 12`); err != nil {
+		return summary, nil, err
+	}
+	if summary.EventTypes, err = loadDistinct(`SELECT DISTINCT event_type FROM normalized_events WHERE ` + where + ` AND COALESCE(event_type,'') <> '' ORDER BY event_type LIMIT 12`); err != nil {
+		return summary, nil, err
+	}
+	if summary.Rules, err = loadDistinct(`SELECT DISTINCT rule_id FROM normalized_events WHERE ` + where + ` AND COALESCE(rule_id,'') <> '' ORDER BY rule_id LIMIT 20`); err != nil {
+		return summary, nil, err
+	}
+
+	rows, err := a.db.QueryContext(ctx, `
+SELECT event_ts_unix_ms, recv_ts_unix_ms, node_id, source_type, event_type,
+       COALESCE(src_ip::text,''), COALESCE(dst_ip::text,''), COALESCE(dst_port,0), COALESCE(protocol_family,''),
+       COALESCE(user_name,''), COALESCE(severity,''), COALESCE(rule_id,''),
+       COALESCE(exec_path,''), COALESCE(comm,''), COALESCE(cmdline,''), COALESCE(dns_name,''),
+       COALESCE(file_sha256,''), COALESCE(exec_sha256,''), event_idem_key, COALESCE(raw_line_sha256,'')
+FROM normalized_events
+WHERE `+where+`
+ORDER BY recv_ts_unix_ms DESC
+LIMIT 50
+`, arg)
+	if err != nil {
+		return summary, nil, err
+	}
+	defer rows.Close()
+	events := make([]eventRow, 0, 50)
+	for rows.Next() {
+		var item eventRow
+		if err := rows.Scan(
+			&item.EventTSUnixMs,
+			&item.RecvTSUnixMs,
+			&item.NodeID,
+			&item.SourceType,
+			&item.EventType,
+			&item.SrcIP,
+			&item.DstIP,
+			&item.DstPort,
+			&item.ProtocolFamily,
+			&item.UserName,
+			&item.Severity,
+			&item.RuleID,
+			&item.ExecPath,
+			&item.Comm,
+			&item.Cmdline,
+			&item.DNSName,
+			&item.FileSHA256,
+			&item.ExecSHA256,
+			&item.EventIdemKey,
+			&item.RawLineSHA256,
+		); err != nil {
+			return summary, nil, err
+		}
+		events = append(events, item)
+	}
+	return summary, events, nil
+}
+
+func sameIPHost(candidate string, target string) bool {
+	left := ipHostOnly(candidate)
+	right := ipHostOnly(target)
+	return left != "" && right != "" && left == right
+}
+
+func ipHostOnly(value string) string {
+	raw := strings.TrimSpace(value)
+	if raw == "" {
+		return ""
+	}
+	if strings.Contains(raw, "/") {
+		raw = strings.SplitN(raw, "/", 2)[0]
+	}
+	ip := net.ParseIP(raw)
+	if ip == nil {
+		return ""
+	}
+	return ip.String()
 }
 
 func requestMetricsFromMap(data map[string]any) (attempts int, latencyMs int64, httpStatus int, errorClass string) {
@@ -3920,6 +5087,301 @@ LIMIT $4
 	})
 }
 
+type eventSearchRequest struct {
+	Q              string         `json:"q"`
+	FromMs         int64          `json:"from"`
+	ToMs           int64          `json:"to"`
+	NodeID         string         `json:"node_id,omitempty"`
+	UserName       string         `json:"user_name,omitempty"`
+	SrcIP          string         `json:"src_ip,omitempty"`
+	DstIP          string         `json:"dst_ip,omitempty"`
+	DstPort        int            `json:"dst_port,omitempty"`
+	ProtocolFamily string         `json:"protocol_family,omitempty"`
+	SourceType     string         `json:"source_type,omitempty"`
+	EventType      string         `json:"event_type,omitempty"`
+	RuleID         string         `json:"rule_id,omitempty"`
+	Severity       string         `json:"severity,omitempty"`
+	Comm           string         `json:"comm,omitempty"`
+	ExecPath       string         `json:"exec_path,omitempty"`
+	Cmdline        string         `json:"cmdline,omitempty"`
+	DNSName        string         `json:"dns_name,omitempty"`
+	FileSHA256     string         `json:"file_sha256,omitempty"`
+	ExecSHA256     string         `json:"exec_sha256,omitempty"`
+	EventIdemKey   string         `json:"event_idem_key,omitempty"`
+	RawLineSHA256  string         `json:"raw_line_sha256,omitempty"`
+	Page           int            `json:"page"`
+	Limit          int            `json:"limit"`
+	Sort           string         `json:"sort"`
+	Filters        map[string]any `json:"filters,omitempty"`
+}
+
+func parseEventSearchRequest(values url.Values, now time.Time) eventSearchRequest {
+	req := eventSearchRequest{
+		Q:              strings.TrimSpace(values.Get("q")),
+		FromMs:         parseInt64(values.Get("from"), 0),
+		ToMs:           parseInt64(values.Get("to"), 0),
+		NodeID:         strings.TrimSpace(values.Get("node_id")),
+		UserName:       strings.TrimSpace(values.Get("user_name")),
+		SrcIP:          strings.TrimSpace(values.Get("src_ip")),
+		DstIP:          strings.TrimSpace(values.Get("dst_ip")),
+		DstPort:        int(parseInt64(values.Get("dst_port"), 0)),
+		ProtocolFamily: strings.TrimSpace(values.Get("protocol_family")),
+		SourceType:     strings.TrimSpace(values.Get("source_type")),
+		EventType:      strings.TrimSpace(values.Get("event_type")),
+		RuleID:         strings.TrimSpace(values.Get("rule_id")),
+		Severity:       strings.TrimSpace(values.Get("severity")),
+		Comm:           strings.TrimSpace(values.Get("comm")),
+		ExecPath:       strings.TrimSpace(values.Get("exec_path")),
+		Cmdline:        strings.TrimSpace(values.Get("cmdline")),
+		DNSName:        strings.TrimSpace(values.Get("dns_name")),
+		FileSHA256:     strings.TrimSpace(values.Get("file_sha256")),
+		ExecSHA256:     strings.TrimSpace(values.Get("exec_sha256")),
+		EventIdemKey:   strings.TrimSpace(values.Get("event_idem_key")),
+		RawLineSHA256:  strings.TrimSpace(values.Get("raw_line_sha256")),
+		Page:           int(parseInt64(values.Get("page"), 1)),
+		Limit:          int(parseInt64(values.Get("limit"), 100)),
+		Sort:           normalizeEventSearchSort(values.Get("sort")),
+	}
+	if req.Page <= 0 {
+		req.Page = 1
+	}
+	if req.Limit <= 0 {
+		req.Limit = 100
+	}
+	if req.Limit > 500 {
+		req.Limit = 500
+	}
+	if req.FromMs <= 0 {
+		req.FromMs = now.Add(-24 * time.Hour).UnixMilli()
+	}
+	if req.ToMs <= 0 {
+		req.ToMs = now.UnixMilli()
+	}
+	if req.FromMs > req.ToMs {
+		req.FromMs, req.ToMs = req.ToMs, req.FromMs
+	}
+	req.Filters = map[string]any{}
+	for key, value := range map[string]string{
+		"node_id":         req.NodeID,
+		"user_name":       req.UserName,
+		"src_ip":          req.SrcIP,
+		"dst_ip":          req.DstIP,
+		"protocol_family": req.ProtocolFamily,
+		"source_type":     req.SourceType,
+		"event_type":      req.EventType,
+		"rule_id":         req.RuleID,
+		"severity":        req.Severity,
+		"comm":            req.Comm,
+		"exec_path":       req.ExecPath,
+		"cmdline":         req.Cmdline,
+		"dns_name":        req.DNSName,
+		"file_sha256":     req.FileSHA256,
+		"exec_sha256":     req.ExecSHA256,
+		"event_idem_key":  req.EventIdemKey,
+		"raw_line_sha256": req.RawLineSHA256,
+	} {
+		if value != "" {
+			req.Filters[key] = value
+		}
+	}
+	if req.DstPort > 0 {
+		req.Filters["dst_port"] = req.DstPort
+	}
+	if len(req.Filters) == 0 {
+		req.Filters = nil
+	}
+	return req
+}
+
+func normalizeEventSearchSort(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "recv_asc":
+		return "recv_asc"
+	case "event_desc":
+		return "event_desc"
+	case "event_asc":
+		return "event_asc"
+	default:
+		return "recv_desc"
+	}
+}
+
+func eventSearchOrderBy(sortKey string) string {
+	switch sortKey {
+	case "recv_asc":
+		return "recv_ts_unix_ms ASC, event_idem_key ASC"
+	case "event_desc":
+		return "event_ts_unix_ms DESC, event_idem_key DESC"
+	case "event_asc":
+		return "event_ts_unix_ms ASC, event_idem_key ASC"
+	default:
+		return "recv_ts_unix_ms DESC, event_idem_key DESC"
+	}
+}
+
+func buildEventSearchPredicates(req eventSearchRequest) ([]string, []any) {
+	clauses := []string{"recv_ts_unix_ms BETWEEN $1 AND $2"}
+	args := []any{req.FromMs, req.ToMs}
+	appendExact := func(column, value string) {
+		if strings.TrimSpace(value) == "" {
+			return
+		}
+		args = append(args, value)
+		clauses = append(clauses, fmt.Sprintf("%s = $%d", column, len(args)))
+	}
+	appendExact("node_id", req.NodeID)
+	appendExact("COALESCE(user_name,'')", req.UserName)
+	appendExact("COALESCE(src_ip::text,'')", req.SrcIP)
+	appendExact("COALESCE(dst_ip::text,'')", req.DstIP)
+	if req.DstPort > 0 {
+		args = append(args, req.DstPort)
+		clauses = append(clauses, fmt.Sprintf("COALESCE(dst_port,0) = $%d", len(args)))
+	}
+	appendExact("COALESCE(protocol_family,'')", req.ProtocolFamily)
+	appendExact("source_type", req.SourceType)
+	appendExact("event_type", req.EventType)
+	appendExact("COALESCE(rule_id,'')", req.RuleID)
+	appendExact("COALESCE(severity,'')", req.Severity)
+	appendExact("COALESCE(comm,'')", req.Comm)
+	appendExact("COALESCE(exec_path,'')", req.ExecPath)
+	appendExact("COALESCE(cmdline,'')", req.Cmdline)
+	appendExact("COALESCE(dns_name,'')", req.DNSName)
+	appendExact("COALESCE(file_sha256,'')", req.FileSHA256)
+	appendExact("COALESCE(exec_sha256,'')", req.ExecSHA256)
+	appendExact("event_idem_key", req.EventIdemKey)
+	appendExact("COALESCE(raw_line_sha256,'')", req.RawLineSHA256)
+	if q := strings.ToLower(strings.TrimSpace(req.Q)); q != "" {
+		args = append(args, "%"+q+"%")
+		ph := fmt.Sprintf("$%d", len(args))
+		clauses = append(clauses, `(
+LOWER(COALESCE(node_id,'')) LIKE `+ph+`
+OR LOWER(COALESCE(source_type,'')) LIKE `+ph+`
+OR LOWER(COALESCE(event_type,'')) LIKE `+ph+`
+OR LOWER(COALESCE(src_ip::text,'')) LIKE `+ph+`
+OR LOWER(COALESCE(dst_ip::text,'')) LIKE `+ph+`
+OR LOWER(COALESCE(dst_port::text,'')) LIKE `+ph+`
+OR LOWER(COALESCE(protocol_family,'')) LIKE `+ph+`
+OR LOWER(COALESCE(user_name,'')) LIKE `+ph+`
+OR LOWER(COALESCE(severity,'')) LIKE `+ph+`
+OR LOWER(COALESCE(rule_id,'')) LIKE `+ph+`
+OR LOWER(COALESCE(exec_path,'')) LIKE `+ph+`
+OR LOWER(COALESCE(comm,'')) LIKE `+ph+`
+OR LOWER(COALESCE(cmdline,'')) LIKE `+ph+`
+OR LOWER(COALESCE(dns_name,'')) LIKE `+ph+`
+OR LOWER(COALESCE(file_sha256,'')) LIKE `+ph+`
+OR LOWER(COALESCE(exec_sha256,'')) LIKE `+ph+`
+OR LOWER(COALESCE(event_idem_key,'')) LIKE `+ph+`
+OR LOWER(COALESCE(raw_line_sha256,'')) LIKE `+ph+`
+)`)
+	}
+	return clauses, args
+}
+
+func (a *app) handleSearchEvents(w http.ResponseWriter, r *http.Request) {
+	req := parseEventSearchRequest(r.URL.Query(), time.Now())
+	resp := eventSearchResponse{
+		Items:  []eventRow{},
+		Count:  0,
+		Total:  0,
+		Page:   req.Page,
+		Limit:  req.Limit,
+		Sort:   req.Sort,
+		Source: "db",
+		AvailableFilters: []string{
+			"q",
+			"from",
+			"to",
+			"node_id",
+			"user_name",
+			"src_ip",
+			"dst_ip",
+			"dst_port",
+			"protocol_family",
+			"source_type",
+			"event_type",
+			"rule_id",
+			"severity",
+			"comm",
+			"exec_path",
+			"cmdline",
+			"dns_name",
+			"file_sha256",
+			"exec_sha256",
+			"event_idem_key",
+			"raw_line_sha256",
+			"page",
+			"limit",
+			"sort",
+		},
+		Query: req,
+	}
+	if a.db == nil {
+		resp.Source = "exports"
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	clauses, args := buildEventSearchPredicates(req)
+	whereSQL := strings.Join(clauses, " AND ")
+	var total int
+	countQuery := "SELECT COUNT(*) FROM normalized_events WHERE " + whereSQL
+	if err := a.db.QueryRowContext(r.Context(), countQuery, args...).Scan(&total); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": fmt.Sprintf("count events: %v", err)})
+		return
+	}
+	resp.Total = total
+	offset := (req.Page - 1) * req.Limit
+	args = append(args, req.Limit, offset)
+	dataQuery := `
+SELECT event_ts_unix_ms, recv_ts_unix_ms, node_id, source_type, event_type,
+       COALESCE(src_ip::text,''), COALESCE(dst_ip::text,''), COALESCE(dst_port,0), COALESCE(protocol_family,''),
+       COALESCE(user_name,''), COALESCE(severity,''), COALESCE(rule_id,''),
+       COALESCE(exec_path,''), COALESCE(comm,''), COALESCE(cmdline,''), COALESCE(dns_name,''),
+       COALESCE(file_sha256,''), COALESCE(exec_sha256,''), event_idem_key, COALESCE(raw_line_sha256,'')
+FROM normalized_events
+WHERE ` + whereSQL + `
+ORDER BY ` + eventSearchOrderBy(req.Sort) + `
+LIMIT $` + strconv.Itoa(len(args)-1) + ` OFFSET $` + strconv.Itoa(len(args))
+	rows, err := a.db.QueryContext(r.Context(), dataQuery, args...)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": fmt.Sprintf("query events: %v", err)})
+		return
+	}
+	defer rows.Close()
+	items := make([]eventRow, 0, req.Limit)
+	for rows.Next() {
+		var item eventRow
+		if err := rows.Scan(
+			&item.EventTSUnixMs,
+			&item.RecvTSUnixMs,
+			&item.NodeID,
+			&item.SourceType,
+			&item.EventType,
+			&item.SrcIP,
+			&item.DstIP,
+			&item.DstPort,
+			&item.ProtocolFamily,
+			&item.UserName,
+			&item.Severity,
+			&item.RuleID,
+			&item.ExecPath,
+			&item.Comm,
+			&item.Cmdline,
+			&item.DNSName,
+			&item.FileSHA256,
+			&item.ExecSHA256,
+			&item.EventIdemKey,
+			&item.RawLineSHA256,
+		); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": fmt.Sprintf("scan event: %v", err)})
+			return
+		}
+		items = append(items, item)
+	}
+	resp.Items = items
+	resp.Count = len(items)
+	writeJSON(w, http.StatusOK, resp)
+}
+
 func (a *app) handleStream(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -4144,6 +5606,96 @@ LIMIT 500`
 	return items, "db", nil
 }
 
+func (a *app) handleEndpointSummary(w http.ResponseWriter, r *http.Request) {
+	nodeID := strings.TrimSpace(r.PathValue("node_id"))
+	if nodeID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing node_id"})
+		return
+	}
+	fromMs := parseInt64(r.URL.Query().Get("from"), time.Now().Add(-1*time.Hour).UnixMilli())
+	toMs := parseInt64(r.URL.Query().Get("to"), time.Now().UnixMilli())
+	if fromMs > toMs {
+		fromMs, toMs = toMs, fromMs
+	}
+	summary := endpointDetailSummary{
+		NodeID:           nodeID,
+		WindowFromUnixMs: fromMs,
+		WindowToUnixMs:   toMs,
+		SourceTypeDist:   map[string]int{},
+		EventTypeDist:    map[string]int{},
+		SeverityDist:     map[string]int{},
+	}
+	if a.db == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"summary": summary, "source": "exports"})
+		return
+	}
+	ctx := r.Context()
+	_ = a.db.QueryRowContext(ctx, `
+SELECT COALESCE(MIN(event_ts_unix_ms),0),
+       COALESCE(MAX(recv_ts_unix_ms),0),
+       COUNT(*),
+       SUM(CASE WHEN COALESCE(rule_id,'') <> '' THEN 1 ELSE 0 END)
+FROM normalized_events
+WHERE node_id = $1 AND recv_ts_unix_ms BETWEEN $2 AND $3
+`, nodeID, fromMs, toMs).Scan(&summary.FirstSeenUnixMs, &summary.LastSeenUnixMs, &summary.TotalEvents, &summary.DetectionCount)
+
+	loadCountMap := func(query string, target map[string]int) {
+		rows, err := a.db.QueryContext(ctx, query, nodeID, fromMs, toMs)
+		if err != nil {
+			return
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var key string
+			var count int
+			if err := rows.Scan(&key, &count); err == nil {
+				target[key] = count
+			}
+		}
+	}
+	loadTop := func(query string, limit int) []namedCount {
+		rows, err := a.db.QueryContext(ctx, query, nodeID, fromMs, toMs, limit)
+		if err != nil {
+			return nil
+		}
+		defer rows.Close()
+		out := make([]namedCount, 0, limit)
+		for rows.Next() {
+			var item namedCount
+			if err := rows.Scan(&item.Value, &item.Count); err == nil {
+				out = append(out, item)
+			}
+		}
+		return out
+	}
+	loadCountMap(`SELECT source_type, COUNT(*) FROM normalized_events WHERE node_id = $1 AND recv_ts_unix_ms BETWEEN $2 AND $3 AND COALESCE(source_type,'') <> '' GROUP BY source_type`, summary.SourceTypeDist)
+	loadCountMap(`SELECT event_type, COUNT(*) FROM normalized_events WHERE node_id = $1 AND recv_ts_unix_ms BETWEEN $2 AND $3 AND COALESCE(event_type,'') <> '' GROUP BY event_type`, summary.EventTypeDist)
+	loadCountMap(`SELECT severity, COUNT(*) FROM normalized_events WHERE node_id = $1 AND recv_ts_unix_ms BETWEEN $2 AND $3 AND COALESCE(severity,'') <> '' GROUP BY severity`, summary.SeverityDist)
+	summary.TopUsers = loadTop(`SELECT user_name, COUNT(*) FROM normalized_events WHERE node_id = $1 AND recv_ts_unix_ms BETWEEN $2 AND $3 AND COALESCE(user_name,'') <> '' GROUP BY user_name ORDER BY COUNT(*) DESC, user_name LIMIT $4`, 5)
+	summary.TopRules = loadTop(`SELECT rule_id, COUNT(*) FROM normalized_events WHERE node_id = $1 AND recv_ts_unix_ms BETWEEN $2 AND $3 AND COALESCE(rule_id,'') <> '' GROUP BY rule_id ORDER BY COUNT(*) DESC, rule_id LIMIT $4`, 5)
+	summary.TopDestinations = loadTop(`SELECT dst_ip::text, COUNT(*) FROM normalized_events WHERE node_id = $1 AND recv_ts_unix_ms BETWEEN $2 AND $3 AND dst_ip IS NOT NULL GROUP BY dst_ip::text ORDER BY COUNT(*) DESC, dst_ip::text LIMIT $4`, 6)
+	summary.TopDomains = loadTop(`SELECT dns_name, COUNT(*) FROM normalized_events WHERE node_id = $1 AND recv_ts_unix_ms BETWEEN $2 AND $3 AND COALESCE(dns_name,'') <> '' GROUP BY dns_name ORDER BY COUNT(*) DESC, dns_name LIMIT $4`, 6)
+
+	runs, stepsByRun, _ := a.loadState()
+	for _, view := range allActionViews(a.loadActionRecords(), runs, stepsByRun) {
+		if view.NodeID != nodeID {
+			continue
+		}
+		if view.Bucket == "active" {
+			summary.ActiveActionCount++
+		}
+	}
+	for _, run := range runs {
+		if strings.TrimSpace(run.NodeID) != nodeID {
+			continue
+		}
+		if run.LastUpdatedAtUnixMs >= fromMs && run.LastUpdatedAtUnixMs <= toMs {
+			summary.RecentRunCount++
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"summary": summary, "source": "db"})
+}
+
 func (a *app) handleEndpointEvents(w http.ResponseWriter, r *http.Request) {
 	nodeID := strings.TrimSpace(r.PathValue("node_id"))
 	if nodeID == "" {
@@ -4167,7 +5719,11 @@ func (a *app) handleEndpointEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rows, err := a.db.QueryContext(r.Context(), `
-SELECT event_ts_unix_ms, recv_ts_unix_ms, node_id, source_type, event_type, COALESCE(src_ip::text,''), COALESCE(dst_ip::text,''), COALESCE(user_name,''), COALESCE(severity,''), COALESCE(rule_id,''), event_idem_key
+SELECT event_ts_unix_ms, recv_ts_unix_ms, node_id, source_type, event_type,
+       COALESCE(src_ip::text,''), COALESCE(dst_ip::text,''), COALESCE(dst_port,0), COALESCE(protocol_family,''),
+       COALESCE(user_name,''), COALESCE(severity,''), COALESCE(rule_id,''),
+       COALESCE(exec_path,''), COALESCE(comm,''), COALESCE(cmdline,''), COALESCE(dns_name,''),
+       COALESCE(file_sha256,''), COALESCE(exec_sha256,''), event_idem_key, COALESCE(raw_line_sha256,'')
 FROM normalized_events
 WHERE node_id = $1 AND recv_ts_unix_ms BETWEEN $2 AND $3
 ORDER BY recv_ts_unix_ms DESC
@@ -4181,7 +5737,13 @@ LIMIT $4
 	items := make([]eventRow, 0, limit)
 	for rows.Next() {
 		var ev eventRow
-		if err := rows.Scan(&ev.EventTSUnixMs, &ev.RecvTSUnixMs, &ev.NodeID, &ev.SourceType, &ev.EventType, &ev.SrcIP, &ev.DstIP, &ev.UserName, &ev.Severity, &ev.RuleID, &ev.EventIdemKey); err == nil {
+		if err := rows.Scan(
+			&ev.EventTSUnixMs, &ev.RecvTSUnixMs, &ev.NodeID, &ev.SourceType, &ev.EventType,
+			&ev.SrcIP, &ev.DstIP, &ev.DstPort, &ev.ProtocolFamily,
+			&ev.UserName, &ev.Severity, &ev.RuleID,
+			&ev.ExecPath, &ev.Comm, &ev.Cmdline, &ev.DNSName,
+			&ev.FileSHA256, &ev.ExecSHA256, &ev.EventIdemKey, &ev.RawLineSHA256,
+		); err == nil {
 			items = append(items, ev)
 		}
 	}
@@ -5830,7 +7392,7 @@ func parseAuditLog(path string, source string) []auditEntry {
 		}
 		keep := false
 		switch msg {
-		case "approval_received", "approval_approved", "approval_denied", "approval_timed_out", "response_run_manual_review_required", "response_run_partial_completion", "response_run_corroborated", "ui_approval_published", "ui_user_upserted", "ui_user_disabled", "ui_user_deleted", "identity_verification_completed", "identity_verification_failed_safe", "identity_verification_failed", "auth_access_restored", "auth_restore_failed_safe", "auth_access_restore_failed":
+		case "approval_received", "approval_approved", "approval_denied", "approval_timed_out", "response_run_manual_review_required", "response_run_partial_completion", "response_run_corroborated", "ui_approval_published", "ui_user_upserted", "ui_user_disabled", "ui_user_deleted", "ui_model_change_proposed", "ui_model_change_approved", "ui_model_change_rejected", "ui_model_change_applied", "identity_verification_completed", "identity_verification_failed_safe", "identity_verification_failed", "auth_access_restored", "auth_restore_failed_safe", "auth_access_restore_failed":
 			keep = true
 		case "response_run_updated":
 			status := strings.ToUpper(strVal(obj["status"]))

@@ -1,10 +1,13 @@
 package main
 
 import (
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestApplyIncidentRetentionPolicyUsesServiceAccountRule(t *testing.T) {
@@ -179,7 +182,7 @@ func TestLoadDashboardHintsParsesRetentionRuleConditions(t *testing.T) {
 	if err := os.WriteFile(path, content, 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
-	_, _, rules, _, _, _, _ := loadDashboardHints(path)
+	_, _, rules, _, _, _, _, _, _, _, _, _ := loadDashboardHints(path)
 	if len(rules) != 2 {
 		t.Fatalf("rules=%d, want 2", len(rules))
 	}
@@ -216,7 +219,7 @@ func TestLoadDashboardHintsParsesAssetAndIdentityInventory(t *testing.T) {
 	if err := os.WriteFile(path, content, 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
-	_, _, _, defaultEnv, assetsByNode, assetsByTarget, identities := loadDashboardHints(path)
+	_, _, _, defaultEnv, assetsByNode, assetsByTarget, identities, _, _, _, _, _ := loadDashboardHints(path)
 	if defaultEnv != "lab" {
 		t.Fatalf("default environment=%q, want lab", defaultEnv)
 	}
@@ -236,6 +239,242 @@ func TestLoadDashboardHintsParsesAssetAndIdentityInventory(t *testing.T) {
 	}
 	if identity.DisplayName != "Khotso" || identity.Department != "security-engineering" || !identity.Privileged {
 		t.Fatalf("identity inventory parsed incorrectly: %+v", identity)
+	}
+}
+
+func TestBuildResponseActionRequestSupportsDNSDestination(t *testing.T) {
+	template, ok := responseActionTemplateByID("block_matching_connections")
+	if !ok {
+		t.Fatalf("missing block_matching_connections template")
+	}
+	req, err := buildResponseActionRequest(
+		template,
+		"uiact_dns_1",
+		"analyst",
+		"run-1",
+		"node-1",
+		"node-1",
+		incident{RunID: "run-1", NodeID: "node-1", DNSName: "proof-rsiem-demo.zip", DstIP: "104.18.32.47"},
+		"",
+		60000,
+		"manual dns block",
+		"case-1",
+	)
+	if err != nil {
+		t.Fatalf("buildResponseActionRequest error: %v", err)
+	}
+	if req.command.ActionType != "network_block" {
+		t.Fatalf("action_type=%q, want network_block", req.command.ActionType)
+	}
+	if req.command.Target != "proof-rsiem-demo.zip" {
+		t.Fatalf("target=%q, want dns target", req.command.Target)
+	}
+	if got := strings.TrimSpace(strVal(req.command.Params["resolved_targets"])); got != "104.18.32.47" {
+		t.Fatalf("resolved_targets=%q, want 104.18.32.47", got)
+	}
+}
+
+func TestLoadDashboardHintsParsesLogicCatalog(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "master.yaml")
+	content := []byte(`policies:
+  approvals:
+    timeout_ms: 123000
+    default_auto_min_confidence: 77
+    rules:
+      - id: "auto_within_bounds"
+        when:
+          mode_in: ["auto"]
+          confidence_at_least_floor: true
+        decision:
+          required: false
+          reason: "policy:auto_within_bounds"
+playbooks:
+  - id: "PB-NET-OUTBOUND-OBSERVE"
+    version: 1
+    enabled: true
+    selectors:
+      rule_ids: ["R-NET-OUTBOUND-CONNECTION"]
+    policy_requirements:
+      approval: "auto"
+      max_blast_radius: 1
+      auto_min_confidence: 65
+    steps:
+      - name: "notify_outbound_connection"
+        action_type: "notify"
+        reversibility: "reversible"
+        timeout_ms: 2000
+        retries: 0
+        backoff_ms: 0
+        target_from: "group_key"
+        params:
+          summary: "true"
+rce:
+  rules:
+    - id: "R-NET-OUTBOUND-CONNECTION"
+      enabled: true
+      kind: trigger
+      severity: medium
+      group_by: src_ip
+      when:
+        type: network_connection
+`)
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	_, _, _, _, _, _, _, logicRules, logicPlaybooks, approvalRules, approvalTimeoutMs, defaultAutoMinConf := loadDashboardHints(path)
+	if approvalTimeoutMs != 123000 {
+		t.Fatalf("approvalTimeoutMs=%d, want 123000", approvalTimeoutMs)
+	}
+	if defaultAutoMinConf != 77 {
+		t.Fatalf("defaultAutoMinConf=%d, want 77", defaultAutoMinConf)
+	}
+	rule, ok := logicRules["R-NET-OUTBOUND-CONNECTION"]
+	if !ok {
+		t.Fatalf("logic rule missing")
+	}
+	if rule.Kind != "trigger" || rule.WhenType != "network_connection" || rule.GroupBy != "src_ip" {
+		t.Fatalf("logic rule parsed incorrectly: %+v", rule)
+	}
+	playbook, ok := logicPlaybooks["PB-NET-OUTBOUND-OBSERVE"]
+	if !ok {
+		t.Fatalf("logic playbook missing")
+	}
+	if playbook.ApprovalMode != "auto" || len(playbook.Steps) != 1 || len(playbook.Steps[0].ParamKeys) != 1 || playbook.Steps[0].ParamKeys[0] != "summary" {
+		t.Fatalf("logic playbook parsed incorrectly: %+v", playbook)
+	}
+	approvalRule, ok := approvalRules["auto_within_bounds"]
+	if !ok {
+		t.Fatalf("approval rule missing")
+	}
+	if approvalRule.Reason != "policy:auto_within_bounds" || approvalRule.Required {
+		t.Fatalf("approval rule parsed incorrectly: %+v", approvalRule)
+	}
+}
+
+func TestBuildIncidentLogicUsesResolvedMetadata(t *testing.T) {
+	a := &app{
+		logicRulesByID: map[string]logicRuleDefinition{
+			"R-NET-OUTBOUND-CONNECTION": {
+				ID:         "R-NET-OUTBOUND-CONNECTION",
+				Enabled:    true,
+				Kind:       "trigger",
+				Severity:   "medium",
+				GroupBy:    "src_ip",
+				WhenType:   "network_connection",
+				Conditions: []string{"message_contains=connect"},
+			},
+		},
+		logicPlaybooksByID: map[string]logicPlaybookDefinition{
+			"PB-NET-OUTBOUND-OBSERVE": {
+				ID:                "PB-NET-OUTBOUND-OBSERVE",
+				Version:           1,
+				Enabled:           true,
+				SelectorRuleIDs:   []string{"R-NET-OUTBOUND-CONNECTION"},
+				ApprovalMode:      "auto",
+				AutoMinConfidence: 65,
+				MaxBlastRadius:    1,
+				Steps: []logicPlaybookStepDefinition{{
+					Name:          "notify_outbound_connection",
+					ActionType:    "notify",
+					Reversibility: "reversible",
+					ParamKeys:     []string{"summary"},
+				}},
+			},
+		},
+		approvalRulesByID: map[string]logicApprovalRuleDefinition{
+			"auto_default": {
+				ID:         "auto_default",
+				Conditions: []string{"mode_in in [auto]"},
+				Required:   false,
+				Reason:     "policy:auto",
+			},
+		},
+		approvalTimeoutMs:  300000,
+		defaultAutoMinConf: 70,
+	}
+	resp := a.buildIncidentLogic(incident{
+		RunID:                 "run-1",
+		RuleID:                "R-NET-OUTBOUND-CONNECTION",
+		PlaybookID:            "PB-NET-OUTBOUND-OBSERVE",
+		ApprovalPolicyMode:    "auto",
+		ApprovalPolicyRuleID:  "auto_default",
+		ApprovalPolicyReason:  "policy:auto",
+		PlaybookReversibility: "reversible",
+		NodeID:                "node-1",
+		SrcIP:                 "192.0.2.50",
+		DstIP:                 "104.18.32.47",
+	})
+	if resp.Rule.ID != "R-NET-OUTBOUND-CONNECTION" || resp.Rule.Kind != "trigger" {
+		t.Fatalf("rule logic wrong: %+v", resp.Rule)
+	}
+	if resp.Playbook.ID != "PB-NET-OUTBOUND-OBSERVE" || len(resp.Playbook.Steps) != 1 {
+		t.Fatalf("playbook logic wrong: %+v", resp.Playbook)
+	}
+	if resp.Policy.ApprovalRule == nil || resp.Policy.ApprovalRule.ID != "auto_default" {
+		t.Fatalf("policy logic wrong: %+v", resp.Policy)
+	}
+	if resp.Scope.SrcIP != "192.0.2.50" || resp.Scope.DstIP != "104.18.32.47" {
+		t.Fatalf("scope wrong: %+v", resp.Scope)
+	}
+}
+
+func TestParseEventSearchRequestDefaultsAndFilters(t *testing.T) {
+	now := time.Date(2026, 3, 21, 15, 0, 0, 0, time.UTC)
+	req := parseEventSearchRequest(url.Values{
+		"node_id":     {"node-1"},
+		"source_type": {"auditd_connect"},
+		"limit":       {"999"},
+		"page":        {"0"},
+		"sort":        {"EVENT_ASC"},
+	}, now)
+	if req.Page != 1 {
+		t.Fatalf("page=%d, want 1", req.Page)
+	}
+	if req.Limit != 500 {
+		t.Fatalf("limit=%d, want 500", req.Limit)
+	}
+	if req.Sort != "event_asc" {
+		t.Fatalf("sort=%q, want event_asc", req.Sort)
+	}
+	if req.FromMs != now.Add(-24*time.Hour).UnixMilli() || req.ToMs != now.UnixMilli() {
+		t.Fatalf("default window wrong: from=%d to=%d", req.FromMs, req.ToMs)
+	}
+	if req.Filters == nil || req.Filters["node_id"] != "node-1" || req.Filters["source_type"] != "auditd_connect" {
+		t.Fatalf("filters not populated correctly: %+v", req.Filters)
+	}
+}
+
+func TestBuildEventSearchPredicatesIncludesExactAndFreeTextFilters(t *testing.T) {
+	req := eventSearchRequest{
+		Q:             "cloudflare",
+		FromMs:        1000,
+		ToMs:          2000,
+		NodeID:        "node-1",
+		UserName:      "khotso",
+		SourceType:    "auditd_connect",
+		RawLineSHA256: "abc123",
+	}
+	clauses, args := buildEventSearchPredicates(req)
+	if len(args) != 7 {
+		t.Fatalf("args=%d, want 7 (%v)", len(args), args)
+	}
+	joined := strings.Join(clauses, " AND ")
+	for _, want := range []string{
+		"recv_ts_unix_ms BETWEEN $1 AND $2",
+		"node_id = $3",
+		"COALESCE(user_name,'') = $4",
+		"source_type = $5",
+		"COALESCE(raw_line_sha256,'') = $6",
+		"LOWER(COALESCE(node_id,'')) LIKE $7",
+		"LOWER(COALESCE(raw_line_sha256,'')) LIKE $7",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("predicate missing %q in %s", want, joined)
+		}
+	}
+	if args[6] != "%cloudflare%" {
+		t.Fatalf("free text arg=%v, want %%cloudflare%%", args[6])
 	}
 }
 
@@ -274,6 +513,65 @@ func TestLoadIncidentAnnotationsReturnsCorroborationForRun(t *testing.T) {
 	}
 	if annotations[0].Msg != "response_run_corroborated" {
 		t.Fatalf("msg=%q, want response_run_corroborated", annotations[0].Msg)
+	}
+}
+
+func TestSameIPHostIgnoresCIDRDecorations(t *testing.T) {
+	if !sameIPHost("172.30.50.11/32", "172.30.50.11") {
+		t.Fatalf("sameIPHost should match host and /32 decorated form")
+	}
+	if sameIPHost("172.30.50.11/32", "172.30.50.12") {
+		t.Fatalf("sameIPHost should not match different hosts")
+	}
+}
+
+func TestParseEnabledProvidersLocalDedupesAndSorts(t *testing.T) {
+	got := parseEnabledProvidersLocal(" virustotal , abuseipdb,virustotal , urlscan ")
+	want := []string{"abuseipdb", "urlscan", "virustotal"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("providers=%v, want %v", got, want)
+	}
+}
+
+func TestLoadResponseHistoryCombinesMasterLogsStepsAndUIState(t *testing.T) {
+	dir := t.TempDir()
+	masterLog := filepath.Join(dir, "master.log")
+	assignments := filepath.Join(dir, "assignments.jsonl")
+	identity := filepath.Join(dir, "identity_actions.jsonl")
+	if err := os.WriteFile(masterLog, []byte(""+
+		"{\"time\":\"2026-03-21T10:00:00Z\",\"msg\":\"response_run_created\",\"run_id\":\"run-1\",\"status\":\"CREATED\"}\n"+
+		"{\"time\":\"2026-03-21T10:00:05Z\",\"msg\":\"approval_approved\",\"run_id\":\"run-1\",\"actor\":\"analyst\",\"decision\":\"approve\"}\n"), 0o600); err != nil {
+		t.Fatalf("write master log: %v", err)
+	}
+	if err := os.WriteFile(assignments, []byte("{\"ts\":\"2026-03-21T10:00:07Z\",\"action\":\"assign\",\"run_id\":\"run-1\",\"actor\":\"analyst\",\"assignee\":\"khotso\",\"status\":\"assigned\"}\n"), 0o600); err != nil {
+		t.Fatalf("write assignments: %v", err)
+	}
+	if err := os.WriteFile(identity, []byte("{\"ts\":\"2026-03-21T10:00:09Z\",\"action\":\"verify_user\",\"run_id\":\"run-1\",\"actor\":\"analyst\",\"method\":\"phone\",\"reference\":\"ticket-1\",\"status\":\"verified\",\"result\":\"ok\"}\n"), 0o600); err != nil {
+		t.Fatalf("write identity: %v", err)
+	}
+	a := &app{cfg: serverConfig{MasterLogPath: masterLog, UIStateDir: dir}}
+	items := a.loadResponseHistory(incident{RunID: "run-1", Status: "SUCCEEDED", LastUpdatedAtUnixMs: time.Date(2026, 3, 21, 10, 0, 10, 0, time.UTC).UnixMilli()}, []stepResult{{
+		RunID:        "run-1",
+		StepID:       "step-1",
+		StepIndex:    0,
+		Status:       "SUCCEEDED",
+		ActionType:   "agent_command",
+		FinishedAtMs: time.Date(2026, 3, 21, 10, 0, 8, 0, time.UTC).UnixMilli(),
+	}})
+	if len(items) < 5 {
+		t.Fatalf("history items=%d, want at least 5", len(items))
+	}
+	labels := make([]string, 0, len(items))
+	for _, item := range items {
+		labels = append(labels, item.Label)
+	}
+	for _, want := range []string{"response run created", "approval approved", "Step 0 succeeded", "assign", "verify user"} {
+		if !slices.Contains(labels, want) {
+			t.Fatalf("history labels=%v, missing %q", labels, want)
+		}
+	}
+	if items[0].TSUnixMs > items[len(items)-1].TSUnixMs {
+		t.Fatalf("history is not sorted ascending by timestamp: first=%d last=%d", items[0].TSUnixMs, items[len(items)-1].TSUnixMs)
 	}
 }
 

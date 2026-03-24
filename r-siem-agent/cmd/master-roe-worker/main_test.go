@@ -107,7 +107,13 @@ func TestValidateStepParamsAllowlist(t *testing.T) {
 	}
 
 	if reason := validateStepParams(block.RequiredParams(), block.OptionalParams(), map[string]any{
-		"direction": "ingress",
+		"direction":          "ingress",
+		"duration_ms":        60000,
+		"reason":             "manual_response_action",
+		"mode":               "apply",
+		"response_action_id": "uiact_123",
+		"dns_name":           "proof-rsiem-demo.zip",
+		"resolved_targets":   "104.18.32.47",
 	}); reason != "" {
 		t.Fatalf("network_block allowlist rejected direction: %s", reason)
 	}

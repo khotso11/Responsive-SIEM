@@ -2,8 +2,8 @@
 
 import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { Activity, BarChart3, Clock3, ListChecks, Search, ShieldCheck, UserCircle2, Zap } from "lucide-react";
-import { ReactNode, useEffect, useMemo, useState } from "react";
+import { Activity, BarChart3, Clock3, ListChecks, Search, Settings2, ShieldCheck, UserCircle2, Zap } from "lucide-react";
+import { ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { getStreamURL, login, logout, me, setAuthToken } from "@/lib/api";
 import { AUTH_REQUIRED_EVENT, emitIncidentsUpdated } from "@/lib/events";
 import { AuthUser } from "@/lib/types";
@@ -12,6 +12,8 @@ const NAV = [
   { href: "/", label: "Dashboard", icon: BarChart3 },
   { href: "/incidents", label: "Incidents", icon: ListChecks },
   { href: "/endpoints", label: "Endpoints", icon: Activity },
+  { href: "/actions", label: "Actions", icon: Zap },
+  { href: "/search", label: "Search", icon: Search },
   { href: "/audit", label: "Audit", icon: ShieldCheck }
 ];
 
@@ -49,6 +51,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const router = useRouter();
+  const mainRef = useRef<HTMLElement | null>(null);
 
   const [globalQuery, setGlobalQuery] = useState(searchParams.get("gq") || "");
   const [range, setRange] = useState(searchParams.get("grange") || "1h");
@@ -66,6 +69,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   const [loginUser, setLoginUser] = useState("analyst");
   const [loginPass, setLoginPass] = useState("");
   const [loginErr, setLoginErr] = useState("");
+  const scrollStorageKey = useMemo(() => `rsiem:scroll:${pathname}`, [pathname]);
 
   useEffect(() => {
     const now = Date.now();
@@ -81,6 +85,33 @@ export function AppShell({ children }: { children: ReactNode }) {
     setCustomTo(searchParams.get("gto") || "");
     setLive(searchParams.get("live") !== "0");
   }, [searchParams]);
+
+  useEffect(() => {
+    const el = mainRef.current;
+    if (!el || typeof window === "undefined") return;
+    const saved = window.sessionStorage.getItem(scrollStorageKey);
+    if (!saved) return;
+    const nextTop = Number(saved);
+    if (!Number.isFinite(nextTop) || nextTop < 0) return;
+    const frame = window.requestAnimationFrame(() => {
+      el.scrollTop = nextTop;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [pathname, searchParams, scrollStorageKey]);
+
+  useEffect(() => {
+    const el = mainRef.current;
+    if (!el || typeof window === "undefined") return;
+    const persistScroll = () => {
+      window.sessionStorage.setItem(scrollStorageKey, String(el.scrollTop));
+    };
+    persistScroll();
+    el.addEventListener("scroll", persistScroll, { passive: true });
+    return () => {
+      persistScroll();
+      el.removeEventListener("scroll", persistScroll);
+    };
+  }, [scrollStorageKey]);
 
   useEffect(() => {
     let cancelled = false;
@@ -187,13 +218,24 @@ export function AppShell({ children }: { children: ReactNode }) {
       params.set("gfrom", String(from));
       params.set("gto", String(now));
     }
-    router.push(`${pathname}?${params.toString()}`);
+    if (typeof window !== "undefined" && mainRef.current) {
+      window.sessionStorage.setItem(scrollStorageKey, String(mainRef.current.scrollTop));
+    }
+    router.push(`${pathname}?${params.toString()}`, { scroll: false });
   };
 
   const quickNow = useMemo(() => {
     if (!mounted || lastRefresh <= 0) return "--:--:--";
     return new Date(lastRefresh).toLocaleTimeString();
   }, [mounted, lastRefresh]);
+
+  const navItems = useMemo(() => {
+    const items = [...NAV];
+    if (authUser?.role === "admin") {
+      items.splice(items.length - 1, 0, { href: "/models", label: "Models", icon: Settings2 });
+    }
+    return items;
+  }, [authUser]);
 
   const doLogin = async () => {
     try {
@@ -331,7 +373,7 @@ export function AppShell({ children }: { children: ReactNode }) {
       <div className="grid min-h-0 flex-1 grid-cols-1 gap-4 md:grid-cols-[280px_minmax(0,1fr)]">
         <aside className="panel overflow-auto p-3">
           <nav className="space-y-1.5">
-            {NAV.map((item) => {
+            {navItems.map((item) => {
               const active = item.href === "/" ? pathname === "/" : pathname.startsWith(item.href);
               const Icon = item.icon;
               return (
@@ -355,7 +397,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           </nav>
         </aside>
 
-        <main className="panel min-h-0 overflow-auto p-3 md:p-5">{children}</main>
+        <main ref={mainRef} className="panel min-h-0 overflow-auto p-3 md:p-5">{children}</main>
       </div>
       </div>
     </div>

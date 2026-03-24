@@ -17,6 +17,13 @@ type SavedView = {
   severity?: string;
 };
 
+type TrayStat = {
+  label: string;
+  value: number;
+  tone?: string;
+  hint: string;
+};
+
 const DEFAULT_VIEWS: SavedView[] = [
   { name: "Triage", view: "active", status: "RUNNING" },
   { name: "FAST Pending", view: "active", lane: "FAST", status: "WAITING_APPROVAL" },
@@ -94,6 +101,7 @@ export default function IncidentsPage() {
     | "entities"
     | "evidence"
     | "actions"
+    | "logic"
     | "");
   const [toasts, setToasts] = useState<Array<{ id: number; tone: "success" | "error"; message: string }>>([]);
   const [items, setItems] = useState<Incident[]>([]);
@@ -205,6 +213,25 @@ export default function IncidentsPage() {
   }, []);
 
   const pages = useMemo(() => Math.max(1, Math.ceil(total / limit)), [total, limit]);
+  const trayStats = useMemo<TrayStat[]>(() => {
+    const waitingApproval = items.filter((item) => item.status?.toUpperCase() === "WAITING_APPROVAL").length;
+    const manualReview = items.filter((item) => item.status?.toUpperCase() === "MANUAL_REVIEW_REQUIRED").length;
+    const autoContained = items.filter(
+      (item) =>
+        item.status?.toUpperCase() === "SUCCEEDED" &&
+        (item.playbook_reversibility || "").toLowerCase().includes("reversible")
+    ).length;
+    const failedSafe = items.filter((item) => item.status?.toUpperCase() === "FAILED_SAFE").length;
+    const highPriority = items.filter((item) => ["high", "critical"].includes((item.severity || "").toLowerCase())).length;
+    return [
+      { label: "Visible threats", value: items.length, hint: "Current rows in this filtered tray." },
+      { label: "Awaiting approval", value: waitingApproval, tone: "text-amber-200", hint: "Manual analyst decisions blocking FAST actions." },
+      { label: "Manual review", value: manualReview, tone: "text-fuchsia-200", hint: "Runs that timed out or require analyst-led follow-up." },
+      { label: "Auto-contained", value: autoContained, tone: "text-emerald-200", hint: "Reversible runs that completed successfully." },
+      { label: "Failed safe", value: failedSafe, tone: "text-rose-200", hint: "Runs stopped safely and need investigation." },
+      { label: "High / critical", value: highPriority, tone: "text-cyan-200", hint: "High-priority work inside this queue slice." }
+    ];
+  }, [items]);
 
   const saveView = (view: SavedView) => {
     localStorage.setItem("rsiem-saved-view", JSON.stringify(view));
@@ -227,7 +254,7 @@ export default function IncidentsPage() {
   };
 
   return (
-    <section className="flex h-full min-h-0 flex-col gap-4 overflow-auto">
+    <section className="flex h-full min-h-0 flex-col gap-4">
       {toasts.length > 0 ? (
         <div className="fixed right-6 top-6 z-50 flex max-w-sm flex-col gap-2">
           {toasts.map((toast) => (
@@ -277,10 +304,19 @@ export default function IncidentsPage() {
 
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h2 className="text-[18px] font-semibold">Incident Queue</h2>
-          <p className="text-[13px] text-ink-300">SOC queue with deterministic sort/paging, triage filters, and drawer investigation.</p>
+          <h2 className="text-[18px] font-semibold">Threat Tray</h2>
+          <p className="text-[13px] text-ink-300">Primary analyst queue for triage, approvals, investigation pivots, and response execution.</p>
         </div>
         <div className="flex flex-wrap items-center gap-2 text-xs">
+          <Link className="btn-secondary px-3 py-1 text-xs" href="/search">
+            Advanced Search
+          </Link>
+          <Link className="btn-secondary px-3 py-1 text-xs" href="/endpoints">
+            Entity Pages
+          </Link>
+          <Link className="btn-secondary px-3 py-1 text-xs" href="/dashboard">
+            System Views
+          </Link>
           {refreshing ? (
             <div className="rounded border border-ink-700/80 bg-ink-900/60 px-2 py-1 text-[11px] text-ink-300">
               Refreshing...
@@ -315,6 +351,16 @@ export default function IncidentsPage() {
             </button>
           ) : null}
         </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-6">
+        {trayStats.map((stat) => (
+          <div key={stat.label} className="panel-elevated p-3">
+            <div className="text-[11px] uppercase tracking-[0.08em] text-ink-400">{stat.label}</div>
+            <div className={`mt-2 text-[24px] font-semibold ${stat.tone || "text-ink-100"}`}>{stat.value}</div>
+            <div className="mt-1 text-[11px] text-ink-400">{stat.hint}</div>
+          </div>
+        ))}
       </div>
 
       <div className="sticky top-2 z-20 panel-elevated grid grid-cols-1 gap-2 p-2 md:grid-cols-10">
@@ -353,6 +399,9 @@ export default function IncidentsPage() {
             {v.name}
           </button>
         ))}
+        <div className="rounded border border-ink-700/70 bg-ink-900/40 px-3 py-1 text-[11px] text-ink-300">
+          Click any row to open the investigation workspace, response history, advanced search pivots, and model logic.
+        </div>
       </div>
 
       {loading && !hasLoadedOnce ? <LoadingState /> : null}

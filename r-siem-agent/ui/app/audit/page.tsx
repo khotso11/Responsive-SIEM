@@ -46,6 +46,14 @@ function auditMessageLabel(msg: string): string {
       return "Access Restore Failed Safe";
     case "auth_access_restore_failed":
       return "Access Restore Failed";
+    case "ui_model_change_proposed":
+      return "Model Change Proposed";
+    case "ui_model_change_approved":
+      return "Model Change Approved";
+    case "ui_model_change_rejected":
+      return "Model Change Rejected";
+    case "ui_model_change_applied":
+      return "Model Change Applied";
     default:
       return msg;
   }
@@ -189,7 +197,7 @@ export default function AuditPage() {
   };
 
   return (
-    <section className="flex h-full min-h-0 flex-col gap-4 overflow-auto">
+    <section className="flex h-full min-h-0 flex-col gap-4">
       {toasts.length > 0 ? (
         <div className="fixed right-6 top-6 z-50 flex max-w-sm flex-col gap-2">
           {toasts.map((toast) => (

@@ -4,12 +4,26 @@ import {
   DashboardIncidentPoint,
   DashboardSummary,
   EndpointsGeoResponse,
+  EndpointDetailSummary,
   EndpointSummary,
+  EventSearchQuery,
+  EventSearchResponse,
   EventRow,
+  EntityProfileResponse,
   Incident,
   IncidentDetailResponse,
+  IncidentLogicResponse,
   IncidentListResponse,
+  InvestigationProvidersResponse,
   InvestigationResponse,
+  ModelCatalogResponse,
+  ModelDetailResponse,
+  ModelEditorPatch,
+  ModelProposalsResponse,
+  ModelValidationResponse,
+  ResponseHistoryResponse,
+  ResponseActionFleetResponse,
+  ResponseActionListResponse,
   SearchResponse,
   StepResult
 } from "@/lib/types";
@@ -133,6 +147,39 @@ export async function getIncidents(query = ""): Promise<IncidentListResponse> {
 
 export async function getIncident(runId: string): Promise<IncidentDetailResponse> {
   return apiFetch(`/api/incidents/${encodeURIComponent(runId)}`);
+}
+
+export async function getIncidentLogic(runId: string): Promise<IncidentLogicResponse> {
+  return apiFetch(`/api/incidents/${encodeURIComponent(runId)}/logic`);
+}
+
+export async function getIncidentResponseHistory(runId: string): Promise<ResponseHistoryResponse> {
+  return apiFetch(`/api/incidents/${encodeURIComponent(runId)}/response-history`);
+}
+
+export async function getIncidentActions(runId: string): Promise<ResponseActionListResponse> {
+  return apiFetch(`/api/incidents/${encodeURIComponent(runId)}/actions`);
+}
+
+export async function postIncidentAction(
+  runId: string,
+  body: { actor?: string; action_name: string; duration_ms?: number; reason?: string; reference?: string; target?: string; target_agent_id?: string }
+): Promise<{ ok: boolean; action: any }> {
+  return apiFetch(`/api/incidents/${encodeURIComponent(runId)}/actions`, {
+    method: "POST",
+    body: JSON.stringify(body)
+  });
+}
+
+export async function clearIncidentAction(
+  runId: string,
+  actionId: string,
+  body: { actor?: string; reason?: string; reference?: string } = {}
+): Promise<{ ok: boolean; action: any }> {
+  return apiFetch(`/api/incidents/${encodeURIComponent(runId)}/actions/${encodeURIComponent(actionId)}/clear`, {
+    method: "POST",
+    body: JSON.stringify(body)
+  });
 }
 
 export async function downloadIncidentReport(runId: string, format: "json" | "html" | "pdf"): Promise<void> {
@@ -292,12 +339,55 @@ export async function getEndpointEvents(nodeID: string, query = ""): Promise<{ i
   return apiFetch(`/api/endpoints/${encodeURIComponent(nodeID)}/events${query ? `?${query}` : ""}`);
 }
 
+export async function getEndpointSummary(nodeID: string, query = ""): Promise<{ summary: EndpointDetailSummary; source: string }> {
+  return apiFetch(`/api/endpoints/${encodeURIComponent(nodeID)}/summary${query ? `?${query}` : ""}`);
+}
+
 export async function getEndpointRuns(nodeID: string, limit = 50): Promise<{ items: Incident[]; count: number; source: string }> {
   return apiFetch(`/api/endpoints/${encodeURIComponent(nodeID)}/runs?limit=${limit}`);
 }
 
+export async function getEndpointActions(nodeID: string): Promise<ResponseActionListResponse> {
+  return apiFetch(`/api/endpoints/${encodeURIComponent(nodeID)}/actions`);
+}
+
+export async function getFleetActions(query: Record<string, string | number | undefined> = {}): Promise<ResponseActionFleetResponse> {
+  const qs = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) {
+    if (value !== undefined && value !== null && String(value).trim() !== "") {
+      qs.set(key, String(value));
+    }
+  }
+  return apiFetch(`/api/actions${qs.toString() ? `?${qs.toString()}` : ""}`);
+}
+
+export async function postEndpointAction(
+  nodeID: string,
+  body: { actor?: string; action_name: string; duration_ms?: number; reason?: string; reference?: string; target?: string; target_agent_id?: string }
+): Promise<{ ok: boolean; action: any }> {
+  return apiFetch(`/api/endpoints/${encodeURIComponent(nodeID)}/actions`, {
+    method: "POST",
+    body: JSON.stringify(body)
+  });
+}
+
+export async function clearEndpointAction(
+  nodeID: string,
+  actionId: string,
+  body: { actor?: string; reason?: string; reference?: string } = {}
+): Promise<{ ok: boolean; action: any }> {
+  return apiFetch(`/api/endpoints/${encodeURIComponent(nodeID)}/actions/${encodeURIComponent(actionId)}/clear`, {
+    method: "POST",
+    body: JSON.stringify(body)
+  });
+}
+
 export async function getInvestigation(runId: string): Promise<InvestigationResponse> {
   return apiFetch(`/api/incidents/${encodeURIComponent(runId)}/investigation`);
+}
+
+export async function getInvestigationProviders(): Promise<InvestigationProvidersResponse> {
+  return apiFetch("/api/investigation/providers");
 }
 
 export async function refreshInvestigation(runId: string): Promise<{ ok: boolean; job_id: string; observables: number }> {
@@ -331,6 +421,50 @@ export async function getSearch(query: string, from?: number, to?: number, limit
   return apiFetch(`/api/search?${qs.toString()}`);
 }
 
+export async function getSearchEvents(query: EventSearchQuery = {}): Promise<EventSearchResponse> {
+  const qs = new URLSearchParams();
+  const entries: Array<[string, string | number | undefined]> = [
+    ["q", query.q],
+    ["from", query.from],
+    ["to", query.to],
+    ["node_id", query.node_id],
+    ["user_name", query.user_name],
+    ["src_ip", query.src_ip],
+    ["dst_ip", query.dst_ip],
+    ["dst_port", query.dst_port],
+    ["protocol_family", query.protocol_family],
+    ["source_type", query.source_type],
+    ["event_type", query.event_type],
+    ["rule_id", query.rule_id],
+    ["severity", query.severity],
+    ["comm", query.comm],
+    ["exec_path", query.exec_path],
+    ["cmdline", query.cmdline],
+    ["dns_name", query.dns_name],
+    ["file_sha256", query.file_sha256],
+    ["exec_sha256", query.exec_sha256],
+    ["event_idem_key", query.event_idem_key],
+    ["raw_line_sha256", query.raw_line_sha256],
+    ["page", query.page],
+    ["limit", query.limit],
+    ["sort", query.sort]
+  ];
+  for (const [key, value] of entries) {
+    if (value !== undefined && value !== null && String(value).trim() !== "") {
+      qs.set(key, String(value));
+    }
+  }
+  return apiFetch(`/api/search/events${qs.toString() ? `?${qs.toString()}` : ""}`);
+}
+
+export async function getEntityIP(ip: string): Promise<EntityProfileResponse> {
+  return apiFetch(`/api/entities/ip/${encodeURIComponent(ip)}`);
+}
+
+export async function getEntityUser(user: string): Promise<EntityProfileResponse> {
+  return apiFetch(`/api/entities/user/${encodeURIComponent(user)}`);
+}
+
 export async function getArtifacts(
   prefix: string,
   opts?: { q?: string; page?: number; limit?: number }
@@ -345,6 +479,64 @@ export async function getArtifacts(
 
 export async function getAdminUsers(): Promise<{ items: Array<{ username: string; role: string; disabled: boolean }>; count: number }> {
   return apiFetch("/api/users");
+}
+
+export async function getModels(): Promise<ModelCatalogResponse> {
+  return apiFetch("/api/models");
+}
+
+export async function getModelDetail(kind: string, id: string): Promise<ModelDetailResponse> {
+  return apiFetch(`/api/models/${encodeURIComponent(kind)}/${encodeURIComponent(id)}`);
+}
+
+export async function validateModelChange(kind: string, id: string, changes: ModelEditorPatch, summary = ""): Promise<ModelValidationResponse> {
+  return apiFetch(`/api/models/${encodeURIComponent(kind)}/${encodeURIComponent(id)}/validate`, {
+    method: "POST",
+    body: JSON.stringify({ summary, changes })
+  });
+}
+
+export async function proposeModelChange(kind: string, id: string, changes: ModelEditorPatch, summary = ""): Promise<{ ok: boolean; proposal_id: string; warnings?: string[] }> {
+  return apiFetch(`/api/models/${encodeURIComponent(kind)}/${encodeURIComponent(id)}/propose`, {
+    method: "POST",
+    body: JSON.stringify({ summary, changes })
+  });
+}
+
+export async function getModelProposals(): Promise<ModelProposalsResponse> {
+  return apiFetch("/api/models/proposals");
+}
+
+export async function approveModelProposal(proposalId: string): Promise<{ ok: boolean; proposal_id: string; status: string }> {
+  return apiFetch(`/api/models/proposals/${encodeURIComponent(proposalId)}/approve`, {
+    method: "POST",
+    body: JSON.stringify({})
+  });
+}
+
+export async function rejectModelProposal(proposalId: string): Promise<{ ok: boolean; proposal_id: string; status: string }> {
+  return apiFetch(`/api/models/proposals/${encodeURIComponent(proposalId)}/reject`, {
+    method: "POST",
+    body: JSON.stringify({})
+  });
+}
+
+export async function applyModelProposal(
+  proposalId: string,
+  restartTargets: string[] = []
+): Promise<{
+  ok: boolean;
+  proposal_id: string;
+  backup_path?: string;
+  restart_targets?: string[];
+  restart_results?: Array<{ target: string; ok: boolean; pid?: number; log_file?: string; error?: string }>;
+  effective_after_restart: boolean;
+  live_reload_supported: boolean;
+}> {
+  return apiFetch(`/api/models/proposals/${encodeURIComponent(proposalId)}/apply`, {
+    method: "POST",
+    body: JSON.stringify({ restart_targets: restartTargets })
+  });
 }
 
 export async function upsertAdminUser(payload: { username: string; role: string; disabled?: boolean; password?: string }): Promise<{ ok: boolean }> {

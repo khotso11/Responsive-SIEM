@@ -63,6 +63,37 @@ func TestEnrichNetworkEventIdentityDoesNotUseExpiredContext(t *testing.T) {
 	}
 }
 
+func TestEnrichNetworkEventIdentityBackfillsExecContextWhenUserKnown(t *testing.T) {
+	recentSuspiciousProcContext = newRecentProcessContextTracker(2 * time.Minute)
+	recentSuspiciousProcContext.Observe("node-a", recentProcessContext{
+		User:       "alice",
+		ExecPath:   "/usr/bin/nmap",
+		Comm:       "nmap",
+		Cmdline:    "/usr/bin/nmap -Pn -n -p 5985 172.30.50.11",
+		ObservedAt: 10_000,
+	})
+
+	enriched := enrichNetworkEventIdentity(rawEvent{
+		EventType:        "network_connection",
+		NodeID:           "node-a",
+		User:             "alice",
+		ObservedAtUnixMs: 10_500,
+	})
+
+	if enriched.User != "alice" {
+		t.Fatalf("expected user alice, got %q", enriched.User)
+	}
+	if enriched.ExecPath != "/usr/bin/nmap" {
+		t.Fatalf("expected exec_path to be inherited, got %q", enriched.ExecPath)
+	}
+	if enriched.Comm != "nmap" {
+		t.Fatalf("expected comm to be inherited, got %q", enriched.Comm)
+	}
+	if enriched.Cmdline != "/usr/bin/nmap -Pn -n -p 5985 172.30.50.11" {
+		t.Fatalf("expected cmdline to be inherited, got %q", enriched.Cmdline)
+	}
+}
+
 func TestInternalSMBScanRequiresFanoutThreshold(t *testing.T) {
 	configPathCfg, err := config.LoadDetector("../../configs/detector.yaml")
 	if err != nil {
@@ -114,15 +145,15 @@ func TestAuditdConnectInternalScanIsNotMisclassifiedAsProcess(t *testing.T) {
 	resetDetectorRegressionState(configPathCfg)
 
 	base := rawEvent{
-		EventType: "network_connection",
+		EventType:  "network_connection",
 		SourceType: "auditd_connect",
-		NodeID:    "khotso-Latitude-5500",
-		Host:      "khotso-Latitude-5500",
-		User:      "khotso",
-		ExecPath:  "/usr/bin/nmap",
-		Comm:      "nmap",
-		Cmdline:   "/usr/bin/nmap -Pn -n -sT -p 445 172.30.50.11 172.30.50.12 172.30.50.13 172.30.50.14 172.30.50.15",
-		DstPort:   445,
+		NodeID:     "khotso-Latitude-5500",
+		Host:       "khotso-Latitude-5500",
+		User:       "khotso",
+		ExecPath:   "/usr/bin/nmap",
+		Comm:       "nmap",
+		Cmdline:    "/usr/bin/nmap -Pn -n -sT -p 445 172.30.50.11 172.30.50.12 172.30.50.13 172.30.50.14 172.30.50.15",
+		DstPort:    445,
 	}
 
 	for i, dst := range []string{"172.30.50.11", "172.30.50.12", "172.30.50.13", "172.30.50.14"} {
@@ -161,15 +192,15 @@ func TestInternalScanApprovedSourceUsesUserAllowlistNotToolNameOnly(t *testing.T
 	resetDetectorRegressionState(configPathCfg)
 
 	base := rawEvent{
-		EventType: "network_connection",
+		EventType:  "network_connection",
 		SourceType: "auditd_connect",
-		NodeID:    "scanner-appliance-01",
-		Host:      "scanner-appliance-01",
-		User:      "admin",
-		ExecPath:  "/usr/bin/nmap",
-		Comm:      "nmap",
-		Cmdline:   "/usr/bin/nmap -Pn -n -sT -p 445 172.30.50.11 172.30.50.12 172.30.50.13 172.30.50.14 172.30.50.15",
-		DstPort:   445,
+		NodeID:     "scanner-appliance-01",
+		Host:       "scanner-appliance-01",
+		User:       "admin",
+		ExecPath:   "/usr/bin/nmap",
+		Comm:       "nmap",
+		Cmdline:    "/usr/bin/nmap -Pn -n -sT -p 445 172.30.50.11 172.30.50.12 172.30.50.13 172.30.50.14 172.30.50.15",
+		DstPort:    445,
 	}
 
 	for i, dst := range []string{"172.30.50.11", "172.30.50.12", "172.30.50.13", "172.30.50.14"} {

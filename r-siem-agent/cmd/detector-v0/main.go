@@ -413,11 +413,13 @@ func enrichNetworkEventIdentity(evt rawEvent) rawEvent {
 	if !eventTypeIs(evt.EventType, "network", "network_connection") {
 		return evt
 	}
+	missingUser := false
 	user := strings.ToLower(strings.TrimSpace(evt.User))
-	if user != "" && user != "unknown" {
-		return evt
+	if user == "" || user == "unknown" {
+		missingUser = true
 	}
-	if strings.TrimSpace(evt.ExecPath) != "" || strings.TrimSpace(evt.Comm) != "" || strings.TrimSpace(evt.Cmdline) != "" {
+	missingExecContext := strings.TrimSpace(evt.ExecPath) == "" || strings.TrimSpace(evt.Comm) == "" || strings.TrimSpace(evt.Cmdline) == ""
+	if !missingUser && !missingExecContext {
 		return evt
 	}
 	nodeKey := detectorNodeID(evt)
@@ -431,7 +433,7 @@ func enrichNetworkEventIdentity(evt rawEvent) rawEvent {
 	if !ok {
 		return evt
 	}
-	if strings.TrimSpace(evt.User) == "" || strings.EqualFold(strings.TrimSpace(evt.User), "unknown") {
+	if missingUser {
 		evt.User = ctx.User
 	}
 	if strings.TrimSpace(evt.ExecPath) == "" {

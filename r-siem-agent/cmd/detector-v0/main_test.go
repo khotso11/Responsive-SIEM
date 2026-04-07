@@ -224,3 +224,122 @@ func TestInternalScanApprovedSourceUsesUserAllowlistNotToolNameOnly(t *testing.T
 		t.Fatalf("rule_id=%q want %q", match.RuleID, internalApprovedScanRuleID)
 	}
 }
+
+func TestInfrastructureFirewallDenyBurstMatchesAtThreshold(t *testing.T) {
+	cfg, err := config.LoadDetector("../../configs/detector.yaml")
+	if err != nil {
+		t.Fatalf("load detector config: %v", err)
+	}
+	resetDetectorRegressionState(cfg)
+
+	base := rawEvent{
+		EventType:        "syslog",
+		SourceType:       "syslog",
+		Host:             "fw-01",
+		NodeID:           "collector-syslog",
+		SrcIP:            "10.10.0.22",
+		ObservedAtUnixMs: 0,
+	}
+	msg := "<134>Apr 07 20:00:00 fw-01 firewall policy denied src=10.30.0.11 dst=10.20.30.11 dpt=443"
+	for i := 0; i < 4; i++ {
+		evt := base
+		evt.ObservedAtUnixMs = int64((i + 1) * 1000)
+		match, ok := matchRule(msg, evt)
+		if ok {
+			t.Fatalf("unexpected early match at i=%d: %+v", i, match)
+		}
+	}
+
+	final := base
+	final.ObservedAtUnixMs = 5_000
+	match, ok := matchRule(msg, final)
+	if !ok {
+		t.Fatal("expected firewall deny burst match")
+	}
+	if match.RuleID != infraFirewallDenyRuleID {
+		t.Fatalf("rule_id=%q want %q", match.RuleID, infraFirewallDenyRuleID)
+	}
+	if match.GroupKey != "fw-01" {
+		t.Fatalf("group_key=%q want fw-01", match.GroupKey)
+	}
+}
+
+func TestInfrastructureNetworkAdminLoginMatchesAdminUser(t *testing.T) {
+	cfg, err := config.LoadDetector("../../configs/detector.yaml")
+	if err != nil {
+		t.Fatalf("load detector config: %v", err)
+	}
+	resetDetectorRegressionState(cfg)
+
+	evt := rawEvent{
+		EventType:        "syslog",
+		SourceType:       "syslog",
+		Host:             "edge-rtr-01",
+		NodeID:           "collector-syslog",
+		SrcIP:            "10.10.0.21",
+		ObservedAtUnixMs: 1_000,
+	}
+	msg := "<134>Apr 07 20:00:00 edge-rtr-01 sshd[123]: Accepted password for admin from 10.30.0.11 port 2222 ssh2"
+	match, ok := matchRule(msg, evt)
+	if !ok {
+		t.Fatal("expected infrastructure admin login match")
+	}
+	if match.RuleID != infraNetworkAdminRuleID {
+		t.Fatalf("rule_id=%q want %q", match.RuleID, infraNetworkAdminRuleID)
+	}
+	if match.GroupKey != "edge-rtr-01" {
+		t.Fatalf("group_key=%q want edge-rtr-01", match.GroupKey)
+	}
+}
+
+func TestInfrastructureLinkFlapBurstUsesRecentTrapCorroboration(t *testing.T) {
+	cfg, err := config.LoadDetector("../../configs/detector.yaml")
+	if err != nil {
+		t.Fatalf("load detector config: %v", err)
+	}
+	resetDetectorRegressionState(cfg)
+
+	trapEvt := rawEvent{
+		EventType:        "snmp_trap",
+		SourceType:       "snmp_trap",
+		Host:             "sw-core-01",
+		SrcIP:            "10.10.0.23",
+		ObservedAtUnixMs: 500,
+	}
+	if match, ok := matchRule("snmp trap", trapEvt); ok {
+		t.Fatalf("unexpected trap match: %+v", match)
+	}
+
+	base := rawEvent{
+		EventType:  "syslog",
+		SourceType: "syslog",
+		Host:       "sw-core-01",
+		NodeID:     "collector-syslog",
+		SrcIP:      "10.10.0.23",
+	}
+	msg := "<134>Apr 07 20:00:00 sw-core-01 interface Gi0/1 changed state to down"
+	for i := 0; i < 2; i++ {
+		evt := base
+		evt.ObservedAtUnixMs = int64((i + 1) * 1000)
+		match, ok := matchRule(msg, evt)
+		if ok {
+			t.Fatalf("unexpected early link event match at i=%d: %+v", i, match)
+		}
+	}
+
+	final := base
+	final.ObservedAtUnixMs = 3_000
+	match, ok := matchRule(msg, final)
+	if !ok {
+		t.Fatal("expected link flap burst match")
+	}
+	if match.RuleID != infraLinkFlapRuleID {
+		t.Fatalf("rule_id=%q want %q", match.RuleID, infraLinkFlapRuleID)
+	}
+	if match.GroupKey != "sw-core-01" {
+		t.Fatalf("group_key=%q want sw-core-01", match.GroupKey)
+	}
+	if match.ConfidenceScore != 84 {
+		t.Fatalf("confidence=%d want 84", match.ConfidenceScore)
+	}
+}

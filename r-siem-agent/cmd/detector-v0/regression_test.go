@@ -125,7 +125,9 @@ func resetDetectorRegressionState(cfg *config.DetectorConfig) {
 	recentSuspiciousProcContext = newRecentProcessContextTracker(2 * time.Minute)
 	recentAuthProcByNode = newLastSeenTracker(5 * time.Minute)
 	recentFileAlertByPath = newLastSeenTracker(15 * time.Second)
+	recentInfrastructureTrapBySource = newLastSeenTracker(2 * time.Minute)
 	initNetworkPolicy(cfg)
+	initInfrastructurePolicy(cfg)
 	initBaselinePolicy(cfg)
 }
 

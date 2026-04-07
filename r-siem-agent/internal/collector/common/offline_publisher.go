@@ -50,12 +50,22 @@ func NewOfflinePublisher(cfg OfflinePublisherConfig, logger *slog.Logger) (*Offl
 	if logger == nil {
 		logger = slog.Default()
 	}
-	spoolPath, err := resolveSpoolPath(cfg.Name, strings.TrimSpace(cfg.SpoolPath))
+	configuredSpoolPath := strings.TrimSpace(cfg.SpoolPath)
+	spoolPath, err := resolveSpoolPath(cfg.Name, configuredSpoolPath)
 	if err != nil {
 		return nil, err
 	}
 	spool, err := openMessageSpool(spoolPath, cfg.SpoolFsync)
 	if err != nil {
+		if configuredSpoolPath == "" {
+			fallbackPath := fallbackSpoolPath(cfg.Name)
+			if fallbackPath != spoolPath && shouldRetryWithFallback(err) {
+				spool, fallbackErr := openMessageSpool(fallbackPath, cfg.SpoolFsync)
+				if fallbackErr == nil {
+					return &OfflinePublisher{cfg: cfg, logger: logger, spool: spool}, nil
+				}
+			}
+		}
 		return nil, err
 	}
 	return &OfflinePublisher{cfg: cfg, logger: logger, spool: spool}, nil
@@ -71,11 +81,19 @@ func resolveSpoolPath(name, configured string) (string, error) {
 			return preferred, nil
 		}
 	}
-	fallback := filepath.Join("/tmp", fmt.Sprintf("%s.spool.jsonl", name))
+	fallback := fallbackSpoolPath(name)
 	if err := os.MkdirAll(filepath.Dir(fallback), 0o755); err != nil {
 		return "", fmt.Errorf("create fallback spool directory: %w", err)
 	}
 	return fallback, nil
+}
+
+func fallbackSpoolPath(name string) string {
+	return filepath.Join("/tmp", fmt.Sprintf("%s.spool.jsonl", name))
+}
+
+func shouldRetryWithFallback(err error) bool {
+	return errors.Is(err, os.ErrPermission) || errors.Is(err, os.ErrNotExist)
 }
 
 func (p *OfflinePublisher) Start(ctx context.Context) {

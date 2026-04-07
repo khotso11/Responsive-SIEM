@@ -106,3 +106,57 @@ dns:
     - .zip
     - .mov
     - .cam
+
+infrastructure:
+  firewall_deny:
+    threshold: 5
+    window_ms: 60000
+    keywords:
+      - " deny "
+      - " denied "
+      - " blocked "
+      - " reject "
+      - " rejected "
+      - " drop "
+      - " dropped "
+    context_keywords:
+      - firewall
+      - policy
+      - acl
+      - iptables
+      - nft
+      - pf
+      - "src="
+      - "dst="
+      - "src "
+      - "dst "
+  network_admin_login:
+    success_keywords:
+      - "accepted password"
+      - "login successful"
+      - "logged in"
+      - "authentication succeeded"
+      - "ssh login"
+      - "user login"
+    admin_users:
+      - admin
+      - administrator
+      - root
+      - netadmin
+      - fwadmin
+  link_flap:
+    threshold: 3
+    window_ms: 300000
+    down_keywords:
+      - "link down"
+      - "interface down"
+      - "changed state to down"
+      - "line protocol down"
+      - "port down"
+    up_keywords:
+      - "link up"
+      - "interface up"
+      - "changed state to up"
+      - "line protocol up"
+      - "port up"
+      - flapping

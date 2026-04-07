@@ -1,0 +1,244 @@
+lab:
+  id: emulated-infrastructure-v1
+  description: >-
+    Emulated infrastructure plane for R-SIEM using virtual routers, firewall, switch
+    segments, Windows and Linux endpoints, and a management node running the master stack.
+
+management_plane:
+  rsiem_master:
+    hostname: rsiem-master-01
+    role: management
+    ip: 10.10.0.10/24
+    services:
+      - nats-jetstream
+      - master-roe
+      - master-roe-worker
+      - detector-v0
+      - ui-api
+      - ui-web
+      - investigation-enricher
+      - postgres-timescaledb
+    collector_endpoints:
+      syslog_udp: 10.10.0.10:5140
+      netflow_v5: 10.10.0.10:2055
+      snmp_trap: 10.10.0.10:9162
+
+networks:
+  management:
+    cidr: 10.10.0.0/24
+    purpose: control plane and collector destinations
+  user_lan:
+    cidr: 10.20.10.0/24
+    purpose: user workstation segment
+  server_lan:
+    cidr: 10.20.20.0/24
+    purpose: application and database servers
+  dmz:
+    cidr: 10.20.30.0/24
+    purpose: exposed services and inspection targets
+  red_team:
+    cidr: 10.30.0.0/24
+    purpose: attacker simulation segment
+
+nodes:
+  - id: edge-rtr-01
+    role: router
+    mgmt_ip: 10.10.0.21/24
+    data_ips:
+      - 10.20.10.1/24
+      - 10.20.20.1/24
+      - 10.20.30.1/24
+      - 10.30.0.1/24
+    telemetry_exports:
+      - type: syslog
+        destination: 10.10.0.10:5140
+      - type: snmp_trap
+        destination: 10.10.0.10:9162
+
+  - id: fw-01
+    role: firewall_gateway
+    mgmt_ip: 10.10.0.22/24
+    data_ips:
+      - 10.20.30.254/24
+      - 10.30.0.254/24
+    telemetry_exports:
+      - type: syslog
+        destination: 10.10.0.10:5140
+      - type: netflow_v5
+        destination: 10.10.0.10:2055
+      - type: snmp_trap
+        destination: 10.10.0.10:9162
+
+  - id: sw-core-01
+    role: switch_segment
+    mgmt_ip: 10.10.0.23/24
+    telemetry_exports:
+      - type: syslog
+        destination: 10.10.0.10:5140
+      - type: snmp_trap
+        destination: 10.10.0.10:9162
+
+  - id: linux-endpoint-01
+    role: managed_endpoint
+    os: linux
+    ip: 10.20.10.11/24
+    agent_support: true
+    telemetry_exports:
+      - type: agent_grpc_mtls
+        destination: 10.10.0.10:7777
+      - type: nats
+        destination: 10.10.0.10:4222
+      - type: proc_net
+      - type: auditd
+      - type: inotify
+      - type: dns
+
+  - id: linux-endpoint-02
+    role: managed_endpoint
+    os: linux
+    ip: 10.20.10.12/24
+    agent_support: true
+    telemetry_exports:
+      - type: agent_grpc_mtls
+        destination: 10.10.0.10:7777
+      - type: nats
+        destination: 10.10.0.10:4222
+      - type: proc_net
+      - type: auditd
+      - type: inotify
+      - type: dns
+
+  - id: win-endpoint-01
+    role: managed_endpoint
+    os: windows
+    ip: 10.20.10.21/24
+    agent_support: true
+    telemetry_exports:
+      - type: agent_grpc_mtls
+        destination: 10.10.0.10:7777
+      - type: nats
+        destination: 10.10.0.10:4222
+      - type: collector_tail
+        path: C:\\ProgramData\\rsiem\\logs\\endpoint.log
+    note: >-
+      Windows endpoint packaging and service installation exist in the repo. Linux has been
+      exercised more heavily in live tests.
+
+  - id: app-srv-01
+    role: server
+    os: linux
+    ip: 10.20.20.11/24
+    agent_support: true
+
+  - id: db-srv-01
+    role: server
+    os: linux
+    ip: 10.20.20.12/24
+    agent_support: true
+
+  - id: dmz-srv-01
+    role: dmz_service
+    os: linux
+    ip: 10.20.30.11/24
+    agent_support: false
+
+  - id: attacker-01
+    role: attacker_simulation
+    os: linux
+    ip: 10.30.0.11/24
+    agent_support: false
+
+telemetry_mapping:
+  - source: device_syslog
+    exporters:
+      - edge-rtr-01
+      - fw-01
+      - sw-core-01
+    collector_binary: cmd/collector-syslog/main.go
+    collector_config: configs/collector-syslog.yaml
+    source_type: syslog
+    nats_stream: RSIEM_EVENTS
+    nats_subject: rsiem.events.raw
+    expected_use_cases:
+      - device_login
+      - firewall_deny
+      - config_commit
+      - route_change
+      - interface_state
+
+  - source: flow_export
+    exporters:
+      - fw-01
+    collector_binary: cmd/collector-netflowv5/main.go
+    collector_config: configs/collector-netflowv5.yaml
+    source_type: netflow_v5
+    nats_stream: RSIEM_EVENTS
+    nats_subject: rsiem.events.raw
+    expected_use_cases:
+      - east_west_scan
+      - dmz_connection_attempt
+      - egress_beacon_pattern
+      - denied_or_short_lived_flow_burst
+
+  - source: device_trap
+    exporters:
+      - edge-rtr-01
+      - fw-01
+      - sw-core-01
+    collector_binary: cmd/collector-snmptrap/main.go
+    collector_config: configs/collector-snmptrap.yaml
+    source_type: snmp_trap
+    nats_stream: RSIEM_EVENTS
+    nats_subject: rsiem.events.raw
+    expected_use_cases:
+      - link_down
+      - link_up
+      - cold_start
+      - auth_failure_trap
+
+first_six_tests:
+  - id: infra-01-firewall-deny-burst
+    telemetry:
+      - syslog
+      - netflow_v5
+    initiating_node: attacker-01
+    target_node: dmz-srv-01
+    objective: prove blocked north-south abuse is visible on the infrastructure plane
+
+  - id: infra-02-east-west-scan
+    telemetry:
+      - netflow_v5
+      - syslog
+    initiating_node: linux-endpoint-01
+    target_segment: server_lan
+    objective: correlate internal scanning with flow evidence and, if managed, endpoint evidence
+
+  - id: infra-03-network-admin-login
+    telemetry:
+      - syslog
+    initiating_node: attacker-01
+    target_node: edge-rtr-01
+    objective: prove device management-plane access is observable
+
+  - id: infra-04-link-flap-or-linkdown
+    telemetry:
+      - snmp_trap
+      - syslog
+    initiating_node: sw-core-01
+    objective: prove infrastructure health events are ingested and can be promoted to incidents
+
+  - id: infra-05-firewall-config-change
+    telemetry:
+      - syslog
+    initiating_node: fw-01
+    objective: prove configuration governance events are visible to R-SIEM
+
+  - id: infra-06-domain-or-destination-block-verification
+    telemetry:
+      - dns
+      - proc_net
+      - syslog
+      - netflow_v5
+    initiating_node: linux-endpoint-01
+    target_node: fw-01
+    objective: prove before-during-after verification for an enforced block action

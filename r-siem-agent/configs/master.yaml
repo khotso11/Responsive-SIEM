@@ -417,6 +417,63 @@ playbooks:
         backoff_ms: 0
         target_from: "group_key"
 
+  - id: "PB-INFRA-FIREWALL-DENY-BURST-NOTIFY"
+    version: 1
+    enabled: true
+    selectors:
+      rule_ids:
+        - "R-INFRA-FIREWALL-DENY-BURST"
+    policy_requirements:
+      approval: "auto"
+      max_blast_radius: 1
+      auto_min_confidence: 80
+    steps:
+      - name: "notify_infra_firewall_deny_burst"
+        action_type: "notify"
+        reversibility: "reversible"
+        timeout_ms: 2000
+        retries: 0
+        backoff_ms: 0
+        target_from: "group_key"
+
+  - id: "PB-INFRA-NETWORK-ADMIN-LOGIN-NOTIFY"
+    version: 1
+    enabled: true
+    selectors:
+      rule_ids:
+        - "R-INFRA-NETWORK-ADMIN-LOGIN"
+    policy_requirements:
+      approval: "auto"
+      max_blast_radius: 1
+      auto_min_confidence: 82
+    steps:
+      - name: "notify_infra_network_admin_login"
+        action_type: "notify"
+        reversibility: "reversible"
+        timeout_ms: 2000
+        retries: 0
+        backoff_ms: 0
+        target_from: "group_key"
+
+  - id: "PB-INFRA-LINK-FLAP-BURST-NOTIFY"
+    version: 1
+    enabled: true
+    selectors:
+      rule_ids:
+        - "R-INFRA-LINK-FLAP-BURST"
+    policy_requirements:
+      approval: "auto"
+      max_blast_radius: 1
+      auto_min_confidence: 78
+    steps:
+      - name: "notify_infra_link_flap_burst"
+        action_type: "notify"
+        reversibility: "reversible"
+        timeout_ms: 2000
+        retries: 0
+        backoff_ms: 0
+        target_from: "group_key"
+
   - id: "PB-NET-INTERNAL-SCAN-CONTAIN"
     version: 1
     enabled: true
@@ -1447,6 +1504,40 @@ rce:
       group_by: src_ip
       when:
         type: network_connection
+
+    - id: R-INFRA-FIREWALL-DENY-BURST
+      enabled: true
+      kind: count
+      severity: high
+      group_by: host
+      window_ms: 60000
+      threshold: 5
+      when:
+        type: syslog
+        fields:
+          message_contains: "deny"
+
+    - id: R-INFRA-NETWORK-ADMIN-LOGIN
+      enabled: true
+      kind: trigger
+      severity: high
+      group_by: host
+      when:
+        type: syslog
+        fields:
+          message_contains: "accepted password"
+
+    - id: R-INFRA-LINK-FLAP-BURST
+      enabled: true
+      kind: count
+      severity: high
+      group_by: host
+      window_ms: 300000
+      threshold: 3
+      when:
+        type: syslog
+        fields:
+          message_contains: "state to down"
 
     - id: R-NET-INTERNAL-SMB-SCAN
       enabled: true

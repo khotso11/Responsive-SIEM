@@ -22,6 +22,11 @@ The strongest defense claim is not that R-SIEM is finished in every possible are
 6. analysts and admins have distinct responsibilities
 7. the UI now supports investigation, response, governance, and evidence review
 
+One accuracy note you should say clearly if asked:
+
+- Linux endpoint support is the strongest validated live path today
+- Windows endpoint support is implemented in the repo and deployable, but it has been exercised less than Linux in the live demonstrations
+
 Use this sentence repeatedly:
 
 "R-SIEM is now an operational response-capable SIEM. It does not stop at detection. It ingests, detects, decides, responds, and audits."
@@ -119,6 +124,9 @@ Show that the services are `active`.
 
 ### Key point
 "The endpoint plane is real and installed. The tests I run next are observed locally by the installed collectors."
+
+### Accuracy note if asked
+"Linux is the most heavily tested live endpoint path in this project. Windows endpoint support also exists through the installer, service registration, and configuration packaging in this repo, but Linux has received the deeper runtime validation so far."
 
 ## Part 4. Explain Roles: Analyst vs Admin
 Say this before the first live test.
@@ -575,10 +583,34 @@ Use this wording near the end:
 
 "My claim is not that the system is perfect. My claim is that the core architecture is built and working end to end: telemetry, detection, policy, response, search, action lifecycle, model governance, and audit. Remaining work is refinement, hardening, and deployment maturity, not the invention of the core capability."
 
+## Part 20. Infrastructure Expansion Position
+Use this wording if you need to explain the next major module:
+
+"The current strongest live proof is the endpoint plane. The next expansion is the infrastructure plane. That means routers, firewalls, switch-linked segments, and server networks exporting telemetry into the same R-SIEM backend."
+
+Then say:
+
+"I am not positioning that as a theoretical redesign. The infrastructure collectors already exist in this repo for syslog, NetFlow v5, and SNMP traps. The next step is to stand them up in an emulated virtual environment, not just on isolated endpoint hosts."
+
+### What to point at if challenged
+- infrastructure collectors already implemented:
+  - `cmd/collector-syslog/main.go`
+  - `cmd/collector-netflowv5/main.go`
+  - `cmd/collector-snmptrap/main.go`
+- exact lab specification:
+  - `configs/labs/emulated_infrastructure_lab.yaml`
+- implementation plan and telemetry mapping:
+  - `docs/deploy/emulated_infrastructure_lab.md`
+- current ingestion proof wrapper:
+  - `scripts/verify_infrastructure_plane_phase1.sh`
+
+### Exact wording to use
+"So the project is no longer only about endpoints. The architecture already supports an infrastructure telemetry plane. The next robust step is to feed that plane from an emulated network environment and add the first infrastructure detections and proofs."
+
 ## Closing Line
 Use this if you want a firm ending:
 
-"R-SIEM now proves that it can ingest, detect, decide, respond, investigate, govern, and audit on a live endpoint. That is the core contribution of the project."
+"R-SIEM now proves that it can ingest, detect, decide, respond, investigate, govern, and audit on live managed endpoints, with Linux validated most deeply and Windows support implemented. The same architecture is now prepared to extend into the infrastructure plane."
 
 ## Fast Reference: Commands in Order
 

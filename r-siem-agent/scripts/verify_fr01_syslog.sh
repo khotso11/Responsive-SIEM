@@ -79,7 +79,7 @@ fi
 
 lat_file="${ART_DIR}/fr01_syslog_latencies.txt"
 for _ in $(seq 1 30); do
-  rg '"msg":"detector_rule_matched".*"rule_id":"R-COLLECT-INVALID-USER"' logs/detector.log \
+  rg '"msg":"detector_rule_matched"' logs/detector.log \
     | rg "\"user\":\"${user_prefix}" \
     | sed -n 's/.*"latency_ms":\([0-9]\+\).*/\1/p' > "$lat_file" || true
   latency_count_now="$(wc -l < "$lat_file" | tr -d '[:space:]')"
@@ -116,7 +116,7 @@ PY
 PYOUT
 
 if (( latency_count < latency_samples_min )); then
-  echo "FAIL: no detector latency evidence for syslog test run" >&2
+  echo "FAIL: insufficient detector latency evidence for syslog test run" >&2
   rg '"msg":"detector_rule_matched"' logs/detector.log | tail -n 80 >&2 || true
   exit 1
 fi

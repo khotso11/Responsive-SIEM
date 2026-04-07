@@ -43,15 +43,16 @@ type CollectorTailConfig struct {
 
 // DetectorConfig configures detector-v0.
 type DetectorConfig struct {
-	LogLevel     string                     `yaml:"log_level"`
-	JetStream    DetectorJetStreamConfig    `yaml:"jetstream"`
-	Dedupe       DetectorDedupeConfig       `yaml:"dedupe"`
-	Cooldown     DetectorCooldownConfig     `yaml:"cooldown"`
-	CooldownMs   int                        `yaml:"cooldown_ms"`
-	Baseline     DetectorBaselineConfig     `yaml:"baseline"`
-	Network      DetectorNetworkConfig      `yaml:"network"`
-	DNS          DetectorDNSConfig          `yaml:"dns"`
-	InternalScan DetectorInternalScanConfig `yaml:"internal_scan"`
+	LogLevel       string                       `yaml:"log_level"`
+	JetStream      DetectorJetStreamConfig      `yaml:"jetstream"`
+	Dedupe         DetectorDedupeConfig         `yaml:"dedupe"`
+	Cooldown       DetectorCooldownConfig       `yaml:"cooldown"`
+	CooldownMs     int                          `yaml:"cooldown_ms"`
+	Baseline       DetectorBaselineConfig       `yaml:"baseline"`
+	Network        DetectorNetworkConfig        `yaml:"network"`
+	DNS            DetectorDNSConfig            `yaml:"dns"`
+	InternalScan   DetectorInternalScanConfig   `yaml:"internal_scan"`
+	Infrastructure DetectorInfrastructureConfig `yaml:"infrastructure"`
 }
 
 // DetectorJetStreamConfig configures JetStream for detector-v0.
@@ -95,18 +96,18 @@ type DetectorInternalScanAllowlistConfig struct {
 }
 
 type DetectorInternalScanConfig struct {
-	Enabled       bool                             `yaml:"enabled"`
-	WindowMs      int                              `yaml:"window_ms"`
-	InternalCIDRs []string                         `yaml:"internal_cidrs"`
+	Enabled       bool                                `yaml:"enabled"`
+	WindowMs      int                                 `yaml:"window_ms"`
+	InternalCIDRs []string                            `yaml:"internal_cidrs"`
 	Allowlist     DetectorInternalScanAllowlistConfig `yaml:"allowlist"`
-	SMB           DetectorProtocolScanConfig       `yaml:"smb"`
-	RPC           DetectorProtocolScanConfig       `yaml:"rpc"`
-	LDAP          DetectorProtocolScanConfig       `yaml:"ldap"`
-	DNS           DetectorProtocolScanConfig       `yaml:"dns"`
-	FTP           DetectorProtocolScanConfig       `yaml:"ftp"`
-	RDP           DetectorProtocolScanConfig       `yaml:"rdp"`
-	WinRM         DetectorProtocolScanConfig       `yaml:"winrm"`
-	SSH           DetectorProtocolScanConfig       `yaml:"ssh"`
+	SMB           DetectorProtocolScanConfig          `yaml:"smb"`
+	RPC           DetectorProtocolScanConfig          `yaml:"rpc"`
+	LDAP          DetectorProtocolScanConfig          `yaml:"ldap"`
+	DNS           DetectorProtocolScanConfig          `yaml:"dns"`
+	FTP           DetectorProtocolScanConfig          `yaml:"ftp"`
+	RDP           DetectorProtocolScanConfig          `yaml:"rdp"`
+	WinRM         DetectorProtocolScanConfig          `yaml:"winrm"`
+	SSH           DetectorProtocolScanConfig          `yaml:"ssh"`
 }
 
 // DetectorBaselineConfig tunes in-memory first-seen tracking.
@@ -119,6 +120,31 @@ type DetectorBaselineConfig struct {
 type DetectorDNSConfig struct {
 	KnownBadDomains []string `yaml:"known_bad_domains"`
 	SuspiciousTLDs  []string `yaml:"suspicious_tlds"`
+}
+
+type DetectorInfrastructurePatternBurstConfig struct {
+	Threshold       int      `yaml:"threshold"`
+	WindowMs        int      `yaml:"window_ms"`
+	Keywords        []string `yaml:"keywords"`
+	ContextKeywords []string `yaml:"context_keywords"`
+}
+
+type DetectorInfrastructureAdminLoginConfig struct {
+	SuccessKeywords []string `yaml:"success_keywords"`
+	AdminUsers      []string `yaml:"admin_users"`
+}
+
+type DetectorInfrastructureLinkFlapConfig struct {
+	Threshold    int      `yaml:"threshold"`
+	WindowMs     int      `yaml:"window_ms"`
+	DownKeywords []string `yaml:"down_keywords"`
+	UpKeywords   []string `yaml:"up_keywords"`
+}
+
+type DetectorInfrastructureConfig struct {
+	FirewallDeny      DetectorInfrastructurePatternBurstConfig `yaml:"firewall_deny"`
+	NetworkAdminLogin DetectorInfrastructureAdminLoginConfig   `yaml:"network_admin_login"`
+	LinkFlap          DetectorInfrastructureLinkFlapConfig     `yaml:"link_flap"`
 }
 
 // LoadCollector reads and validates the collector configuration from disk.
@@ -251,6 +277,36 @@ func applyDetectorDefaults(c *DetectorConfig) {
 	}
 	if len(c.DNS.SuspiciousTLDs) == 0 {
 		c.DNS.SuspiciousTLDs = []string{".top", ".xyz", ".zip", ".mov", ".cam"}
+	}
+	if c.Infrastructure.FirewallDeny.Threshold <= 0 {
+		c.Infrastructure.FirewallDeny.Threshold = 5
+	}
+	if c.Infrastructure.FirewallDeny.WindowMs <= 0 {
+		c.Infrastructure.FirewallDeny.WindowMs = 60000
+	}
+	if len(c.Infrastructure.FirewallDeny.Keywords) == 0 {
+		c.Infrastructure.FirewallDeny.Keywords = []string{" deny ", " denied ", " blocked ", " reject ", " rejected ", " drop ", " dropped "}
+	}
+	if len(c.Infrastructure.FirewallDeny.ContextKeywords) == 0 {
+		c.Infrastructure.FirewallDeny.ContextKeywords = []string{"firewall", "policy", "acl", "iptables", "nft", "pf", "src=", "dst=", "src ", "dst "}
+	}
+	if len(c.Infrastructure.NetworkAdminLogin.SuccessKeywords) == 0 {
+		c.Infrastructure.NetworkAdminLogin.SuccessKeywords = []string{"accepted password", "login successful", "logged in", "authentication succeeded", "ssh login", "user login"}
+	}
+	if len(c.Infrastructure.NetworkAdminLogin.AdminUsers) == 0 {
+		c.Infrastructure.NetworkAdminLogin.AdminUsers = []string{"admin", "administrator", "root", "netadmin", "fwadmin"}
+	}
+	if c.Infrastructure.LinkFlap.Threshold <= 0 {
+		c.Infrastructure.LinkFlap.Threshold = 3
+	}
+	if c.Infrastructure.LinkFlap.WindowMs <= 0 {
+		c.Infrastructure.LinkFlap.WindowMs = 300000
+	}
+	if len(c.Infrastructure.LinkFlap.DownKeywords) == 0 {
+		c.Infrastructure.LinkFlap.DownKeywords = []string{"link down", "interface down", "changed state to down", "line protocol down", "port down"}
+	}
+	if len(c.Infrastructure.LinkFlap.UpKeywords) == 0 {
+		c.Infrastructure.LinkFlap.UpKeywords = []string{"link up", "interface up", "changed state to up", "line protocol up", "port up", "flapping"}
 	}
 	if c.InternalScan.WindowMs <= 0 {
 		c.InternalScan.WindowMs = 60000

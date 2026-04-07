@@ -110,3 +110,17 @@ Current store boundaries in this repo:
   - `docs/deploy/linux_endpoint_setup.md`
   - `docs/deploy/windows_endpoint_setup.md`
   - `docs/deploy/two_host_pilot.md`
+  - `docs/deploy/emulated_infrastructure_lab.md`
+
+## Infrastructure Plane Extension
+
+For the next deployment stage, this multi-endpoint model extends into an emulated infrastructure plane rather than only more managed endpoints.
+
+That expansion is defined in:
+- `configs/labs/emulated_infrastructure_lab.yaml`
+- `docs/deploy/emulated_infrastructure_lab.md`
+
+The infrastructure-plane ingest path reuses existing collectors already present in this repo:
+- `collector-syslog`
+- `collector-netflowv5`
+- `collector-snmptrap`

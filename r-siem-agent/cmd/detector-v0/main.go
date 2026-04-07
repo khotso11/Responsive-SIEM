@@ -44,6 +44,9 @@ const (
 	internalWinRMScanRuleID    = "R-NET-INTERNAL-WINRM-SCAN"
 	internalSSHScanRuleID      = "R-NET-INTERNAL-SSH-SCAN"
 	internalApprovedScanRuleID = "R-NET-INTERNAL-APPROVED-SCAN"
+	infraFirewallDenyRuleID    = "R-INFRA-FIREWALL-DENY-BURST"
+	infraNetworkAdminRuleID    = "R-INFRA-NETWORK-ADMIN-LOGIN"
+	infraLinkFlapRuleID        = "R-INFRA-LINK-FLAP-BURST"
 	authProcFileRuleID         = "R-AUTH-PROC-FILE-CHAIN"
 	processFirstSeenRuleID     = "R-PROC-FIRST-SEEN-SUSPICIOUS"
 	networkFirstSeenRuleID     = "R-NET-FIRST-SEEN-RISKY"
@@ -76,46 +79,58 @@ const (
 )
 
 var (
-	invalidUserPattern            = "invalid user"
-	ipv4FromPattern               = regexp.MustCompile(`(?i)\bfrom\s+(\d{1,3}(?:\.\d{1,3}){3})\b`)
-	processCountPattern           = regexp.MustCompile(`(?i)\bprocess_count=(\d+)\b`)
-	explicitTSPattern             = regexp.MustCompile(`\bts=([0-9]{9,13})\b`)
-	fr03HostMarkerPattern         = regexp.MustCompile(`(?i)\battack=host_bruteforce\b`)
-	fr03NetworkMarkerPattern      = regexp.MustCompile(`(?i)\battack=(network_scan|c2_beacon)\b`)
-	fr03DeceptionPattern          = regexp.MustCompile(`(?i)\battack=deception_tripwire\b`)
-	suspiciousProcPattern         = regexp.MustCompile(`(?i)\b(exec=)?("?)(/usr/bin/(nmap|nc|curl|wget)|/bin/(bash|sh)|/usr/bin/python3?)\b`)
-	highValueSensitiveFilePattern = regexp.MustCompile(`(?i)(/etc/sudoers(\.d(/[^[:space:]]+)?)?\b|authorized_keys\b|/root/\.ssh/)`)
-	chainSensitiveFilePattern     = regexp.MustCompile(`(?i)(/etc/(sudoers(\.d(/[^[:space:]]+)?)?|passwd|shadow|group|gshadow)\b|authorized_keys\b|/root/\.ssh/)`)
-	noisyStandaloneFilePattern    = regexp.MustCompile(`(?i)(/etc/(passwd|group|shadow|gshadow)(\.[^/[:space:]]+)?\b|/etc/[^[:space:]]+\.lock\b|/etc/\.pwd\.lock\b)`)
-	dstIPPattern                  = regexp.MustCompile(`(?i)\bdst_ip=([0-9]{1,3}(?:\.[0-9]{1,3}){3})\b`)
-	dstPortPattern                = regexp.MustCompile(`(?i)\bdst_port=(\d{1,5})\b`)
-	dnsNamePattern                = regexp.MustCompile(`(?i)\bqname=([A-Za-z0-9._-]+)\b`)
-	dnsTypePattern                = regexp.MustCompile(`(?i)\bqtype=([A-Za-z0-9]+)\b`)
-	fr03HostBurstTracker          = newBurstTracker(fr03HostBurstWindowMs, fr03HostBurstThreshold)
-	processBurstTracker           = newBurstTracker(processBurstWindowMs, processCountThreshold)
-	countFailedPwSrcTracker       = newBurstTracker(countFailedPwWindowMs, countFailedPwThreshold)
-	authFailedPwBurstUserTracker  = newBurstTracker(authBurstUserWindowMs, authBurstUserThreshold)
-	authFailedPwBurstSrcTracker   = newBurstTracker(authBurstSrcWindowMs, authBurstSrcThreshold)
-	networkBurstTracker           *burstTracker
-	knownBadNetworkDestinations   map[string]struct{}
-	benignNetworkDestinations     map[string]struct{}
-	knownBadDomains               map[string]struct{}
-	suspiciousDNSTLDs             []string
-	riskyNetworkPorts             map[int]struct{}
-	internalScanCIDRs             []*net.IPNet
-	internalProtocolDetections    []*protocolScanDetection
-	internalScanAllowedUsers      map[string]struct{}
-	internalScanAllowedNodes      map[string]struct{}
-	internalScanAllowedExecPrefix []string
-	internalScanAllowedCommPrefix []string
-	recentAuthByNode              = newLastSeenTracker(5 * time.Minute)
-	recentLocalAdminByNode        = newLastSeenTracker(2 * time.Minute)
-	recentSuspiciousProcByNode    = newLastSeenTracker(2 * time.Minute)
-	recentSuspiciousProcContext   = newRecentProcessContextTracker(2 * time.Minute)
-	recentAuthProcByNode          = newLastSeenTracker(5 * time.Minute)
-	recentFileAlertByPath         = newLastSeenTracker(15 * time.Second)
-	processFirstSeenTracker       *firstSeenTracker
-	networkFirstSeenTracker       *firstSeenTracker
+	invalidUserPattern                    = "invalid user"
+	ipv4FromPattern                       = regexp.MustCompile(`(?i)\bfrom\s+(\d{1,3}(?:\.\d{1,3}){3})\b`)
+	processCountPattern                   = regexp.MustCompile(`(?i)\bprocess_count=(\d+)\b`)
+	explicitTSPattern                     = regexp.MustCompile(`\bts=([0-9]{9,13})\b`)
+	fr03HostMarkerPattern                 = regexp.MustCompile(`(?i)\battack=host_bruteforce\b`)
+	fr03NetworkMarkerPattern              = regexp.MustCompile(`(?i)\battack=(network_scan|c2_beacon)\b`)
+	fr03DeceptionPattern                  = regexp.MustCompile(`(?i)\battack=deception_tripwire\b`)
+	suspiciousProcPattern                 = regexp.MustCompile(`(?i)\b(exec=)?("?)(/usr/bin/(nmap|nc|curl|wget)|/bin/(bash|sh)|/usr/bin/python3?)\b`)
+	highValueSensitiveFilePattern         = regexp.MustCompile(`(?i)(/etc/sudoers(\.d(/[^[:space:]]+)?)?\b|authorized_keys\b|/root/\.ssh/)`)
+	chainSensitiveFilePattern             = regexp.MustCompile(`(?i)(/etc/(sudoers(\.d(/[^[:space:]]+)?)?|passwd|shadow|group|gshadow)\b|authorized_keys\b|/root/\.ssh/)`)
+	noisyStandaloneFilePattern            = regexp.MustCompile(`(?i)(/etc/(passwd|group|shadow|gshadow)(\.[^/[:space:]]+)?\b|/etc/[^[:space:]]+\.lock\b|/etc/\.pwd\.lock\b)`)
+	dstIPPattern                          = regexp.MustCompile(`(?i)\bdst_ip=([0-9]{1,3}(?:\.[0-9]{1,3}){3})\b`)
+	dstPortPattern                        = regexp.MustCompile(`(?i)\bdst_port=(\d{1,5})\b`)
+	dnsNamePattern                        = regexp.MustCompile(`(?i)\bqname=([A-Za-z0-9._-]+)\b`)
+	dnsTypePattern                        = regexp.MustCompile(`(?i)\bqtype=([A-Za-z0-9]+)\b`)
+	acceptedPasswordUserPattern           = regexp.MustCompile(`(?i)accepted password for\s+([a-z0-9._-]+)`)
+	loggedInAsUserPattern                 = regexp.MustCompile(`(?i)logged in as\s+([a-z0-9._-]+)`)
+	keyValueUserPattern                   = regexp.MustCompile(`(?i)\b(?:user|username|account)[=: ]+([a-z0-9._-]+)\b`)
+	fr03HostBurstTracker                  = newBurstTracker(fr03HostBurstWindowMs, fr03HostBurstThreshold)
+	processBurstTracker                   = newBurstTracker(processBurstWindowMs, processCountThreshold)
+	countFailedPwSrcTracker               = newBurstTracker(countFailedPwWindowMs, countFailedPwThreshold)
+	authFailedPwBurstUserTracker          = newBurstTracker(authBurstUserWindowMs, authBurstUserThreshold)
+	authFailedPwBurstSrcTracker           = newBurstTracker(authBurstSrcWindowMs, authBurstSrcThreshold)
+	infrastructureFirewallDenyTracker     *burstTracker
+	infrastructureLinkFlapTracker         *burstTracker
+	networkBurstTracker                   *burstTracker
+	knownBadNetworkDestinations           map[string]struct{}
+	benignNetworkDestinations             map[string]struct{}
+	knownBadDomains                       map[string]struct{}
+	suspiciousDNSTLDs                     []string
+	riskyNetworkPorts                     map[int]struct{}
+	internalScanCIDRs                     []*net.IPNet
+	internalProtocolDetections            []*protocolScanDetection
+	internalScanAllowedUsers              map[string]struct{}
+	internalScanAllowedNodes              map[string]struct{}
+	internalScanAllowedExecPrefix         []string
+	internalScanAllowedCommPrefix         []string
+	infrastructureFirewallDenyKeywords    []string
+	infrastructureFirewallContextKeywords []string
+	infrastructureAdminLoginKeywords      []string
+	infrastructureAdminUsers              map[string]struct{}
+	infrastructureLinkDownKeywords        []string
+	infrastructureLinkUpKeywords          []string
+	recentAuthByNode                      = newLastSeenTracker(5 * time.Minute)
+	recentLocalAdminByNode                = newLastSeenTracker(2 * time.Minute)
+	recentSuspiciousProcByNode            = newLastSeenTracker(2 * time.Minute)
+	recentSuspiciousProcContext           = newRecentProcessContextTracker(2 * time.Minute)
+	recentAuthProcByNode                  = newLastSeenTracker(5 * time.Minute)
+	recentFileAlertByPath                 = newLastSeenTracker(15 * time.Second)
+	recentInfrastructureTrapBySource      = newLastSeenTracker(2 * time.Minute)
+	processFirstSeenTracker               *firstSeenTracker
+	networkFirstSeenTracker               *firstSeenTracker
 )
 
 type protocolScanDetection struct {
@@ -175,6 +190,7 @@ func main() {
 		os.Exit(1)
 	}
 	initNetworkPolicy(cfg)
+	initInfrastructurePolicy(cfg)
 	initBaselinePolicy(cfg)
 
 	nc, err := nats.Connect(cfg.JetStream.URL, nats.Name("r-siem-detector-v0"))
@@ -490,6 +506,52 @@ func eventMessage(evt rawEvent) string {
 
 func matchRule(message string, evt rawEvent) (ruleMatch, bool) {
 	lower := strings.ToLower(strings.TrimSpace(message))
+	if eventTypeIs(evt.EventType, "snmp_trap") {
+		if sourceKey := infrastructureSourceKey(evt); sourceKey != "" {
+			recentInfrastructureTrapBySource.Observe(sourceKey, evt.ObservedAtUnixMs)
+		}
+		return ruleMatch{}, false
+	}
+	if strings.EqualFold(strings.TrimSpace(evt.SourceType), "syslog") && eventTypeIs(evt.EventType, "syslog") {
+		sourceKey := infrastructureSourceKey(evt)
+		if sourceKey != "" {
+			if isInfrastructureNetworkAdminLogin(evt, message, lower) {
+				return ruleMatch{
+					RuleID:          infraNetworkAdminRuleID,
+					Lane:            invalidUserLane,
+					Severity:        detectorSeverityHigh,
+					GroupKey:        sourceKey,
+					ConfidenceScore: 84,
+				}, true
+			}
+			if isInfrastructureLinkEvent(lower) {
+				confidence := 76
+				if recentInfrastructureTrapBySource.SeenWithin(sourceKey, evt.ObservedAtUnixMs) {
+					confidence = 84
+				}
+				if infrastructureLinkFlapTracker != nil && infrastructureLinkFlapTracker.Observe(sourceKey, evt.ObservedAtUnixMs) {
+					return ruleMatch{
+						RuleID:          infraLinkFlapRuleID,
+						Lane:            invalidUserLane,
+						Severity:        detectorSeverityHigh,
+						GroupKey:        sourceKey,
+						ConfidenceScore: confidence,
+					}, true
+				}
+			}
+			if isInfrastructureFirewallDeny(lower) {
+				if infrastructureFirewallDenyTracker != nil && infrastructureFirewallDenyTracker.Observe(sourceKey, evt.ObservedAtUnixMs) {
+					return ruleMatch{
+						RuleID:          infraFirewallDenyRuleID,
+						Lane:            invalidUserLane,
+						Severity:        detectorSeverityHigh,
+						GroupKey:        sourceKey,
+						ConfidenceScore: 82,
+					}, true
+				}
+			}
+		}
+	}
 	if eventTypeIs(evt.EventType, "dns", "dns_query") {
 		qname := strings.TrimSpace(evt.DNSName)
 		if qname == "" {
@@ -960,9 +1022,90 @@ func initNetworkPolicy(cfg *config.DetectorConfig) {
 	internalScanAllowedCommPrefix = normalizeLowerTrimmed(cfg.InternalScan.Allowlist.CommPrefixes)
 }
 
+func initInfrastructurePolicy(cfg *config.DetectorConfig) {
+	infrastructureFirewallDenyTracker = newBurstTracker(int64(cfg.Infrastructure.FirewallDeny.WindowMs), cfg.Infrastructure.FirewallDeny.Threshold)
+	infrastructureLinkFlapTracker = newBurstTracker(int64(cfg.Infrastructure.LinkFlap.WindowMs), cfg.Infrastructure.LinkFlap.Threshold)
+	infrastructureFirewallDenyKeywords = normalizeLowerTrimmed(cfg.Infrastructure.FirewallDeny.Keywords)
+	infrastructureFirewallContextKeywords = normalizeLowerTrimmed(cfg.Infrastructure.FirewallDeny.ContextKeywords)
+	infrastructureAdminLoginKeywords = normalizeLowerTrimmed(cfg.Infrastructure.NetworkAdminLogin.SuccessKeywords)
+	infrastructureAdminUsers = make(map[string]struct{}, len(cfg.Infrastructure.NetworkAdminLogin.AdminUsers))
+	for _, raw := range cfg.Infrastructure.NetworkAdminLogin.AdminUsers {
+		value := strings.ToLower(strings.TrimSpace(raw))
+		if value != "" {
+			infrastructureAdminUsers[value] = struct{}{}
+		}
+	}
+	infrastructureLinkDownKeywords = normalizeLowerTrimmed(cfg.Infrastructure.LinkFlap.DownKeywords)
+	infrastructureLinkUpKeywords = normalizeLowerTrimmed(cfg.Infrastructure.LinkFlap.UpKeywords)
+}
+
 func initBaselinePolicy(cfg *config.DetectorConfig) {
 	processFirstSeenTracker = newFirstSeenTracker(time.Duration(cfg.Baseline.ProcessFirstSeenTTLms) * time.Millisecond)
 	networkFirstSeenTracker = newFirstSeenTracker(time.Duration(cfg.Baseline.NetworkFirstSeenTTLms) * time.Millisecond)
+}
+
+func infrastructureSourceKey(evt rawEvent) string {
+	if trimmed := strings.TrimSpace(evt.Host); trimmed != "" {
+		return trimmed
+	}
+	if trimmed := strings.TrimSpace(evt.SrcIP); trimmed != "" {
+		return trimmed
+	}
+	return detectorNodeID(evt)
+}
+
+func containsAnyKeyword(lower string, keywords []string) bool {
+	for _, keyword := range keywords {
+		if keyword != "" && strings.Contains(lower, keyword) {
+			return true
+		}
+	}
+	return false
+}
+
+func isInfrastructureFirewallDeny(lower string) bool {
+	if !containsAnyKeyword(lower, infrastructureFirewallDenyKeywords) {
+		return false
+	}
+	if len(infrastructureFirewallContextKeywords) == 0 {
+		return true
+	}
+	return containsAnyKeyword(lower, infrastructureFirewallContextKeywords)
+}
+
+func extractInfrastructureAdminUser(evt rawEvent, message string) string {
+	if user := strings.ToLower(strings.TrimSpace(evt.User)); user != "" {
+		return user
+	}
+	for _, pattern := range []*regexp.Regexp{
+		acceptedPasswordUserPattern,
+		loggedInAsUserPattern,
+		keyValueUserPattern,
+	} {
+		if value := strings.ToLower(matchString(pattern, message)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func isInfrastructureNetworkAdminLogin(evt rawEvent, message, lower string) bool {
+	if !containsAnyKeyword(lower, infrastructureAdminLoginKeywords) {
+		return false
+	}
+	if strings.Contains(lower, "failed password") || strings.Contains(lower, "invalid user") || strings.Contains(lower, "authentication failure") {
+		return false
+	}
+	user := extractInfrastructureAdminUser(evt, message)
+	if user == "" {
+		return false
+	}
+	_, ok := infrastructureAdminUsers[user]
+	return ok
+}
+
+func isInfrastructureLinkEvent(lower string) bool {
+	return containsAnyKeyword(lower, infrastructureLinkDownKeywords) || containsAnyKeyword(lower, infrastructureLinkUpKeywords)
 }
 
 func isBenignNetworkDestination(raw string) bool {
@@ -1113,6 +1256,12 @@ func alertKeyForRule(ruleID, eventID string) string {
 		return "A-NET-INTERNAL-SSH-SCAN-" + eventID
 	case internalApprovedScanRuleID:
 		return "A-NET-INTERNAL-APPROVED-SCAN-" + eventID
+	case infraFirewallDenyRuleID:
+		return "A-INFRA-FIREWALL-DENY-BURST-" + eventID
+	case infraNetworkAdminRuleID:
+		return "A-INFRA-NETWORK-ADMIN-LOGIN-" + eventID
+	case infraLinkFlapRuleID:
+		return "A-INFRA-LINK-FLAP-BURST-" + eventID
 	case networkFirstSeenRuleID:
 		return "A-NET-FIRST-SEEN-RISKY-" + eventID
 	case "R-SEQ-PROCESS-TO-NET":

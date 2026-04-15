@@ -303,6 +303,24 @@ A new wrapper added for this expansion is:
 
 This wrapper does not claim full network-lab correlation yet. It proves that the three core infrastructure collectors already work together as an ingestion surface.
 
+The first infrastructure detection proofs are now implemented as well:
+- `scripts/verify_infra_firewall_deny_burst.sh`
+- `scripts/verify_infra_network_admin_login.sh`
+- `scripts/verify_infra_link_flap_burst.sh`
+- `scripts/verify_infrastructure_plane_phase2.sh`
+- `scripts/verify_infra_east_west_flow_scan.sh`
+- `scripts/verify_infra_firewall_config_change_oow.sh`
+- `scripts/verify_infra_post_containment_block_verification.sh`
+- `scripts/verify_infrastructure_plane_phase3.sh`
+
+These prove six infrastructure detections end to end:
+- `R-INFRA-FIREWALL-DENY-BURST` -> `PB-INFRA-FIREWALL-DENY-BURST-NOTIFY`
+- `R-INFRA-NETWORK-ADMIN-LOGIN` -> `PB-INFRA-NETWORK-ADMIN-LOGIN-NOTIFY`
+- `R-INFRA-LINK-FLAP-BURST` -> `PB-INFRA-LINK-FLAP-BURST-NOTIFY`
+- `R-INFRA-EAST-WEST-FLOW-SCAN` -> `PB-INFRA-EAST-WEST-FLOW-SCAN-NOTIFY`
+- `R-INFRA-FIREWALL-CONFIG-CHANGE-OOW` -> `PB-INFRA-FIREWALL-CONFIG-CHANGE-OOW-NOTIFY`
+- `R-INFRA-POST-CONTAINMENT-BLOCK-VERIFY` -> `PB-INFRA-POST-CONTAINMENT-BLOCK-VERIFY-NOTIFY`
+
 ## Recommended Implementation Sequence
 Build in this order.
 
@@ -317,22 +335,26 @@ Build in this order.
 - Route all infrastructure telemetry to the existing collector endpoints on `rsiem-master-01`
 
 ### Phase 3. Add first infrastructure detections
-The first rule classes should be:
+Implemented now:
 - firewall deny burst
-- east-west scan at flow boundary
 - unusual network admin login
-- interface flap burst
+- interface flap burst with SNMP corroboration
+- east-west scan at flow boundary
 - firewall config change outside allowed window
 - block verification after containment
 
 ### Phase 4. Add first infrastructure playbooks
-Start with bounded playbooks only:
-- notify-only for device governance events
+Implemented now:
+- notify-only playbooks for the first six infrastructure detections
+
+Next playbook step:
 - observe/contain hybrids where enforcement happens on Linux-controlled nodes or endpoints
 - do not overclaim direct router/firewall reconfiguration until a real connector exists
 
 ### Phase 5. Add end-to-end proofs
-Each of the six tests above should get its own verifier script and proof JSON artifact.
+Implemented now:
+- a phase-2 proof wrapper for the first three infrastructure detections
+- a phase-3 proof wrapper for all six infrastructure detections
 
 ## Strong Final Claim After This Expansion
 Use this wording when the lab is built and tested:

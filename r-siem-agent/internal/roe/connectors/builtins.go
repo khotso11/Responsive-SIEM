@@ -469,6 +469,9 @@ func (c networkBlockStubConnector) Execute(ctx context.Context, step Step) (map[
 		"target":      step.Target,
 		"params":      step.Params,
 	}
+	if strings.TrimSpace(step.TargetAgentID) != "" {
+		payload["target_agent_id"] = strings.TrimSpace(step.TargetAgentID)
+	}
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
@@ -484,9 +487,9 @@ func (c networkBlockStubConnector) Execute(ctx context.Context, step Step) (map[
 	c.logger.LogAttrs(context.Background(), slog.LevelInfo, "network_block_request",
 		slog.String("run_id", step.RunID),
 		slog.String("step_id", step.StepID),
-		slog.String("subject", c.subject),
+		slog.String("subject", perAgentCommandSubject(c.subject, step.TargetAgentID)),
 	)
-	msg := nats.NewMsg(c.subject)
+	msg := nats.NewMsg(perAgentCommandSubject(c.subject, step.TargetAgentID))
 	msg.Data = data
 	reply, err := c.nats.RequestMsgWithContext(reqCtx, msg)
 	if err != nil {

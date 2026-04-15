@@ -443,10 +443,25 @@ playbooks:
       rule_ids:
         - "R-INFRA-NETWORK-ADMIN-LOGIN"
     policy_requirements:
-      approval: "auto"
+      approval: "required_for_high"
       max_blast_radius: 1
-      auto_min_confidence: 82
+      auto_min_confidence: 90
     steps:
+      - name: "contain_infra_network_admin_source_via_gateway"
+        action_type: "network_block"
+        target_agent_id: "khotso-Latitude-5500"
+        reversibility: "reversible"
+        timeout_ms: 5000
+        retries: 1
+        backoff_ms: 500
+        target_from: "group_key"
+        params:
+          direction: "ingress"
+          duration_ms: 900000
+          reason: "infra_network_admin_login:{rule_id}"
+          reference: "{run_id}"
+          actor: "system:roe"
+          containment_run_id: "{run_id}"
       - name: "notify_infra_network_admin_login"
         action_type: "notify"
         reversibility: "reversible"
@@ -467,6 +482,78 @@ playbooks:
       auto_min_confidence: 78
     steps:
       - name: "notify_infra_link_flap_burst"
+        action_type: "notify"
+        reversibility: "reversible"
+        timeout_ms: 2000
+        retries: 0
+        backoff_ms: 0
+        target_from: "group_key"
+
+  - id: "PB-INFRA-EAST-WEST-FLOW-SCAN-NOTIFY"
+    version: 1
+    enabled: true
+    selectors:
+      rule_ids:
+        - "R-INFRA-EAST-WEST-FLOW-SCAN"
+    policy_requirements:
+      approval: "auto"
+      max_blast_radius: 1
+      auto_min_confidence: 84
+    steps:
+      - name: "contain_infra_east_west_source_via_gateway"
+        action_type: "network_block"
+        target_agent_id: "khotso-Latitude-5500"
+        reversibility: "reversible"
+        timeout_ms: 5000
+        retries: 1
+        backoff_ms: 500
+        target_from: "group_key"
+        params:
+          direction: "both"
+          duration_ms: 900000
+          reason: "infra_east_west_flow_scan:{rule_id}"
+          reference: "{run_id}"
+          actor: "system:roe"
+          containment_run_id: "{run_id}"
+      - name: "notify_infra_east_west_flow_scan"
+        action_type: "notify"
+        reversibility: "reversible"
+        timeout_ms: 2000
+        retries: 0
+        backoff_ms: 0
+        target_from: "group_key"
+
+  - id: "PB-INFRA-FIREWALL-CONFIG-CHANGE-OOW-NOTIFY"
+    version: 1
+    enabled: true
+    selectors:
+      rule_ids:
+        - "R-INFRA-FIREWALL-CONFIG-CHANGE-OOW"
+    policy_requirements:
+      approval: "auto"
+      max_blast_radius: 1
+      auto_min_confidence: 84
+    steps:
+      - name: "notify_infra_firewall_config_change_oow"
+        action_type: "notify"
+        reversibility: "reversible"
+        timeout_ms: 2000
+        retries: 0
+        backoff_ms: 0
+        target_from: "group_key"
+
+  - id: "PB-INFRA-POST-CONTAINMENT-BLOCK-VERIFY-NOTIFY"
+    version: 1
+    enabled: true
+    selectors:
+      rule_ids:
+        - "R-INFRA-POST-CONTAINMENT-BLOCK-VERIFY"
+    policy_requirements:
+      approval: "auto"
+      max_blast_radius: 1
+      auto_min_confidence: 80
+    steps:
+      - name: "notify_infra_post_containment_block_verify"
         action_type: "notify"
         reversibility: "reversible"
         timeout_ms: 2000
@@ -1521,7 +1608,7 @@ rce:
       enabled: true
       kind: trigger
       severity: high
-      group_by: host
+      group_by: src_ip
       when:
         type: syslog
         fields:
@@ -1538,6 +1625,36 @@ rce:
         type: syslog
         fields:
           message_contains: "state to down"
+
+    - id: R-INFRA-EAST-WEST-FLOW-SCAN
+      enabled: true
+      kind: count
+      severity: high
+      group_by: src_ip
+      window_ms: 60000
+      threshold: 5
+      when:
+        type: netflow_flow
+
+    - id: R-INFRA-FIREWALL-CONFIG-CHANGE-OOW
+      enabled: true
+      kind: trigger
+      severity: high
+      group_by: host
+      when:
+        type: syslog
+        fields:
+          message_contains: "config"
+
+    - id: R-INFRA-POST-CONTAINMENT-BLOCK-VERIFY
+      enabled: true
+      kind: trigger
+      severity: medium
+      group_by: response_action_id
+      when:
+        type: syslog
+        fields:
+          message_contains: "post_containment=blocked"
 
     - id: R-NET-INTERNAL-SMB-SCAN
       enabled: true

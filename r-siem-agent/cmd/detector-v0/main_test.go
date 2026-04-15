@@ -287,8 +287,8 @@ func TestInfrastructureNetworkAdminLoginMatchesAdminUser(t *testing.T) {
 	if match.RuleID != infraNetworkAdminRuleID {
 		t.Fatalf("rule_id=%q want %q", match.RuleID, infraNetworkAdminRuleID)
 	}
-	if match.GroupKey != "edge-rtr-01" {
-		t.Fatalf("group_key=%q want edge-rtr-01", match.GroupKey)
+	if match.GroupKey != "10.30.0.11" {
+		t.Fatalf("group_key=%q want 10.30.0.11", match.GroupKey)
 	}
 }
 
@@ -341,5 +341,159 @@ func TestInfrastructureLinkFlapBurstUsesRecentTrapCorroboration(t *testing.T) {
 	}
 	if match.ConfidenceScore != 84 {
 		t.Fatalf("confidence=%d want 84", match.ConfidenceScore)
+	}
+}
+
+func TestInfrastructureLinkFlapBurstUsesTrapSourceIPWhenTrapHostIsCollectorNode(t *testing.T) {
+	cfg, err := config.LoadDetector("../../configs/detector.yaml")
+	if err != nil {
+		t.Fatalf("load detector config: %v", err)
+	}
+	resetDetectorRegressionState(cfg)
+
+	trapEvt := rawEvent{
+		EventType:        "snmp_trap",
+		SourceType:       "snmp_trap",
+		Host:             "collector-snmptrap",
+		NodeID:           "collector-snmptrap",
+		SrcIP:            "10.10.0.23",
+		ObservedAtUnixMs: 500,
+	}
+	if match, ok := matchRule("snmp trap", trapEvt); ok {
+		t.Fatalf("unexpected trap match: %+v", match)
+	}
+
+	base := rawEvent{
+		EventType:  "syslog",
+		SourceType: "syslog",
+		Host:       "sw-core-01",
+		NodeID:     "collector-syslog",
+		SrcIP:      "10.10.0.23",
+	}
+	msg := "<134>Apr 07 20:00:00 sw-core-01 interface Gi0/1 changed state to down"
+	for i := 0; i < 2; i++ {
+		evt := base
+		evt.ObservedAtUnixMs = int64((i + 1) * 1000)
+		match, ok := matchRule(msg, evt)
+		if ok {
+			t.Fatalf("unexpected early link event match at i=%d: %+v", i, match)
+		}
+	}
+
+	final := base
+	final.ObservedAtUnixMs = 3_000
+	match, ok := matchRule(msg, final)
+	if !ok {
+		t.Fatal("expected link flap burst match")
+	}
+	if match.ConfidenceScore != 84 {
+		t.Fatalf("confidence=%d want 84", match.ConfidenceScore)
+	}
+}
+
+func TestInfrastructureEastWestFlowScanMatchesAtThreshold(t *testing.T) {
+	cfg, err := config.LoadDetector("../../configs/detector.yaml")
+	if err != nil {
+		t.Fatalf("load detector config: %v", err)
+	}
+	resetDetectorRegressionState(cfg)
+
+	base := rawEvent{
+		EventType:        "netflow_flow",
+		SourceType:       "netflow_v5",
+		SrcIP:            "10.44.1.10",
+		DstPort:          445,
+		ObservedAtUnixMs: 0,
+	}
+	for i, dst := range []string{"10.44.2.10", "10.44.2.11", "10.44.2.12", "10.44.2.13"} {
+		evt := base
+		evt.DstIP = dst
+		evt.ObservedAtUnixMs = int64((i + 1) * 1000)
+		match, ok := matchRule("", evt)
+		if ok {
+			t.Fatalf("unexpected early east-west match at i=%d: %+v", i, match)
+		}
+	}
+
+	final := base
+	final.DstIP = "10.44.2.14"
+	final.ObservedAtUnixMs = 5_000
+	match, ok := matchRule("", final)
+	if !ok {
+		t.Fatal("expected east-west flow scan match")
+	}
+	if match.RuleID != infraEastWestFlowRuleID {
+		t.Fatalf("rule_id=%q want %q", match.RuleID, infraEastWestFlowRuleID)
+	}
+	if match.GroupKey != "10.44.1.10" {
+		t.Fatalf("group_key=%q want 10.44.1.10", match.GroupKey)
+	}
+	if match.ProtocolFamily != "smb" {
+		t.Fatalf("protocol_family=%q want smb", match.ProtocolFamily)
+	}
+	if match.ScanFanout != 5 {
+		t.Fatalf("scan_fanout=%d want 5", match.ScanFanout)
+	}
+}
+
+func TestInfrastructureFirewallConfigChangeOutsideWindowKeywordMatches(t *testing.T) {
+	cfg, err := config.LoadDetector("../../configs/detector.yaml")
+	if err != nil {
+		t.Fatalf("load detector config: %v", err)
+	}
+	resetDetectorRegressionState(cfg)
+
+	evt := rawEvent{
+		EventType:        "syslog",
+		SourceType:       "syslog",
+		Host:             "edge-fw-02",
+		NodeID:           "collector-syslog",
+		SrcIP:            "10.10.0.24",
+		ObservedAtUnixMs: 1_000,
+	}
+	msg := "<134>Apr 07 22:30:00 edge-fw-02 firewall configuration committed policy updated change_window=outside"
+	match, ok := matchRule(msg, evt)
+	if !ok {
+		t.Fatal("expected firewall config change outside window match")
+	}
+	if match.RuleID != infraConfigChangeRuleID {
+		t.Fatalf("rule_id=%q want %q", match.RuleID, infraConfigChangeRuleID)
+	}
+	if match.GroupKey != "edge-fw-02" {
+		t.Fatalf("group_key=%q want edge-fw-02", match.GroupKey)
+	}
+	if match.ConfidenceScore != 86 {
+		t.Fatalf("confidence=%d want 86", match.ConfidenceScore)
+	}
+}
+
+func TestInfrastructurePostContainmentBlockVerificationMatches(t *testing.T) {
+	cfg, err := config.LoadDetector("../../configs/detector.yaml")
+	if err != nil {
+		t.Fatalf("load detector config: %v", err)
+	}
+	resetDetectorRegressionState(cfg)
+
+	evt := rawEvent{
+		EventType:        "syslog",
+		SourceType:       "syslog",
+		Host:             "edge-fw-03",
+		NodeID:           "collector-syslog",
+		SrcIP:            "10.10.0.25",
+		ObservedAtUnixMs: 1_000,
+	}
+	msg := "<134>Apr 07 20:45:00 edge-fw-03 firewall action=drop src=10.44.1.10 dst=10.44.2.14 response_action_id=uiact_123 post_containment=blocked"
+	match, ok := matchRule(msg, evt)
+	if !ok {
+		t.Fatal("expected post-containment block verification match")
+	}
+	if match.RuleID != infraPostContainmentRuleID {
+		t.Fatalf("rule_id=%q want %q", match.RuleID, infraPostContainmentRuleID)
+	}
+	if match.GroupKey != "uiact_123" {
+		t.Fatalf("group_key=%q want uiact_123", match.GroupKey)
+	}
+	if match.Lane != networkObserveLane {
+		t.Fatalf("lane=%q want %q", match.Lane, networkObserveLane)
 	}
 }

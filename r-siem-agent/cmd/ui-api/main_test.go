@@ -478,6 +478,25 @@ func TestBuildEventSearchPredicatesIncludesExactAndFreeTextFilters(t *testing.T)
 	}
 }
 
+func TestBuildEventSearchPredicatesIncludesInfrastructureCategory(t *testing.T) {
+	req := eventSearchRequest{
+		FromMs:   1000,
+		ToMs:     2000,
+		Category: "infrastructure",
+	}
+	clauses, args := buildEventSearchPredicates(req)
+	if len(args) != 2 {
+		t.Fatalf("args=%d, want 2 (%v)", len(args), args)
+	}
+	joined := strings.Join(clauses, " AND ")
+	if !strings.Contains(joined, "COALESCE(rule_id,'') LIKE 'R-INFRA-%'") {
+		t.Fatalf("infrastructure category predicate missing in %s", joined)
+	}
+	if !strings.Contains(joined, "source_type IN ('syslog','netflow_v5','snmp_trap')") {
+		t.Fatalf("infrastructure source predicate missing in %s", joined)
+	}
+}
+
 func TestParseAuditLogKeepsCorroborationEvents(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "master.log")

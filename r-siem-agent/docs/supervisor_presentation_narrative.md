@@ -603,14 +603,25 @@ Then say:
   - `docs/deploy/emulated_infrastructure_lab.md`
 - current ingestion proof wrapper:
   - `scripts/verify_infrastructure_plane_phase1.sh`
+- current detection proof wrapper:
+  - `scripts/verify_infrastructure_plane_phase2.sh`
+- expanded detection proof wrapper:
+  - `scripts/verify_infrastructure_plane_phase3.sh`
+- infrastructure detections now implemented:
+  - `R-INFRA-FIREWALL-DENY-BURST`
+  - `R-INFRA-NETWORK-ADMIN-LOGIN`
+  - `R-INFRA-LINK-FLAP-BURST`
+  - `R-INFRA-EAST-WEST-FLOW-SCAN`
+  - `R-INFRA-FIREWALL-CONFIG-CHANGE-OOW`
+  - `R-INFRA-POST-CONTAINMENT-BLOCK-VERIFY`
 
 ### Exact wording to use
-"So the project is no longer only about endpoints. The architecture already supports an infrastructure telemetry plane. The next robust step is to feed that plane from an emulated network environment and add the first infrastructure detections and proofs."
+"So the project is no longer only about endpoints. The architecture already supports an infrastructure telemetry plane. The collection-side proof is already in place, six infrastructure detections are now implemented with proof scripts, and the next robust step is to feed that plane from a fuller emulated network environment and extend the response playbook depth."
 
 ## Closing Line
 Use this if you want a firm ending:
 
-"R-SIEM now proves that it can ingest, detect, decide, respond, investigate, govern, and audit on live managed endpoints, with Linux validated most deeply and Windows support implemented. The same architecture is now prepared to extend into the infrastructure plane."
+"R-SIEM now proves that it can ingest, detect, decide, respond, investigate, govern, and audit on live managed endpoints, with Linux validated most deeply and Windows support implemented. The same architecture is now active on infrastructure telemetry and six verified infrastructure detection paths, and is ready to extend further into the infrastructure plane."
 
 ## Fast Reference: Commands in Order
 

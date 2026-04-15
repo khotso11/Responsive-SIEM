@@ -603,6 +603,42 @@ policies:
 	}
 }
 
+func TestCompileStepsCarriesTargetAgentID(t *testing.T) {
+	cfg, err := parseROEConfig([]byte("policies:\n  approvals:\n    timeout_ms: 300000\n"))
+	if err != nil {
+		t.Fatalf("parseROEConfig error: %v", err)
+	}
+	playbook := roePlaybook{
+		ID: "PB-INFRA-EAST-WEST-FLOW-SCAN-NOTIFY",
+		Steps: []roeStep{
+			{
+				ActionType:    "network_block",
+				TargetFrom:    "group_key",
+				TargetAgentID: "{target_agent_id}",
+				Params:        map[string]any{"direction": "both"},
+			},
+		},
+	}
+	trigger := responseTrigger{
+		Lane:          "FAST",
+		GroupKey:      "10.44.1.25",
+		TargetAgentID: "gateway-lnx-01",
+	}
+	steps, err := compileSteps("run-target", trigger, playbook, cfg, nil)
+	if err != nil {
+		t.Fatalf("compileSteps error: %v", err)
+	}
+	if len(steps) != 1 {
+		t.Fatalf("len(steps)=%d, want 1", len(steps))
+	}
+	if got := steps[0].TargetAgentID; got != "gateway-lnx-01" {
+		t.Fatalf("target_agent_id=%q, want gateway-lnx-01", got)
+	}
+	if got := steps[0].Target; got != "10.44.1.25" {
+		t.Fatalf("target=%q, want 10.44.1.25", got)
+	}
+}
+
 func TestApplyAllowlistRejectsWrongCommandFamilyForPlaybook(t *testing.T) {
 	cfg, err := parseROEConfig([]byte(`
 policies:

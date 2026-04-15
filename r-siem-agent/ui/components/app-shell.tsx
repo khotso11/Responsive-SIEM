@@ -13,6 +13,7 @@ const NAV = [
   { href: "/incidents", label: "Incidents", icon: ListChecks },
   { href: "/endpoints", label: "Endpoints", icon: Activity },
   { href: "/actions", label: "Actions", icon: Zap },
+  { href: "/infrastructure", label: "Infrastructure", icon: Clock3 },
   { href: "/search", label: "Search", icon: Search },
   { href: "/audit", label: "Audit", icon: ShieldCheck }
 ];
@@ -97,7 +98,7 @@ export function AppShell({ children }: { children: ReactNode }) {
       el.scrollTop = nextTop;
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [pathname, searchParams, scrollStorageKey]);
+  }, [pathname, scrollStorageKey]);
 
   useEffect(() => {
     const el = mainRef.current;
@@ -261,7 +262,7 @@ export function AppShell({ children }: { children: ReactNode }) {
     return (
       <div className="flex min-h-screen items-center justify-center p-4">
         <div className="panel w-full max-w-md p-5">
-          <h1 className="mb-2 text-xl font-semibold">R-SIEM SOC Console Login</h1>
+          <h1 className="mb-2 text-xl font-semibold">R-SIEM Console Login</h1>
           <p className="mb-4 text-sm text-ink-300">Sign in with a local UI API user (admin/analyst).</p>
           <div className="space-y-3">
             <input
@@ -296,8 +297,8 @@ export function AppShell({ children }: { children: ReactNode }) {
       <header className="panel mb-4 shrink-0 p-4">
         <div className="mb-4 flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
           <div>
-            <h1 className="text-[24px] font-semibold tracking-tight">R-SIEM SOC Console</h1>
-            <p className="text-sm text-ink-300">Posture dashboard, triage, investigations, approvals, endpoints, and audit.</p>
+            <h1 className="text-[24px] font-semibold tracking-tight">R-SIEM Console</h1>
+            <p className="text-sm text-ink-300">Posture dashboard, triage, investigations, approvals, endpoints, infrastructure, and audit.</p>
           </div>
           <div className="flex flex-wrap items-center gap-2 rounded-lg border border-ink-700 bg-ink-900/70 px-3 py-2 text-xs text-ink-200">
             <Clock3 className="h-4 w-4" />

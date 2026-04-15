@@ -65,6 +65,7 @@ export type Incident = {
   identity_workflow_eligible?: boolean;
   identity_workflow_reason?: string;
   source?: string;
+  category?: string;
 };
 
 export type IncidentUIState = {
@@ -108,6 +109,7 @@ export type IncidentDetailResponse = {
   steps: StepResult[];
   ui_state?: IncidentUIState;
   annotations?: AuditEntry[];
+  linked_action?: ResponseActionView;
   source: string;
 };
 
@@ -329,6 +331,7 @@ export type EventRow = {
   exec_sha256?: string;
   event_idem_key: string;
   raw_line_sha256?: string;
+  category?: string;
 };
 
 export type EndpointSummary = {
@@ -365,6 +368,196 @@ export type EndpointDetailSummary = {
   top_domains?: NamedCount[];
 };
 
+export type InfrastructureTopologySummary = {
+  window_from_unix_ms: number;
+  window_to_unix_ms: number;
+  node_count: number;
+  managed_endpoint_count: number;
+  windows_endpoint_count: number;
+  live_node_count: number;
+  infrastructure_runs: number;
+  open_infrastructure_runs: number;
+  recent_event_count: number;
+  active_action_count: number;
+  verified_block_count: number;
+};
+
+export type InfrastructureTopologyProvider = {
+  kind: string;
+  name: string;
+  ui_url?: string;
+  api_base_url?: string;
+  api_lab_path?: string;
+  project_path?: string;
+  lab_file?: string;
+  topology_import_path?: string;
+  source_status: string;
+  source_detail?: string;
+  runtime_status?: string;
+  runtime_detail?: string;
+  runtime_last_sync_unix_ms?: number;
+  notes?: string;
+};
+
+export type InfrastructureNetworkSpec = {
+  cidr: string;
+  purpose: string;
+};
+
+export type InfrastructureTelemetryExport = {
+  type: string;
+  destination?: string;
+  path?: string;
+};
+
+export type InfrastructureNodeLive = {
+  status: string;
+  status_reason?: string;
+  recent_event_count: number;
+  detection_count: number;
+  incident_count: number;
+  open_incident_count: number;
+  active_action_count: number;
+  verified_block_count: number;
+  last_seen_unix_ms?: number;
+  seen_source_types?: string[];
+  seen_rule_ids?: string[];
+  latest_run_id?: string;
+  latest_action_id?: string;
+  eve_runtime_status?: string;
+  eve_console_url?: string;
+  eve_last_sync_unix_ms?: number;
+};
+
+export type InfrastructureTopologyNode = {
+  id: string;
+  label: string;
+  eve_node_name?: string;
+  eve_node_id?: string;
+  role: string;
+  os?: string;
+  ip?: string;
+  mgmt_ip?: string;
+  data_ips?: string[];
+  networks?: string[];
+  agent_support?: boolean;
+  services?: string[];
+  telemetry_exports?: InfrastructureTelemetryExport[];
+  position_left?: number;
+  position_top?: number;
+  note?: string;
+  live: InfrastructureNodeLive;
+};
+
+export type InfrastructureTopologyLink = {
+  id: string;
+  label?: string;
+  network?: string;
+  endpoints: string[];
+  provider_source?: string;
+};
+
+export type InfrastructureEveNodeActionResult = {
+  node_id: string;
+  node_name?: string;
+  action: string;
+  runtime_status?: string;
+  console_url?: string;
+  detail?: string;
+};
+
+export type InfrastructureTopologyStartupStep = {
+  order: number;
+  device_id: string;
+  eve_node_name?: string;
+  device_type?: string;
+  image?: string;
+  boot_command?: string;
+  validation_hint?: string;
+};
+
+export type InfrastructureCollectorLive = {
+  recent_event_count: number;
+  active_exporters: number;
+  last_seen_unix_ms?: number;
+};
+
+export type InfrastructureCollector = {
+  source: string;
+  source_type: string;
+  collector_binary: string;
+  collector_config: string;
+  nats_stream: string;
+  nats_subject: string;
+  exporters: string[];
+  expected_use_cases: string[];
+  live: InfrastructureCollectorLive;
+};
+
+export type InfrastructureTopologyTestLive = {
+  status: string;
+  incident_count: number;
+  last_seen_unix_ms?: number;
+  last_run_id?: string;
+  active_action_count: number;
+};
+
+export type InfrastructureTopologyTest = {
+  id: string;
+  telemetry: string[];
+  initiating_node?: string;
+  target_node?: string;
+  target_segment?: string;
+  objective: string;
+  command_hint?: string;
+  expected_rule_id?: string;
+  search_pivot?: string;
+  live: InfrastructureTopologyTestLive;
+};
+
+export type InfrastructureTopologyActivity = {
+  kind: string;
+  ts_unix_ms: number;
+  label: string;
+  status?: string;
+  rule_id?: string;
+  run_id?: string;
+  node_id?: string;
+  source_type?: string;
+  action_id?: string;
+};
+
+export type InfrastructureTopologyResponse = {
+  lab: { id: string; description: string };
+  provider: InfrastructureTopologyProvider;
+  management: {
+    id?: string;
+    eve_node_name?: string;
+    hostname?: string;
+    role?: string;
+    ip?: string;
+    mgmt_ip?: string;
+    services?: string[];
+    collector_endpoints?: Record<string, string>;
+  };
+  networks: Record<string, InfrastructureNetworkSpec>;
+  summary: InfrastructureTopologySummary;
+  nodes: InfrastructureTopologyNode[];
+  links: InfrastructureTopologyLink[];
+  startup: InfrastructureTopologyStartupStep[];
+  collectors: InfrastructureCollector[];
+  tests: InfrastructureTopologyTest[];
+  activity: InfrastructureTopologyActivity[];
+  source: string;
+};
+
+export type InfrastructureEveNodeActionResponse = {
+  ok: boolean;
+  node_key: string;
+  provider: InfrastructureTopologyProvider;
+  result: InfrastructureEveNodeActionResult;
+};
+
 export type AuditEntry = {
   ts: string;
   msg: string;
@@ -388,6 +581,7 @@ export type EventSearchQuery = {
   q?: string;
   from?: number;
   to?: number;
+  category?: string;
   node_id?: string;
   user_name?: string;
   src_ip?: string;

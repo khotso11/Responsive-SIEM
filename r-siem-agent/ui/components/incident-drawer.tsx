@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   addIncidentNote,
   approveIncident,
@@ -45,6 +45,7 @@ import {
   ResponseHistoryResponse,
   StepResult
 } from "@/lib/types";
+import { infrastructureBadgeClass, infrastructureDescription, infrastructureLabel, isInfrastructureIncident } from "@/lib/infrastructure";
 import { EmptyState, LaneBadge, LoadingState, StatusBadge, ValueRow, unixMsToLocal } from "@/components/ui";
 
 type DrawerTab = "overview" | "steps" | "timeline" | "entities" | "evidence" | "actions" | "logic";
@@ -370,8 +371,8 @@ export function IncidentDrawer({
   const [steps, setSteps] = useState<StepResult[]>([]);
   const [events, setEvents] = useState<EventRow[]>([]);
   const [loading, setLoading] = useState(false);
-  const [refreshing, setRefreshing] = useState(false);
   const [hasLoadedOnce, setHasLoadedOnce] = useState(false);
+  const hasLoadedOnceRef = useRef(false);
   const [investigation, setInvestigation] = useState<InvestigationResponse | null>(null);
   const [investigationLoading, setInvestigationLoading] = useState(false);
   const [investigationError, setInvestigationError] = useState("");
@@ -384,6 +385,7 @@ export function IncidentDrawer({
   const [responseActions, setResponseActions] = useState<ResponseActionListResponse | null>(null);
   const [responseActionsLoading, setResponseActionsLoading] = useState(false);
   const [responseActionsError, setResponseActionsError] = useState("");
+  const [linkedAction, setLinkedAction] = useState<ResponseActionView | null>(null);
   const [entityUserProfile, setEntityUserProfile] = useState<EntityProfileResponse | null>(null);
   const [entitySrcProfile, setEntitySrcProfile] = useState<EntityProfileResponse | null>(null);
   const [entityDstProfile, setEntityDstProfile] = useState<EntityProfileResponse | null>(null);
@@ -435,13 +437,13 @@ export function IncidentDrawer({
 
   const load = useCallback(async () => {
     if (!runID || !open) return;
-    if (hasLoadedOnce) setRefreshing(true);
-    else setLoading(true);
+    if (!hasLoadedOnceRef.current) setLoading(true);
     try {
       const [detail, auth] = await Promise.all([getIncident(runID), me().catch(() => null)]);
       const user = auth?.user || null;
       setRun(detail.run);
       setSteps(detail.steps || []);
+      setLinkedAction(detail.linked_action || null);
       setAuthUser(user);
       setUIState(detail.ui_state || { notes: [], assignment: "", reviewed: false });
       setAnnotations(detail.annotations || []);
@@ -477,12 +479,12 @@ export function IncidentDrawer({
       setArtifactMap(
         collected.filter((a) => a.path.includes("/fr04/") || a.path.endsWith("capture.pcap") || a.path.endsWith("chain_of_custody.json"))
       );
+      hasLoadedOnceRef.current = true;
       setHasLoadedOnce(true);
     } finally {
       setLoading(false);
-      setRefreshing(false);
     }
-  }, [actorDirty, assigneeDirty, fromMs, hasLoadedOnce, open, pivotNode, pivotSrcIP, pivotUser, runID, toMs]);
+  }, [actorDirty, assigneeDirty, fromMs, open, pivotNode, pivotSrcIP, pivotUser, runID, toMs]);
 
   const loadInvestigationData = useCallback(async () => {
     if (!runID || !open) return;
@@ -619,6 +621,7 @@ export function IncidentDrawer({
     setResponseActions(null);
     setResponseActionsError("");
     setResponseActionsLoading(false);
+    setLinkedAction(null);
     setEntityUserProfile(null);
     setEntitySrcProfile(null);
     setEntityDstProfile(null);
@@ -627,9 +630,9 @@ export function IncidentDrawer({
     setProviderCatalog(null);
     setProviderCatalogError("");
     setProviderCatalogLoading(false);
+    hasLoadedOnceRef.current = false;
     setHasLoadedOnce(false);
     setLoading(false);
-    setRefreshing(false);
   }, [initialTab, runID, open]);
 
   useEffect(() => {
@@ -713,6 +716,7 @@ export function IncidentDrawer({
     [run]
   );
   const actionGroups = useMemo(() => groupResponseActions(responseActions?.items), [responseActions?.items]);
+  const isInfrastructureRun = useMemo(() => isInfrastructureIncident(run), [run]);
   const selectedManualAction = useMemo(
     () =>
       responseActions?.available_actions?.find((item) => item.id === manualActionName) ||
@@ -992,7 +996,7 @@ export function IncidentDrawer({
       <div className="absolute right-0 top-0 h-full w-full max-w-4xl overflow-auto border-l border-ink-700 bg-ink-950 p-4 shadow-2xl">
         <div className="mb-3 flex items-center justify-between">
           <div>
-            <h3 className="text-lg font-semibold">Analyst Investigation Workspace</h3>
+            <h3 className="text-lg font-semibold">Incident Investigation</h3>
             <p className="text-xs text-ink-300">run_id: {runID}</p>
           </div>
           <button className="btn-secondary" onClick={onClose}>
@@ -1016,13 +1020,28 @@ export function IncidentDrawer({
           <span className="font-medium text-ink-100">{selectedTabMeta.label}:</span> {selectedTabMeta.detail}
         </div>
 
-        {loading && !hasLoadedOnce ? <LoadingState /> : null}
-        {refreshing && hasLoadedOnce ? (
-          <div className="mb-3 rounded border border-ink-800 bg-ink-900/60 px-3 py-2 text-xs text-ink-300">
-            Refreshing investigation workspace...
+        {hasLoadedOnce && run && isInfrastructureRun ? (
+          <div className={`mb-3 rounded border px-3 py-3 ${infrastructureBadgeClass(run.rule_id)}`}>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="rounded-full border border-current/40 px-2 py-0.5 text-[10px] uppercase tracking-[0.2em]">
+                Infrastructure
+              </span>
+              <span className="text-sm font-semibold">{infrastructureLabel(run.rule_id)}</span>
+            </div>
+            <div className="mt-1 text-xs opacity-90">{infrastructureDescription(run.rule_id)}</div>
+            <div className="mt-2 text-xs opacity-80">
+              Source: {run.source_type || "-"} · Event: {run.event_type || "-"} · Target agent: {run.target_agent_id || "not set"}
+            </div>
+            {linkedAction ? (
+              <div className="mt-2 rounded border border-current/25 bg-black/10 px-2 py-2 text-xs opacity-90">
+                Ledger action: {linkedAction.action_id} · Status: {linkedAction.status || "-"} · Bucket: {linkedAction.bucket || "-"} · Target:{" "}
+                {linkedAction.target || "-"} · Control point: {linkedAction.target_agent_id || linkedAction.node_id || "not set"}
+              </div>
+            ) : null}
           </div>
         ) : null}
 
+        {loading && !hasLoadedOnce ? <LoadingState /> : null}
         {hasLoadedOnce && run && (policyBadge(run.approval_policy_reason) || policySummary.length > 0) ? (
           <div className="mb-3 rounded border border-cyan-900/70 bg-cyan-950/20 px-3 py-3">
             <div className="mb-1 text-[11px] uppercase tracking-[0.18em] text-cyan-300">Policy Summary</div>
@@ -1064,6 +1083,13 @@ export function IncidentDrawer({
               <div className="rounded border border-ink-800 bg-ink-900/50 p-3 text-sm">
                 <div className="text-[11px] uppercase tracking-[0.12em] text-ink-400">Rule</div>
                 <div className="mt-2 font-medium text-ink-100">{run.rule_id || "-"}</div>
+                {isInfrastructureRun ? (
+                  <div className="mt-2">
+                    <span className={`rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-[0.18em] ${infrastructureBadgeClass(run.rule_id)}`}>
+                      {infrastructureLabel(run.rule_id)}
+                    </span>
+                  </div>
+                ) : null}
               </div>
               <div className="rounded border border-ink-800 bg-ink-900/50 p-3 text-sm">
                 <div className="text-[11px] uppercase tracking-[0.12em] text-ink-400">Playbook</div>
@@ -1857,7 +1883,6 @@ export function IncidentDrawer({
             <div className="rounded border border-ink-800 p-3">
               <div className="mb-2 flex items-center justify-between gap-2">
                 <h4 className="text-sm font-semibold">Launch Response Action</h4>
-                {responseActionsLoading ? <span className="text-xs text-ink-400">Refreshing action state…</span> : null}
               </div>
               {responseActionsError ? (
                 <div className="mb-2 rounded border border-rose-700/50 bg-rose-950/20 px-3 py-2 text-xs text-rose-100">

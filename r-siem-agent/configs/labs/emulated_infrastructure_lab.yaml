@@ -1,11 +1,30 @@
+provider:
+  kind: eve_ng
+  name: rsiem-eve-ng-lab
+  ui_url: https://eve-ng.local/
+  api_base_url: https://eve-ng.local
+  api_lab_path: /R-SIEM/rsiem-infrastructure.unl
+  username_env: RSIEM_EVE_NG_USERNAME
+  password_env: RSIEM_EVE_NG_PASSWORD
+  allow_insecure_tls: true
+  project_path: /opt/unetlab/labs/R-SIEM/
+  lab_file: /opt/unetlab/labs/R-SIEM/rsiem-infrastructure.unl
+  topology_import_path: eve_ng_rsiem_infrastructure.unl
+  notes: >-
+    EVE-NG is the emulated lab source of truth. R-SIEM imports the lab topology file
+    and overlays live incidents, telemetry, and response actions on top of it.
+
 lab:
   id: emulated-infrastructure-v1
   description: >-
-    Emulated infrastructure plane for R-SIEM using virtual routers, firewall, switch
-    segments, Windows and Linux endpoints, and a management node running the master stack.
+    Emulated infrastructure plane for R-SIEM using virtual routers, firewall
+    gateways, switch segments, Windows and Linux endpoints, and a management node
+    running the master stack.
 
 management_plane:
   rsiem_master:
+    id: rsiem-master-01
+    eve_node_name: rsiem-master-01
     hostname: rsiem-master-01
     role: management
     ip: 10.10.0.10/24
@@ -42,6 +61,7 @@ networks:
 
 nodes:
   - id: edge-rtr-01
+    eve_node_name: edge-rtr-01
     role: router
     mgmt_ip: 10.10.0.21/24
     data_ips:
@@ -56,6 +76,7 @@ nodes:
         destination: 10.10.0.10:9162
 
   - id: fw-01
+    eve_node_name: fw-01
     role: firewall_gateway
     mgmt_ip: 10.10.0.22/24
     data_ips:
@@ -70,6 +91,7 @@ nodes:
         destination: 10.10.0.10:9162
 
   - id: sw-core-01
+    eve_node_name: sw-core-01
     role: switch_segment
     mgmt_ip: 10.10.0.23/24
     telemetry_exports:
@@ -79,6 +101,7 @@ nodes:
         destination: 10.10.0.10:9162
 
   - id: linux-endpoint-01
+    eve_node_name: linux-endpoint-01
     role: managed_endpoint
     os: linux
     ip: 10.20.10.11/24
@@ -94,6 +117,7 @@ nodes:
       - type: dns
 
   - id: linux-endpoint-02
+    eve_node_name: linux-endpoint-02
     role: managed_endpoint
     os: linux
     ip: 10.20.10.12/24
@@ -109,6 +133,7 @@ nodes:
       - type: dns
 
   - id: win-endpoint-01
+    eve_node_name: win-endpoint-01
     role: managed_endpoint
     os: windows
     ip: 10.20.10.21/24
@@ -125,28 +150,126 @@ nodes:
       exercised more heavily in live tests.
 
   - id: app-srv-01
+    eve_node_name: app-srv-01
     role: server
     os: linux
     ip: 10.20.20.11/24
     agent_support: true
 
   - id: db-srv-01
+    eve_node_name: db-srv-01
     role: server
     os: linux
     ip: 10.20.20.12/24
     agent_support: true
 
   - id: dmz-srv-01
+    eve_node_name: dmz-srv-01
     role: dmz_service
     os: linux
     ip: 10.20.30.11/24
     agent_support: false
 
   - id: attacker-01
+    eve_node_name: attacker-01
     role: attacker_simulation
     os: linux
     ip: 10.30.0.11/24
     agent_support: false
+
+links:
+  - id: mgmt-core
+    label: management fabric
+    network: management
+    endpoints: [rsiem-master-01, edge-rtr-01, fw-01, sw-core-01]
+  - id: user-access
+    label: user access segment
+    network: user_lan
+    endpoints: [edge-rtr-01, sw-core-01, linux-endpoint-01, linux-endpoint-02, win-endpoint-01]
+  - id: server-access
+    label: server segment
+    network: server_lan
+    endpoints: [edge-rtr-01, sw-core-01, app-srv-01, db-srv-01]
+  - id: dmz-edge
+    label: dmz edge segment
+    network: dmz
+    endpoints: [edge-rtr-01, fw-01, dmz-srv-01]
+  - id: red-team-uplink
+    label: red team uplink
+    network: red_team
+    endpoints: [edge-rtr-01, fw-01, attacker-01]
+
+startup_sequence:
+  - order: 1
+    device_id: edge-rtr-01
+    eve_node_name: edge-rtr-01
+    device_type: router
+    image: vios-adventerprisek9-m.SPA.159-3.M6
+    boot_command: Start the router node in EVE-NG and wait for the management interface to answer on 10.10.0.21.
+    validation_hint: Verify syslog and SNMP trap telemetry can be exported toward 10.10.0.10.
+  - order: 2
+    device_id: fw-01
+    eve_node_name: fw-01
+    device_type: firewall_gateway
+    image: fortios.qcow2
+    boot_command: Start the firewall/gateway node in EVE-NG and confirm the DMZ and red-team interfaces are up.
+    validation_hint: Verify syslog, NetFlow v5, and SNMP trap exporters point at the R-SIEM management node.
+  - order: 3
+    device_id: sw-core-01
+    eve_node_name: sw-core-01
+    device_type: switch_segment
+    image: iol_l2-adventerprisek9-ms
+    boot_command: Start the switch node in EVE-NG and verify the user and server VLANs are active.
+    validation_hint: Verify link state notifications reach the SNMP trap and syslog collectors.
+  - order: 4
+    device_id: linux-endpoint-01
+    eve_node_name: linux-endpoint-01
+    device_type: managed_endpoint
+    image: ubuntu-22.04-cloudimg
+    boot_command: Start linux-endpoint-01, bring up the agent and endpoint collectors, and confirm mTLS transport to the master.
+    validation_hint: Verify proc_net and auditd events appear in Advanced Search.
+  - order: 5
+    device_id: linux-endpoint-02
+    eve_node_name: linux-endpoint-02
+    device_type: managed_endpoint
+    image: ubuntu-22.04-cloudimg
+    boot_command: Start linux-endpoint-02, join the user segment, and confirm agent registration.
+    validation_hint: Verify endpoint telemetry is visible and can participate in east-west flow scan proofs.
+  - order: 6
+    device_id: win-endpoint-01
+    eve_node_name: win-endpoint-01
+    device_type: managed_endpoint
+    image: windows-10-enterprise.qcow2
+    boot_command: Start the Windows endpoint and verify the agent service and tail-based collector path are healthy.
+    validation_hint: Verify Windows endpoint telemetry is visible even though Linux remains the more heavily tested path.
+  - order: 7
+    device_id: app-srv-01
+    eve_node_name: app-srv-01
+    device_type: server
+    image: ubuntu-22.04-cloudimg
+    boot_command: Start the application server and verify reachability from the user and DMZ networks.
+    validation_hint: Use it as an east-west scan or service-abuse target.
+  - order: 8
+    device_id: db-srv-01
+    eve_node_name: db-srv-01
+    device_type: server
+    image: ubuntu-22.04-cloudimg
+    boot_command: Start the database server and confirm it is reachable only through the intended server segment path.
+    validation_hint: Use it as a protected server-lan asset in scan and containment proofs.
+  - order: 9
+    device_id: dmz-srv-01
+    eve_node_name: dmz-srv-01
+    device_type: dmz_service
+    image: ubuntu-22.04-cloudimg
+    boot_command: Start the DMZ service node and expose the test service to the firewall path.
+    validation_hint: Use it for firewall deny burst and north-south access-control proofs.
+  - order: 10
+    device_id: attacker-01
+    eve_node_name: attacker-01
+    device_type: attacker_simulation
+    image: kali-linux.qcow2
+    boot_command: Start the attacker node last and use it to drive the infrastructure verifier scenarios.
+    validation_hint: Confirm no telemetry is expected from an agent here; evidence arrives via firewall, router, switch, and endpoint sensors.
 
 telemetry_mapping:
   - source: device_syslog
@@ -204,6 +327,9 @@ first_six_tests:
     initiating_node: attacker-01
     target_node: dmz-srv-01
     objective: prove blocked north-south abuse is visible on the infrastructure plane
+    command_hint: ./scripts/verify_infra_firewall_deny_burst.sh
+    expected_rule_id: R-INFRA-FIREWALL-DENY-BURST
+    search_pivot: category:infrastructure rule_id:R-INFRA-FIREWALL-DENY-BURST
 
   - id: infra-02-east-west-scan
     telemetry:
@@ -212,6 +338,9 @@ first_six_tests:
     initiating_node: linux-endpoint-01
     target_segment: server_lan
     objective: correlate internal scanning with flow evidence and, if managed, endpoint evidence
+    command_hint: ./scripts/verify_infra_east_west_flow_scan.sh
+    expected_rule_id: R-INFRA-EAST-WEST-FLOW-SCAN
+    search_pivot: category:infrastructure rule_id:R-INFRA-EAST-WEST-FLOW-SCAN
 
   - id: infra-03-network-admin-login
     telemetry:
@@ -219,6 +348,9 @@ first_six_tests:
     initiating_node: attacker-01
     target_node: edge-rtr-01
     objective: prove device management-plane access is observable
+    command_hint: ./scripts/verify_infra_network_admin_login.sh
+    expected_rule_id: R-INFRA-NETWORK-ADMIN-LOGIN
+    search_pivot: category:infrastructure rule_id:R-INFRA-NETWORK-ADMIN-LOGIN
 
   - id: infra-04-link-flap-or-linkdown
     telemetry:
@@ -226,12 +358,18 @@ first_six_tests:
       - syslog
     initiating_node: sw-core-01
     objective: prove infrastructure health events are ingested and can be promoted to incidents
+    command_hint: ./scripts/verify_infra_link_flap_burst.sh
+    expected_rule_id: R-INFRA-LINK-FLAP-BURST
+    search_pivot: category:infrastructure rule_id:R-INFRA-LINK-FLAP-BURST
 
   - id: infra-05-firewall-config-change
     telemetry:
       - syslog
     initiating_node: fw-01
     objective: prove configuration governance events are visible to R-SIEM
+    command_hint: ./scripts/verify_infra_firewall_config_change_oow.sh
+    expected_rule_id: R-INFRA-FIREWALL-CONFIG-CHANGE-OOW
+    search_pivot: category:infrastructure rule_id:R-INFRA-FIREWALL-CONFIG-CHANGE-OOW
 
   - id: infra-06-domain-or-destination-block-verification
     telemetry:
@@ -242,3 +380,6 @@ first_six_tests:
     initiating_node: linux-endpoint-01
     target_node: fw-01
     objective: prove before-during-after verification for an enforced block action
+    command_hint: ./scripts/verify_infra_post_containment_block_verification.sh
+    expected_rule_id: R-INFRA-POST-CONTAINMENT-BLOCK-VERIFY
+    search_pivot: category:infrastructure rule_id:R-INFRA-POST-CONTAINMENT-BLOCK-VERIFY

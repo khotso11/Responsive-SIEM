@@ -1,9 +1,10 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { getSearchEvents } from "@/lib/api";
 import { INCIDENT_MUTATED_EVENT, INCIDENTS_UPDATED_EVENT } from "@/lib/events";
+import { infrastructureBadgeClass, infrastructureShortLabel, isInfrastructureEvent } from "@/lib/infrastructure";
 import { EventRow, EventSearchQuery, EventSearchResponse } from "@/lib/types";
 import { EmptyState, ErrorState, LoadingState, unixMsToLocal } from "@/components/ui";
 
@@ -30,6 +31,7 @@ function initialQuery(searchParams: URLSearchParams): EventSearchQuery {
     q: searchParams.get("q") || "",
     from: parseQueryTime(searchParams.get("from")) || parseQueryTime(searchParams.get("gfrom")),
     to: parseQueryTime(searchParams.get("to")) || parseQueryTime(searchParams.get("gto")),
+    category: searchParams.get("category") || "",
     node_id: searchParams.get("node_id") || "",
     user_name: searchParams.get("user_name") || "",
     src_ip: searchParams.get("src_ip") || "",
@@ -97,8 +99,8 @@ type QueryToken = {
   value: string;
 };
 
-const SOURCE_TYPE_OPTIONS = ["", "auditd_connect", "auditd_exec", "proc_net", "dns_packet", "inotify", "tail"];
-const EVENT_TYPE_OPTIONS = ["", "network_connection", "process_exec", "dns_query", "file_change", "auth_failed"];
+const SOURCE_TYPE_OPTIONS = ["", "auditd_connect", "auditd_exec", "proc_net", "dns_packet", "inotify", "tail", "syslog", "netflow_v5", "snmp_trap"];
+const EVENT_TYPE_OPTIONS = ["", "network_connection", "process_exec", "dns_query", "file_change", "auth_failed", "syslog", "netflow_flow", "snmp_trap"];
 const PROTOCOL_OPTIONS = ["", "rdp", "winrm", "ssh", "smb", "rpc", "ldap", "dns", "ftp"];
 const SEVERITY_OPTIONS = ["", "critical", "high", "medium", "low", "info"];
 const WINDOW_PRESETS: Array<{ label: string; ms: number }> = [
@@ -132,6 +134,7 @@ function activeFilterChips(filters: EventSearchQuery): FilterChip[] {
     chips.push({ key, label, value: trimmed });
   };
   push("q", "Text", filters.q);
+  push("category", "Category", filters.category);
   push("node_id", "Node", filters.node_id);
   push("user_name", "User", filters.user_name);
   push("source_type", "Source", filters.source_type);
@@ -164,6 +167,7 @@ function buildSearchStatement(filters: EventSearchQuery): string {
     parts.push(`@${label}:${trimmed.includes(" ") ? `"${trimmed}"` : trimmed}`);
   };
   push("q", filters.q);
+  push("fields.category", filters.category);
   push("fields.node_id", filters.node_id);
   push("fields.user_name", filters.user_name);
   push("fields.src_ip", filters.src_ip);
@@ -187,6 +191,7 @@ function buildSearchStatement(filters: EventSearchQuery): string {
 
 function hasStructuredFilters(filters: EventSearchQuery): boolean {
   return Boolean(
+    filters.category ||
     filters.node_id ||
     filters.user_name ||
     filters.src_ip ||
@@ -256,6 +261,7 @@ function tokenizeQuery(input: string): QueryToken[] {
 function normalizedQueryKey(raw?: string): string {
   const value = (raw || "").trim().toLowerCase().replace(/^@/, "");
   const map: Record<string, string> = {
+    "fields.category": "category",
     "fields.node_id": "node_id",
     "fields.user_name": "user_name",
     "fields.src_ip": "src_ip",
@@ -284,6 +290,7 @@ function filtersFromQuery(input: string, base: EventSearchQuery): EventSearchQue
   const next: EventSearchQuery = {
     ...base,
     q: "",
+    category: "",
     node_id: "",
     user_name: "",
     src_ip: "",
@@ -320,6 +327,7 @@ function filtersFromQuery(input: string, base: EventSearchQuery): EventSearchQue
         next.dst_port = Number(value) || undefined;
         break;
       case "node_id":
+      case "category":
       case "user_name":
       case "src_ip":
       case "dst_ip":
@@ -454,9 +462,9 @@ export default function SearchPage() {
   const [draftFilters, setDraftFilters] = useState<EventSearchQuery>(() => initialQuery(searchParams));
   const [result, setResult] = useState<EventSearchResponse | null>(null);
   const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [hasLoadedOnce, setHasLoadedOnce] = useState(false);
+  const hasLoadedOnceRef = useRef(false);
   const [showFilters, setShowFilters] = useState(false);
   const [analysisMode, setAnalysisMode] = useState<AnalysisMode>("source_type");
   const [queryText, setQueryText] = useState(() => buildSearchStatement(initialQuery(searchParams)));
@@ -470,20 +478,19 @@ export default function SearchPage() {
   }, [searchParams]);
 
   const load = useCallback(async () => {
-    if (hasLoadedOnce) setRefreshing(true);
-    else setLoading(true);
+    if (!hasLoadedOnceRef.current) setLoading(true);
     setError(null);
     try {
       const res = await getSearchEvents(filters);
       setResult(res);
+      hasLoadedOnceRef.current = true;
       setHasLoadedOnce(true);
     } catch (err) {
       setError((err as Error).message || String(err));
     } finally {
       setLoading(false);
-      setRefreshing(false);
     }
-  }, [filters, hasLoadedOnce]);
+  }, [filters]);
 
   useEffect(() => {
     void load();
@@ -507,6 +514,7 @@ export default function SearchPage() {
       ["q", next.q],
       ["from", next.from],
       ["to", next.to],
+      ["category", next.category],
       ["node_id", next.node_id],
       ["user_name", next.user_name],
       ["src_ip", next.src_ip],
@@ -536,7 +544,7 @@ export default function SearchPage() {
         params.set(key, String(value));
       }
     }
-    router.push(`${pathname}?${params.toString()}`);
+    router.push(`${pathname}?${params.toString()}`, { scroll: false });
   }, [pathname, router, searchParams]);
 
   const updateDraftFilters = useCallback((updater: EventSearchQuery | ((prev: EventSearchQuery) => EventSearchQuery)) => {
@@ -587,6 +595,19 @@ export default function SearchPage() {
     }));
   };
 
+  const applyInfrastructurePivot = (patch: Partial<EventSearchQuery>) => {
+    const next = {
+      ...draftFilters,
+      category: "infrastructure",
+      page: 1,
+      ...patch
+    };
+    setDraftFilters(next);
+    setFilters(next);
+    setQueryText(buildSearchStatement(next));
+    pushFilters(next);
+  };
+
   const items = result?.items || [];
   const total = result?.total || 0;
   const currentPage = result?.page || filters.page || 1;
@@ -602,20 +623,32 @@ export default function SearchPage() {
     <section className="flex h-full min-h-0 flex-col gap-4 overflow-hidden">
       <div className="flex items-center justify-between gap-3">
         <div>
-          <div className="text-[11px] uppercase tracking-[0.22em] text-cyan-300">Analyst Workspace</div>
+          <div className="text-[11px] uppercase tracking-[0.22em] text-cyan-300">Search Operations</div>
           <h2 className="mt-1 text-[22px] font-semibold tracking-tight">Advanced Search</h2>
           <p className="mt-1 text-[13px] text-ink-300">
             Search normalized endpoint activity, pivot into timeline analysis, and inspect grouped evidence without leaving the investigation surface.
           </p>
         </div>
-        {refreshing ? (
-          <div className="rounded-full border border-cyan-700/70 bg-cyan-950/40 px-3 py-1 text-[11px] uppercase tracking-[0.18em] text-cyan-200">
-            Refreshing
-          </div>
-        ) : null}
       </div>
 
       <div className="panel-elevated flex flex-col gap-4 p-4">
+        <div className="rounded-2xl border border-cyan-900/60 bg-cyan-950/20 px-4 py-3">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div className="text-[11px] uppercase tracking-[0.2em] text-cyan-300">Infrastructure Quick Pivots</div>
+              <div className="mt-1 text-sm text-ink-300">Jump directly into infrastructure telemetry from syslog, NetFlow, and SNMP collectors.</div>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <button className="btn-secondary px-3 py-2 text-xs" onClick={() => applyInfrastructurePivot({ source_type: "", event_type: "", rule_id: "" })}>All infrastructure</button>
+              <button className="btn-secondary px-3 py-2 text-xs" onClick={() => applyInfrastructurePivot({ source_type: "syslog", event_type: "syslog", rule_id: "" })}>Syslog</button>
+              <button className="btn-secondary px-3 py-2 text-xs" onClick={() => applyInfrastructurePivot({ source_type: "netflow_v5", event_type: "netflow_flow", rule_id: "" })}>NetFlow</button>
+              <button className="btn-secondary px-3 py-2 text-xs" onClick={() => applyInfrastructurePivot({ source_type: "snmp_trap", event_type: "snmp_trap", rule_id: "" })}>SNMP</button>
+              <button className="btn-secondary px-3 py-2 text-xs" onClick={() => applyInfrastructurePivot({ rule_id: "R-INFRA-EAST-WEST-FLOW-SCAN" })}>East-west scan</button>
+              <button className="btn-secondary px-3 py-2 text-xs" onClick={() => applyInfrastructurePivot({ rule_id: "R-INFRA-POST-CONTAINMENT-BLOCK-VERIFY" })}>Block verify</button>
+            </div>
+          </div>
+        </div>
+
         <div className="grid grid-cols-1 gap-3 xl:grid-cols-[9rem_minmax(0,1fr)_11rem]">
           <label className="space-y-1">
             <span className="text-[11px] uppercase tracking-[0.2em] text-ink-500">Window</span>
@@ -725,6 +758,10 @@ export default function SearchPage() {
                 <div className="mb-3 text-[11px] uppercase tracking-[0.2em] text-cyan-300">Detection Context</div>
                 <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
                   <input className="input-field" placeholder="free_text" value={draftFilters.q || ""} onChange={(e) => updateDraftFilters((prev) => ({ ...prev, q: e.target.value, page: 1 }))} />
+                  <select className="select-field" value={draftFilters.category || ""} onChange={(e) => updateDraftFilters((prev) => ({ ...prev, category: e.target.value, page: 1 }))}>
+                    <option value="">all categories</option>
+                    <option value="infrastructure">infrastructure</option>
+                  </select>
                   <input className="input-field" placeholder="node_id" value={draftFilters.node_id || ""} onChange={(e) => updateDraftFilters((prev) => ({ ...prev, node_id: e.target.value, page: 1 }))} />
                   <input className="input-field" placeholder="user_name" value={draftFilters.user_name || ""} onChange={(e) => updateDraftFilters((prev) => ({ ...prev, user_name: e.target.value, page: 1 }))} />
                   <input className="input-field" placeholder="rule_id" value={draftFilters.rule_id || ""} onChange={(e) => updateDraftFilters((prev) => ({ ...prev, rule_id: e.target.value, page: 1 }))} />
@@ -891,6 +928,11 @@ export default function SearchPage() {
                         </td>
                         <td className="p-2">
                           <div className="flex flex-wrap items-center gap-2">
+                            {isInfrastructureEvent(event) ? (
+                              <span className={`rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-[0.18em] ${infrastructureBadgeClass(event.rule_id)}`}>
+                                {infrastructureShortLabel(event.rule_id)}
+                              </span>
+                            ) : null}
                             <span className={eventTypeTone(event.source_type)}>{event.source_type}</span>
                             <span className="text-ink-200">{event.event_type}</span>
                           </div>

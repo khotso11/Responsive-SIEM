@@ -42,6 +42,21 @@ health_fail() {
   HEALTH_FAILURES=$((HEALTH_FAILURES + 1))
 }
 
+wait_for_log() {
+  local pattern="$1"
+  local file="$2"
+  local timeout_s="${3:-15}"
+  local elapsed=0
+  while (( elapsed < timeout_s )); do
+    if rg -n "$pattern" "$file" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  return 1
+}
+
 for cmd in awk curl docker go nohup pkill rg sed sudo; do
   need_cmd "$cmd"
 done
@@ -287,19 +302,19 @@ start_repo_proc "master-roe-worker" ".pids/worker.pid" "logs/worker.log" \
 start_repo_proc "detector-v0" ".pids/detector.pid" "logs/detector.log" \
   go run -mod=vendor ./cmd/detector-v0 --config configs/detector.yaml
 
-sleep 3
-DB_SINK_LINE="$(rg -n '"msg":"db_sink_enabled"' logs/master-roe.log | tail -n 1 || true)"
-if [[ -z "$DB_SINK_LINE" ]]; then
+if ! wait_for_log '"msg":"db_sink_enabled"' logs/master-roe.log 20; then
   echo "FAIL: db_sink_enabled not observed in logs/master-roe.log" >&2
+  tail -n 80 logs/master-roe.log >&2 || true
   exit 1
 fi
+DB_SINK_LINE="$(rg -n '"msg":"db_sink_enabled"' logs/master-roe.log | tail -n 1 || true)"
 echo "$DB_SINK_LINE"
-DETECTOR_STARTED_LINE="$(rg -n '"msg":"detector_started"' logs/detector.log | tail -n 1 || true)"
-if [[ -z "$DETECTOR_STARTED_LINE" ]]; then
+if ! wait_for_log '"msg":"detector_started"' logs/detector.log 20; then
   echo "FAIL: detector_started not observed in logs/detector.log" >&2
-  tail -n 40 logs/detector.log >&2 || true
+  tail -n 80 logs/detector.log >&2 || true
   exit 1
 fi
+DETECTOR_STARTED_LINE="$(rg -n '"msg":"detector_started"' logs/detector.log | tail -n 1 || true)"
 echo "$DETECTOR_STARTED_LINE"
 if [[ "$IDENTITY_DEMO_ROUTE" == "1" ]]; then
   echo "IDENTITY_DEMO_ROUTE=PB-AUTH-ABUSE-CONTAIN"

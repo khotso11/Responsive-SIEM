@@ -47,6 +47,9 @@ const (
 	infraFirewallDenyRuleID    = "R-INFRA-FIREWALL-DENY-BURST"
 	infraNetworkAdminRuleID    = "R-INFRA-NETWORK-ADMIN-LOGIN"
 	infraLinkFlapRuleID        = "R-INFRA-LINK-FLAP-BURST"
+	infraEastWestFlowRuleID    = "R-INFRA-EAST-WEST-FLOW-SCAN"
+	infraConfigChangeRuleID    = "R-INFRA-FIREWALL-CONFIG-CHANGE-OOW"
+	infraPostContainmentRuleID = "R-INFRA-POST-CONTAINMENT-BLOCK-VERIFY"
 	authProcFileRuleID         = "R-AUTH-PROC-FILE-CHAIN"
 	processFirstSeenRuleID     = "R-PROC-FIRST-SEEN-SUSPICIOUS"
 	networkFirstSeenRuleID     = "R-NET-FIRST-SEEN-RISKY"
@@ -81,6 +84,7 @@ const (
 var (
 	invalidUserPattern                    = "invalid user"
 	ipv4FromPattern                       = regexp.MustCompile(`(?i)\bfrom\s+(\d{1,3}(?:\.\d{1,3}){3})\b`)
+	responseActionIDPattern               = regexp.MustCompile(`(?i)\bresponse_action_id=([A-Za-z0-9._:-]+)\b`)
 	processCountPattern                   = regexp.MustCompile(`(?i)\bprocess_count=(\d+)\b`)
 	explicitTSPattern                     = regexp.MustCompile(`\bts=([0-9]{9,13})\b`)
 	fr03HostMarkerPattern                 = regexp.MustCompile(`(?i)\battack=host_bruteforce\b`)
@@ -104,6 +108,7 @@ var (
 	authFailedPwBurstSrcTracker           = newBurstTracker(authBurstSrcWindowMs, authBurstSrcThreshold)
 	infrastructureFirewallDenyTracker     *burstTracker
 	infrastructureLinkFlapTracker         *burstTracker
+	infrastructureEastWestFlowTracker     *uniqueDestTracker
 	networkBurstTracker                   *burstTracker
 	knownBadNetworkDestinations           map[string]struct{}
 	benignNetworkDestinations             map[string]struct{}
@@ -122,6 +127,15 @@ var (
 	infrastructureAdminUsers              map[string]struct{}
 	infrastructureLinkDownKeywords        []string
 	infrastructureLinkUpKeywords          []string
+	infrastructureEastWestCIDRs           []*net.IPNet
+	infrastructureEastWestPorts           map[int]struct{}
+	infrastructureConfigChangeKeywords    []string
+	infrastructureConfigContextKeywords   []string
+	infrastructureOutsideWindowKeywords   []string
+	infrastructureAllowedChangeStartHour  int
+	infrastructureAllowedChangeEndHour    int
+	infrastructurePostContainmentKeywords []string
+	infrastructurePostContainmentContext  []string
 	recentAuthByNode                      = newLastSeenTracker(5 * time.Minute)
 	recentLocalAdminByNode                = newLastSeenTracker(2 * time.Minute)
 	recentSuspiciousProcByNode            = newLastSeenTracker(2 * time.Minute)
@@ -507,7 +521,7 @@ func eventMessage(evt rawEvent) string {
 func matchRule(message string, evt rawEvent) (ruleMatch, bool) {
 	lower := strings.ToLower(strings.TrimSpace(message))
 	if eventTypeIs(evt.EventType, "snmp_trap") {
-		if sourceKey := infrastructureSourceKey(evt); sourceKey != "" {
+		for _, sourceKey := range infrastructureSourceKeys(evt) {
 			recentInfrastructureTrapBySource.Observe(sourceKey, evt.ObservedAtUnixMs)
 		}
 		return ruleMatch{}, false
@@ -516,17 +530,24 @@ func matchRule(message string, evt rawEvent) (ruleMatch, bool) {
 		sourceKey := infrastructureSourceKey(evt)
 		if sourceKey != "" {
 			if isInfrastructureNetworkAdminLogin(evt, message, lower) {
+				groupKey := extractIPv4(message)
+				if groupKey == "" {
+					groupKey = strings.TrimSpace(evt.SrcIP)
+				}
+				if groupKey == "" {
+					groupKey = sourceKey
+				}
 				return ruleMatch{
 					RuleID:          infraNetworkAdminRuleID,
 					Lane:            invalidUserLane,
 					Severity:        detectorSeverityHigh,
-					GroupKey:        sourceKey,
+					GroupKey:        groupKey,
 					ConfidenceScore: 84,
 				}, true
 			}
 			if isInfrastructureLinkEvent(lower) {
 				confidence := 76
-				if recentInfrastructureTrapBySource.SeenWithin(sourceKey, evt.ObservedAtUnixMs) {
+				if seenRecentInfrastructureTrap(evt) {
 					confidence = 84
 				}
 				if infrastructureLinkFlapTracker != nil && infrastructureLinkFlapTracker.Observe(sourceKey, evt.ObservedAtUnixMs) {
@@ -547,6 +568,55 @@ func matchRule(message string, evt rawEvent) (ruleMatch, bool) {
 						Severity:        detectorSeverityHigh,
 						GroupKey:        sourceKey,
 						ConfidenceScore: 82,
+					}, true
+				}
+			}
+			if isInfrastructureConfigChangeOutsideWindow(evt, lower) {
+				return ruleMatch{
+					RuleID:          infraConfigChangeRuleID,
+					Lane:            invalidUserLane,
+					Severity:        detectorSeverityHigh,
+					GroupKey:        sourceKey,
+					ConfidenceScore: 86,
+				}, true
+			}
+			if isInfrastructurePostContainmentBlockVerification(lower) {
+				groupKey := extractResponseActionID(message)
+				if groupKey == "" {
+					groupKey = sourceKey
+				}
+				return ruleMatch{
+					RuleID:          infraPostContainmentRuleID,
+					Lane:            networkObserveLane,
+					Severity:        detectorSeverityMedium,
+					GroupKey:        groupKey,
+					ConfidenceScore: 88,
+				}, true
+			}
+		}
+	}
+	if strings.EqualFold(strings.TrimSpace(evt.SourceType), "netflow_v5") && eventTypeIs(evt.EventType, "netflow_flow") {
+		srcIP := strings.TrimSpace(evt.SrcIP)
+		dstIP := strings.TrimSpace(evt.DstIP)
+		dstPort := evt.DstPort
+		if srcIP != "" && dstIP != "" && dstPort > 0 && isInfrastructureEastWestCandidate(srcIP, dstIP, dstPort) {
+			if infrastructureEastWestFlowTracker != nil {
+				matched, fanout, topDestinations := infrastructureEastWestFlowTracker.Observe(srcIP, dstIP, evt.ObservedAtUnixMs)
+				if matched {
+					protocolFamily := ""
+					if detection := matchInternalProtocolDetection(dstPort); detection != nil {
+						protocolFamily = detection.Label
+					}
+					return ruleMatch{
+						RuleID:          infraEastWestFlowRuleID,
+						Lane:            invalidUserLane,
+						Severity:        detectorSeverityHigh,
+						GroupKey:        srcIP,
+						ConfidenceScore: 86,
+						ProtocolFamily:  protocolFamily,
+						DstPort:         dstPort,
+						ScanFanout:      fanout,
+						TopDestinations: topDestinations,
 					}, true
 				}
 			}
@@ -913,6 +983,14 @@ func extractIPv4(line string) string {
 	return match[1]
 }
 
+func extractResponseActionID(line string) string {
+	match := responseActionIDPattern.FindStringSubmatch(line)
+	if len(match) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(match[1])
+}
+
 func extractDstIP(line string) string {
 	match := dstIPPattern.FindStringSubmatch(line)
 	if len(match) < 2 {
@@ -1025,6 +1103,7 @@ func initNetworkPolicy(cfg *config.DetectorConfig) {
 func initInfrastructurePolicy(cfg *config.DetectorConfig) {
 	infrastructureFirewallDenyTracker = newBurstTracker(int64(cfg.Infrastructure.FirewallDeny.WindowMs), cfg.Infrastructure.FirewallDeny.Threshold)
 	infrastructureLinkFlapTracker = newBurstTracker(int64(cfg.Infrastructure.LinkFlap.WindowMs), cfg.Infrastructure.LinkFlap.Threshold)
+	infrastructureEastWestFlowTracker = newUniqueDestTracker(int64(cfg.Infrastructure.EastWestFlowScan.WindowMs), cfg.Infrastructure.EastWestFlowScan.Threshold)
 	infrastructureFirewallDenyKeywords = normalizeLowerTrimmed(cfg.Infrastructure.FirewallDeny.Keywords)
 	infrastructureFirewallContextKeywords = normalizeLowerTrimmed(cfg.Infrastructure.FirewallDeny.ContextKeywords)
 	infrastructureAdminLoginKeywords = normalizeLowerTrimmed(cfg.Infrastructure.NetworkAdminLogin.SuccessKeywords)
@@ -1037,6 +1116,27 @@ func initInfrastructurePolicy(cfg *config.DetectorConfig) {
 	}
 	infrastructureLinkDownKeywords = normalizeLowerTrimmed(cfg.Infrastructure.LinkFlap.DownKeywords)
 	infrastructureLinkUpKeywords = normalizeLowerTrimmed(cfg.Infrastructure.LinkFlap.UpKeywords)
+	infrastructureEastWestCIDRs = make([]*net.IPNet, 0, len(cfg.Infrastructure.EastWestFlowScan.InternalCIDRs))
+	for _, raw := range cfg.Infrastructure.EastWestFlowScan.InternalCIDRs {
+		_, block, err := net.ParseCIDR(strings.TrimSpace(raw))
+		if err != nil || block == nil {
+			continue
+		}
+		infrastructureEastWestCIDRs = append(infrastructureEastWestCIDRs, block)
+	}
+	infrastructureEastWestPorts = make(map[int]struct{}, len(cfg.Infrastructure.EastWestFlowScan.RiskyPorts))
+	for _, port := range cfg.Infrastructure.EastWestFlowScan.RiskyPorts {
+		if port > 0 && port <= 65535 {
+			infrastructureEastWestPorts[port] = struct{}{}
+		}
+	}
+	infrastructureConfigChangeKeywords = normalizeLowerTrimmed(cfg.Infrastructure.ConfigChangeOutsideWindow.ChangeKeywords)
+	infrastructureConfigContextKeywords = normalizeLowerTrimmed(cfg.Infrastructure.ConfigChangeOutsideWindow.ContextKeywords)
+	infrastructureOutsideWindowKeywords = normalizeLowerTrimmed(cfg.Infrastructure.ConfigChangeOutsideWindow.OutsideWindowKeywords)
+	infrastructureAllowedChangeStartHour = cfg.Infrastructure.ConfigChangeOutsideWindow.AllowedStartHourLocal
+	infrastructureAllowedChangeEndHour = cfg.Infrastructure.ConfigChangeOutsideWindow.AllowedEndHourLocal
+	infrastructurePostContainmentKeywords = normalizeLowerTrimmed(cfg.Infrastructure.PostContainmentBlockVerify.Keywords)
+	infrastructurePostContainmentContext = normalizeLowerTrimmed(cfg.Infrastructure.PostContainmentBlockVerify.ContextKeywords)
 }
 
 func initBaselinePolicy(cfg *config.DetectorConfig) {
@@ -1044,14 +1144,49 @@ func initBaselinePolicy(cfg *config.DetectorConfig) {
 	networkFirstSeenTracker = newFirstSeenTracker(time.Duration(cfg.Baseline.NetworkFirstSeenTTLms) * time.Millisecond)
 }
 
+func infrastructureSourceKeys(evt rawEvent) []string {
+	keys := make([]string, 0, 3)
+	add := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		for _, existing := range keys {
+			if existing == value {
+				return
+			}
+		}
+		keys = append(keys, value)
+	}
+
+	if eventTypeIs(evt.EventType, "snmp_trap") {
+		add(evt.SrcIP)
+		add(evt.Host)
+		add(detectorNodeID(evt))
+		return keys
+	}
+
+	add(evt.Host)
+	add(evt.SrcIP)
+	add(detectorNodeID(evt))
+	return keys
+}
+
 func infrastructureSourceKey(evt rawEvent) string {
-	if trimmed := strings.TrimSpace(evt.Host); trimmed != "" {
-		return trimmed
+	keys := infrastructureSourceKeys(evt)
+	if len(keys) == 0 {
+		return ""
 	}
-	if trimmed := strings.TrimSpace(evt.SrcIP); trimmed != "" {
-		return trimmed
+	return keys[0]
+}
+
+func seenRecentInfrastructureTrap(evt rawEvent) bool {
+	for _, key := range infrastructureSourceKeys(evt) {
+		if recentInfrastructureTrapBySource.SeenWithin(key, evt.ObservedAtUnixMs) {
+			return true
+		}
 	}
-	return detectorNodeID(evt)
+	return false
 }
 
 func containsAnyKeyword(lower string, keywords []string) bool {
@@ -1106,6 +1241,55 @@ func isInfrastructureNetworkAdminLogin(evt rawEvent, message, lower string) bool
 
 func isInfrastructureLinkEvent(lower string) bool {
 	return containsAnyKeyword(lower, infrastructureLinkDownKeywords) || containsAnyKeyword(lower, infrastructureLinkUpKeywords)
+}
+
+func isInfrastructureEastWestCandidate(srcIP, dstIP string, dstPort int) bool {
+	if strings.TrimSpace(srcIP) == "" || strings.TrimSpace(dstIP) == "" || dstPort <= 0 {
+		return false
+	}
+	if !isInfrastructureInternalIPv4(srcIP) || !isInfrastructureInternalIPv4(dstIP) {
+		return false
+	}
+	if strings.TrimSpace(srcIP) == strings.TrimSpace(dstIP) {
+		return false
+	}
+	_, ok := infrastructureEastWestPorts[dstPort]
+	return ok
+}
+
+func isInfrastructureConfigChangeOutsideWindow(evt rawEvent, lower string) bool {
+	if !containsAnyKeyword(lower, infrastructureConfigChangeKeywords) {
+		return false
+	}
+	if len(infrastructureConfigContextKeywords) > 0 && !containsAnyKeyword(lower, infrastructureConfigContextKeywords) {
+		return false
+	}
+	if containsAnyKeyword(lower, infrastructureOutsideWindowKeywords) {
+		return true
+	}
+	if evt.ObservedAtUnixMs <= 0 {
+		return false
+	}
+	hour := time.UnixMilli(evt.ObservedAtUnixMs).Local().Hour()
+	start := infrastructureAllowedChangeStartHour
+	end := infrastructureAllowedChangeEndHour
+	if start == end {
+		return false
+	}
+	if start < end {
+		return hour < start || hour >= end
+	}
+	return hour >= end && hour < start
+}
+
+func isInfrastructurePostContainmentBlockVerification(lower string) bool {
+	if !containsAnyKeyword(lower, infrastructurePostContainmentKeywords) {
+		return false
+	}
+	if len(infrastructurePostContainmentContext) == 0 {
+		return true
+	}
+	return containsAnyKeyword(lower, infrastructurePostContainmentContext)
 }
 
 func isBenignNetworkDestination(raw string) bool {
@@ -1178,6 +1362,19 @@ func isInternalIPv4(raw string) bool {
 	}
 	for _, block := range internalScanCIDRs {
 		if block.Contains(ip4) {
+			return true
+		}
+	}
+	return false
+}
+
+func isInfrastructureInternalIPv4(raw string) bool {
+	ip := net.ParseIP(strings.TrimSpace(raw))
+	if ip == nil {
+		return false
+	}
+	for _, block := range infrastructureEastWestCIDRs {
+		if block.Contains(ip) {
 			return true
 		}
 	}
@@ -1262,6 +1459,12 @@ func alertKeyForRule(ruleID, eventID string) string {
 		return "A-INFRA-NETWORK-ADMIN-LOGIN-" + eventID
 	case infraLinkFlapRuleID:
 		return "A-INFRA-LINK-FLAP-BURST-" + eventID
+	case infraEastWestFlowRuleID:
+		return "A-INFRA-EAST-WEST-FLOW-SCAN-" + eventID
+	case infraConfigChangeRuleID:
+		return "A-INFRA-FIREWALL-CONFIG-CHANGE-OOW-" + eventID
+	case infraPostContainmentRuleID:
+		return "A-INFRA-POST-CONTAINMENT-BLOCK-VERIFY-" + eventID
 	case networkFirstSeenRuleID:
 		return "A-NET-FIRST-SEEN-RISKY-" + eventID
 	case "R-SEQ-PROCESS-TO-NET":

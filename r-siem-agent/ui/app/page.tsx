@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import {
   approveIncident,
@@ -213,8 +213,8 @@ export default function DashboardPage() {
   const range = parseRange(searchParams.get("grange"));
 
   const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
   const [hasLoadedOnce, setHasLoadedOnce] = useState(false);
+  const hasLoadedOnceRef = useRef(false);
   const [error, setError] = useState("");
   const [summary, setSummary] = useState<DashboardSummary | null>(null);
   const [series, setSeries] = useState<DashboardIncidentPoint[]>([]);
@@ -247,9 +247,7 @@ export default function DashboardPage() {
   const toMs = useMemo(() => parseQueryTime(searchParams.get("gto")), [searchParams]);
 
   const load = useCallback(async () => {
-    if (hasLoadedOnce) {
-      setRefreshing(true);
-    } else {
+    if (!hasLoadedOnceRef.current) {
       setLoading(true);
     }
     setError("");
@@ -273,14 +271,14 @@ export default function DashboardPage() {
       setAuditItems(audit.items || []);
       setGeoEndpoints(geo.endpoints || []);
       setGeoGeneratedAt(geo.generated_at || "");
+      hasLoadedOnceRef.current = true;
       setHasLoadedOnce(true);
     } catch (e) {
       setError((e as Error).message);
     } finally {
       setLoading(false);
-      setRefreshing(false);
     }
-  }, [hasLoadedOnce, range]);
+  }, [range]);
 
   useEffect(() => {
     let cancelled = false;
@@ -400,11 +398,6 @@ export default function DashboardPage() {
             <button className="btn-secondary px-2 py-1 text-xs" onClick={() => void downloadSOCOperationsReport(range, "html")}>
               SOC HTML
             </button>
-            {refreshing ? (
-              <div className="rounded border border-ink-700/80 bg-ink-900/60 px-2 py-1 text-[11px] text-ink-300">
-                Refreshing...
-              </div>
-            ) : null}
           </div>
         </div>
       </div>
@@ -461,7 +454,7 @@ export default function DashboardPage() {
                           className="mt-0.5"
                         />
                         <span>
-                          Use Site Location for Unlocated Endpoints (demo)
+                          Use Configured Site Location for Unlocated Endpoints
                           <span className="ml-1 text-[11px] text-ink-400">(default OFF)</span>
                         </span>
                       </label>

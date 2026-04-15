@@ -1,0 +1,54 @@
+<lab name="rsiem-infrastructure" version="2">
+  <topology>
+    <networks>
+      <network id="1" name="management" type="bridge" />
+      <network id="2" name="user_lan" type="bridge" />
+      <network id="3" name="server_lan" type="bridge" />
+      <network id="4" name="dmz" type="bridge" />
+      <network id="5" name="red_team" type="bridge" />
+    </networks>
+    <nodes>
+      <node id="1" name="rsiem-master-01" type="qemu" template="linux" image="ubuntu-22.04-cloudimg" left="520" top="40">
+        <interface id="0" name="eth0" network_id="1" />
+      </node>
+      <node id="2" name="edge-rtr-01" type="iol" template="router" image="vios-adventerprisek9-m.SPA.159-3.M6" left="400" top="180">
+        <interface id="0" name="Gi0/0" network_id="1" />
+        <interface id="1" name="Gi0/1" network_id="2" />
+        <interface id="2" name="Gi0/2" network_id="3" />
+        <interface id="3" name="Gi0/3" network_id="4" />
+        <interface id="4" name="Gi1/0" network_id="5" />
+      </node>
+      <node id="3" name="fw-01" type="qemu" template="firewall" image="fortios.qcow2" left="680" top="180">
+        <interface id="0" name="port1" network_id="1" />
+        <interface id="1" name="port2" network_id="4" />
+        <interface id="2" name="port3" network_id="5" />
+      </node>
+      <node id="4" name="sw-core-01" type="iol" template="switch" image="iol_l2-adventerprisek9-ms" left="520" top="300">
+        <interface id="0" name="Gi0/0" network_id="1" />
+        <interface id="1" name="Gi0/1" network_id="2" />
+        <interface id="2" name="Gi0/2" network_id="3" />
+      </node>
+      <node id="5" name="linux-endpoint-01" type="qemu" template="linux" image="ubuntu-22.04-cloudimg" left="250" top="440">
+        <interface id="0" name="eth0" network_id="2" />
+      </node>
+      <node id="6" name="linux-endpoint-02" type="qemu" template="linux" image="ubuntu-22.04-cloudimg" left="420" top="440">
+        <interface id="0" name="eth0" network_id="2" />
+      </node>
+      <node id="7" name="win-endpoint-01" type="qemu" template="windows" image="windows-10-enterprise.qcow2" left="590" top="440">
+        <interface id="0" name="Ethernet0" network_id="2" />
+      </node>
+      <node id="8" name="app-srv-01" type="qemu" template="linux" image="ubuntu-22.04-cloudimg" left="480" top="590">
+        <interface id="0" name="eth0" network_id="3" />
+      </node>
+      <node id="9" name="db-srv-01" type="qemu" template="linux" image="ubuntu-22.04-cloudimg" left="650" top="590">
+        <interface id="0" name="eth0" network_id="3" />
+      </node>
+      <node id="10" name="dmz-srv-01" type="qemu" template="linux" image="ubuntu-22.04-cloudimg" left="820" top="420">
+        <interface id="0" name="eth0" network_id="4" />
+      </node>
+      <node id="11" name="attacker-01" type="qemu" template="linux" image="kali-linux.qcow2" left="920" top="240">
+        <interface id="0" name="eth0" network_id="5" />
+      </node>
+    </nodes>
+  </topology>
+</lab>

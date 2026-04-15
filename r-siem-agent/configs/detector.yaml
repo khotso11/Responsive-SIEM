@@ -160,3 +160,56 @@ infrastructure:
       - "line protocol up"
       - "port up"
       - flapping
+  east_west_flow_scan:
+    threshold: 5
+    window_ms: 60000
+    internal_cidrs:
+      - "10.0.0.0/8"
+      - "172.16.0.0/12"
+      - "192.168.0.0/16"
+    risky_ports:
+      - 22
+      - 135
+      - 139
+      - 389
+      - 445
+      - 3389
+      - 5985
+      - 5986
+  config_change_outside_window:
+    change_keywords:
+      - "config changed"
+      - "configuration changed"
+      - "commit complete"
+      - "policy installed"
+      - "acl updated"
+      - "rule changed"
+      - "configuration committed"
+    context_keywords:
+      - firewall
+      - policy
+      - acl
+      - rule
+      - config
+      - commit
+    outside_window_keywords:
+      - "change_window=outside"
+      - "window=outside"
+      - "outside approved window"
+      - "outside maintenance window"
+    allowed_start_hour_local: 6
+    allowed_end_hour_local: 18
+  post_containment_block_verification:
+    keywords:
+      - "post_containment=blocked"
+      - "containment block verified"
+      - "response action block verified"
+      - "containment enforced"
+    context_keywords:
+      - "response_action_id="
+      - "action=drop"
+      - "action=deny"
+      - "dst="
+      - "src="
+      - firewall
+      - gateway

@@ -51,7 +51,6 @@ function eligibilityTone(available: boolean): string {
 export default function ActionsPage() {
   const [data, setData] = useState<ResponseActionFleetResponse | null>(null);
   const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [bucket, setBucket] = useState("");
@@ -71,8 +70,7 @@ export default function ActionsPage() {
 
   const load = useCallback(async (opts?: { page?: number }) => {
     const nextPage = opts?.page || page;
-    if (data) setRefreshing(true);
-    else setLoading(true);
+    if (!data) setLoading(true);
     setError(null);
     try {
       const res = await getFleetActions({
@@ -88,7 +86,6 @@ export default function ActionsPage() {
       setError((e as Error).message || String(e));
     } finally {
       setLoading(false);
-      setRefreshing(false);
     }
   }, [bucket, data, page, query, scopeType]);
 
@@ -244,12 +241,11 @@ export default function ActionsPage() {
           <h2 className="text-[18px] font-semibold text-ink-100">Actions</h2>
           <p className="text-[13px] text-ink-300">One ledger for incident-scoped and endpoint-scoped controls across the fleet.</p>
         </div>
-        {refreshing ? <div className="rounded border border-ink-700/80 bg-ink-900/60 px-2 py-1 text-[11px] text-ink-300">Refreshing…</div> : null}
       </div>
 
       <div className="rounded-2xl border border-ink-800 bg-ink-900/80 p-4">
         <div className="mb-3">
-          <h3 className="text-sm font-semibold text-ink-100">Launch Or Clear From Fleet Ledger</h3>
+          <h3 className="text-sm font-semibold text-ink-100">Launch and Clear from Fleet Ledger</h3>
           <p className="text-xs text-ink-300">Operate on an incident run ID or endpoint node ID directly from this page.</p>
         </div>
         <div className="grid gap-3 xl:grid-cols-[140px_1fr_140px_140px]">

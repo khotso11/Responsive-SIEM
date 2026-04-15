@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   applyModelProposal,
   approveModelProposal,
@@ -243,6 +243,41 @@ function RestartTargetStatusPanel({ targets }: { targets: ModelRestartTarget[] }
   );
 }
 
+function usePersistentPaneScroll(storageKey: string, restoreToken: string) {
+  const ref = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || typeof window === "undefined") return;
+    const persist = () => {
+      window.sessionStorage.setItem(storageKey, String(el.scrollTop));
+    };
+    persist();
+    el.addEventListener("scroll", persist, { passive: true });
+    return () => {
+      persist();
+      el.removeEventListener("scroll", persist);
+    };
+  }, [storageKey]);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || typeof window === "undefined") return;
+    const saved = window.sessionStorage.getItem(storageKey);
+    if (!saved) return;
+    const nextTop = Number(saved);
+    if (!Number.isFinite(nextTop) || nextTop < 0) return;
+    const frame = window.requestAnimationFrame(() => {
+      if (ref.current) {
+        ref.current.scrollTop = nextTop;
+      }
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [restoreToken, storageKey]);
+
+  return ref;
+}
+
 function ModelTextField({
   label,
   value,
@@ -338,6 +373,12 @@ export default function ModelsPage() {
     () => catalog.find((item) => modelKey(item) === selectedKey) || null,
     [catalog, selectedKey]
   );
+  const catalogScrollRef = usePersistentPaneScroll("rsiem:models:catalog", `${catalog.length}:${selectedKey}:${lastStatusRefreshTs}`);
+  const workspaceScrollRef = usePersistentPaneScroll(
+    "rsiem:models:workspace",
+    `${selectedKey}:${detail?.id || ""}:${detailLoading ? "loading" : "ready"}:${lastStatusRefreshTs}`
+  );
+  const proposalsScrollRef = usePersistentPaneScroll("rsiem:models:proposals", `${proposals.length}:${lastStatusRefreshTs}`);
 
   const loadCatalog = useCallback(async () => {
     const [meRes, catalogRes, proposalsRes] = await Promise.all([me(), getModels(), getModelProposals()]);
@@ -575,7 +616,7 @@ export default function ModelsPage() {
       <div className="rounded-2xl border border-ink-800 bg-panel px-5 py-4">
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div>
-            <p className="text-xs uppercase tracking-[0.28em] text-cyan-300">Admin Workspace</p>
+            <p className="text-xs uppercase tracking-[0.28em] text-cyan-300">Admin Configuration</p>
             <h1 className="mt-2 text-3xl font-semibold text-white">Model Editor</h1>
             <p className="mt-2 max-w-3xl text-sm text-ink-300">
               Controlled configuration management for rules, playbooks, and approval policies. Proposals require separate approval, changes are audit logged,
@@ -600,7 +641,7 @@ export default function ModelsPage() {
             <h2 className="text-sm font-semibold text-white">Editable Models</h2>
             <p className="mt-1 text-xs text-ink-300">Rules, playbooks, and approval rules sourced from `configs/master.yaml`.</p>
           </div>
-          <div className="flex-1 overflow-auto p-3">
+          <div ref={catalogScrollRef} className="flex-1 overflow-auto p-3">
             {catalog.length === 0 ? (
               <EmptyState title="No models found" detail="The UI API did not load any editable rule, playbook, or approval definitions." />
             ) : (
@@ -638,10 +679,10 @@ export default function ModelsPage() {
 
         <main className="flex min-h-[52rem] flex-col rounded-2xl border border-ink-800 bg-panel">
           <div className="border-b border-ink-800 px-4 py-3">
-            <h2 className="text-sm font-semibold text-white">Change Workspace</h2>
+            <h2 className="text-sm font-semibold text-white">Change Editor</h2>
             <p className="mt-1 text-xs text-ink-300">Stage bounded edits, validate them, then submit a proposal into the approval queue.</p>
           </div>
-          <div className="flex-1 overflow-auto p-4">
+          <div ref={workspaceScrollRef} className="flex-1 overflow-auto p-4">
             {detailLoading ? (
               <LoadingState />
             ) : !detail ? (
@@ -799,7 +840,7 @@ export default function ModelsPage() {
             <h2 className="text-sm font-semibold text-white">Proposal Queue</h2>
             <p className="mt-1 text-xs text-ink-300">Dual-control path: propose, separate approval, then apply with optional repo-side restart targets.</p>
           </div>
-          <div className="flex-1 overflow-auto p-3">
+          <div ref={proposalsScrollRef} className="flex-1 overflow-auto p-3">
             {proposals.length === 0 ? (
               <EmptyState title="No proposals yet" detail="Validated changes will appear here before and after application." />
             ) : (

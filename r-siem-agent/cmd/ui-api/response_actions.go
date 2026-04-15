@@ -509,6 +509,27 @@ func allActionViews(records []responseActionRecord, runs []incident, stepsByRun 
 	return out
 }
 
+func (a *app) latestResponseActionByID(actionID string) (responseActionView, bool) {
+	actionID = strings.TrimSpace(actionID)
+	if actionID == "" {
+		return responseActionView{}, false
+	}
+	var latest *responseActionRecord
+	for _, rec := range a.loadActionRecords() {
+		if strings.TrimSpace(rec.ActionID) != actionID {
+			continue
+		}
+		if latest == nil || logTimeUnixMs(rec.TS) >= logTimeUnixMs(latest.TS) {
+			copyRec := rec
+			latest = &copyRec
+		}
+	}
+	if latest == nil {
+		return responseActionView{}, false
+	}
+	return actionViewFromRecord(*latest), true
+}
+
 func filterFleetActionViews(items []responseActionView, q url.Values) []responseActionView {
 	scopeType := strings.ToLower(strings.TrimSpace(q.Get("scope_type")))
 	bucket := strings.ToLower(strings.TrimSpace(q.Get("bucket")))

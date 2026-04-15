@@ -51,6 +51,7 @@ type roeSelectors struct {
 type roeStep struct {
 	ActionType    string         `yaml:"action_type"`
 	TargetFrom    string         `yaml:"target_from"`
+	TargetAgentID string         `yaml:"target_agent_id"`
 	Reversibility string         `yaml:"reversibility"`
 	Params        map[string]any `yaml:"params"`
 }
@@ -445,6 +446,7 @@ type stepRecord struct {
 	ActionType       string         `json:"action_type"`
 	Reversibility    string         `json:"reversibility,omitempty"`
 	Target           string         `json:"target,omitempty"`
+	TargetAgentID    string         `json:"target_agent_id,omitempty"`
 	Actor            string         `json:"actor,omitempty"`
 	Params           map[string]any `json:"params"`
 	AllowlistRuleID  string         `json:"allowlist_rule_id,omitempty"`
@@ -1673,6 +1675,9 @@ func processTrigger(runtime *roeRuntime, msg *nats.Msg, lane string, runJournal 
 		ApprovalActor:   auditActor(""),
 	}
 	runtime.enrichRunContext(&run)
+	if trigger.TargetAgentID == "" && run.TargetAgentID != "" {
+		trigger.TargetAgentID = run.TargetAgentID
+	}
 
 	if ok, existingRunID, err := runtime.tryAcquireGroupLock(trigger, runID); err != nil {
 		return err
@@ -3207,6 +3212,9 @@ func (r *roeRuntime) enrichRunContext(run *runRecord) {
 		return
 	}
 	if asset := r.assetEntry(run.NodeID, run.TargetAgentID); asset != nil {
+		if v := strings.TrimSpace(asset.TargetAgentID); v != "" && run.TargetAgentID == "" {
+			run.TargetAgentID = v
+		}
 		if v := strings.TrimSpace(asset.Environment); v != "" && run.AssetEnvironment == "" {
 			run.AssetEnvironment = v
 		}
@@ -3578,6 +3586,10 @@ func compileSteps(runID string, trigger responseTrigger, playbook roePlaybook, c
 			params = map[string]any{}
 		}
 		params = expandStepParams(params, runID, trigger, target)
+		stepTargetAgentID := expandStepTemplateVars(step.TargetAgentID, runID, trigger, target)
+		if stepTargetAgentID == "" {
+			stepTargetAgentID = strings.TrimSpace(trigger.TargetAgentID)
+		}
 		guardrails := evaluateGuardrails(playbook, step.ActionType, params, cfg)
 		if guardrails.ValidateIdentityContext {
 			if err := validateIdentityContext(playbook, trigger); err != nil {
@@ -3596,6 +3608,7 @@ func compileSteps(runID string, trigger responseTrigger, playbook roePlaybook, c
 			ActionType:       step.ActionType,
 			Reversibility:    normalizeReversibility(step.Reversibility),
 			Target:           target,
+			TargetAgentID:    stepTargetAgentID,
 			Params:           params,
 			AllowlistRuleID:  allowlistRuleIDAt(allowlistDecisions, idx),
 			GuardrailRuleIDs: append([]string(nil), guardrails.RuleIDs...),

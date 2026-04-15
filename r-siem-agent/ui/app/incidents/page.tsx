@@ -2,9 +2,10 @@
 
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getIncidents, me, purgeDemoTestIncidents } from "@/lib/api";
 import { INCIDENT_MUTATED_EVENT, INCIDENTS_UPDATED_EVENT } from "@/lib/events";
+import { infrastructureBadgeClass, infrastructureShortLabel, isInfrastructureIncident } from "@/lib/infrastructure";
 import { AuthUser, Incident, IncidentListResponse } from "@/lib/types";
 import { IncidentDrawer } from "@/components/incident-drawer";
 import { EmptyState, ErrorState, LaneBadge, LoadingState, StatusBadge, unixMsToLocal } from "@/components/ui";
@@ -94,6 +95,7 @@ function parseQueryTime(v: string | null): number | undefined {
 export default function IncidentsPage() {
   const searchParams = useSearchParams();
   const requestedRunID = (searchParams.get("open_run_id") || "").trim();
+  const requestedCategory = (searchParams.get("category") || "").trim().toLowerCase();
   const requestedTab = ((searchParams.get("open_tab") || "").trim().toLowerCase() as
     | "overview"
     | "steps"
@@ -109,8 +111,8 @@ export default function IncidentsPage() {
   const [page, setPage] = useState(1);
   const [limit, setLimit] = useState(50);
   const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
   const [hasLoadedOnce, setHasLoadedOnce] = useState(false);
+  const hasLoadedOnceRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const [authUser, setAuthUser] = useState<AuthUser | null>(null);
   const [view, setView] = useState("active");
@@ -171,6 +173,7 @@ export default function IncidentsPage() {
     if (nodeID) params.set("node_id", nodeID);
     if (playbookID) params.set("playbook_id", playbookID);
     if (ruleID) params.set("rule_id", ruleID);
+    if (requestedCategory) params.set("category", requestedCategory);
     if (q) params.set("q", q);
     if (globalFrom) params.set("from", String(globalFrom));
     if (globalTo) params.set("to", String(globalTo));
@@ -178,9 +181,7 @@ export default function IncidentsPage() {
     params.set("page", String(page));
     params.set("sort", sort);
 
-    if (hasLoadedOnce) {
-      setRefreshing(true);
-    } else {
+    if (!hasLoadedOnceRef.current) {
       setLoading(true);
     }
     setError(null);
@@ -189,14 +190,14 @@ export default function IncidentsPage() {
         setItems(res.items || []);
         setTotal(res.total || res.count || 0);
         setAuthUser(meRes?.user || null);
+        hasLoadedOnceRef.current = true;
         setHasLoadedOnce(true);
       })
       .catch((e) => setError(e.message || String(e)))
       .finally(() => {
         setLoading(false);
-        setRefreshing(false);
       });
-  }, [view, status, lane, severity, lifecycle, environment, nodeID, playbookID, ruleID, q, globalFrom, globalTo, page, limit, sort, hasLoadedOnce]);
+  }, [view, status, lane, severity, lifecycle, environment, nodeID, playbookID, ruleID, requestedCategory, q, globalFrom, globalTo, page, limit, sort]);
 
   useEffect(() => {
     void load();
@@ -306,10 +307,20 @@ export default function IncidentsPage() {
         <div>
           <h2 className="text-[18px] font-semibold">Threat Tray</h2>
           <p className="text-[13px] text-ink-300">Primary analyst queue for triage, approvals, investigation pivots, and response execution.</p>
+          {requestedCategory === "infrastructure" ? (
+            <div className="mt-2">
+              <span className="rounded-full border border-cyan-700/60 bg-cyan-950/40 px-2.5 py-1 text-[11px] uppercase tracking-[0.18em] text-cyan-100">
+                Infrastructure slice
+              </span>
+            </div>
+          ) : null}
         </div>
         <div className="flex flex-wrap items-center gap-2 text-xs">
           <Link className="btn-secondary px-3 py-1 text-xs" href="/search">
             Advanced Search
+          </Link>
+          <Link className="btn-secondary px-3 py-1 text-xs" href="/infrastructure">
+            Infrastructure
           </Link>
           <Link className="btn-secondary px-3 py-1 text-xs" href="/endpoints">
             Entity Pages
@@ -317,11 +328,6 @@ export default function IncidentsPage() {
           <Link className="btn-secondary px-3 py-1 text-xs" href="/dashboard">
             System Views
           </Link>
-          {refreshing ? (
-            <div className="rounded border border-ink-700/80 bg-ink-900/60 px-2 py-1 text-[11px] text-ink-300">
-              Refreshing...
-            </div>
-          ) : null}
           <select value={sort} onChange={(e) => setSort(e.target.value)} className="select-field py-1 text-xs">
             <option value="updated_desc">Updated desc</option>
             <option value="updated_asc">Updated asc</option>
@@ -482,6 +488,13 @@ export default function IncidentsPage() {
                   <td className="p-2">
                     <div className="font-medium">{it.rule_id || "-"}</div>
                     <div className="text-xs text-ink-300">{it.playbook_id || "-"}</div>
+                    {isInfrastructureIncident(it) ? (
+                      <div className="mt-2">
+                        <span className={`rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-[0.18em] ${infrastructureBadgeClass(it.rule_id)}`}>
+                          {infrastructureShortLabel(it.rule_id)}
+                        </span>
+                      </div>
+                    ) : null}
                   </td>
                   <td className="p-2">
                     <div className="font-medium">{it.node_id || "-"}</div>

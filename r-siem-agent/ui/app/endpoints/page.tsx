@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { clearEndpointAction, getEndpointActions, getEndpointEvents, getEndpointRuns, getEndpoints, getEndpointSummary, postEndpointAction, postEndpointTargetedTest } from "@/lib/api";
 import { INCIDENT_MUTATED_EVENT, INCIDENTS_UPDATED_EVENT } from "@/lib/events";
@@ -100,8 +100,8 @@ export default function EndpointsPage() {
   const searchParams = useSearchParams();
   const [items, setItems] = useState<EndpointSummary[]>([]);
   const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
   const [hasLoadedOnce, setHasLoadedOnce] = useState(false);
+  const hasLoadedOnceRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const [selectedNode, setSelectedNode] = useState<EndpointSummary | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -124,23 +124,21 @@ export default function EndpointsPage() {
   const toMs = useMemo(() => parseQueryTime(searchParams.get("gto")), [searchParams]);
 
   const load = useCallback(async () => {
-    if (hasLoadedOnce) {
-      setRefreshing(true);
-    } else {
+    if (!hasLoadedOnceRef.current) {
       setLoading(true);
     }
     setError(null);
     try {
       const res = await getEndpoints();
       setItems(res.items || []);
+      hasLoadedOnceRef.current = true;
       setHasLoadedOnce(true);
     } catch (e) {
       setError((e as Error).message || String(e));
     } finally {
       setLoading(false);
-      setRefreshing(false);
     }
-  }, [hasLoadedOnce]);
+  }, []);
 
   useEffect(() => {
     void load();
@@ -308,11 +306,6 @@ export default function EndpointsPage() {
           <h2 className="text-[18px] font-semibold">Endpoints</h2>
           <p className="text-[13px] text-ink-300">Endpoint posture with activity rates and source distribution. Select a node to investigate.</p>
         </div>
-        {refreshing ? (
-          <div className="rounded border border-ink-700/80 bg-ink-900/60 px-2 py-1 text-[11px] text-ink-300">
-            Refreshing...
-          </div>
-        ) : null}
       </div>
 
       {loading && !hasLoadedOnce ? <LoadingState /> : null}

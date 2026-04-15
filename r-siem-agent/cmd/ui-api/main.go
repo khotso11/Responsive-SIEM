@@ -586,6 +586,7 @@ type incident struct {
 	IdentityWorkflowEligible bool     `json:"identity_workflow_eligible,omitempty"`
 	IdentityWorkflowReason   string   `json:"identity_workflow_reason,omitempty"`
 	Source                   string   `json:"source"`
+	Category                 string   `json:"category,omitempty"`
 }
 
 type investigationObservable struct {
@@ -723,6 +724,7 @@ type eventRow struct {
 	ExecSHA256     string `json:"exec_sha256,omitempty"`
 	EventIdemKey   string `json:"event_idem_key"`
 	RawLineSHA256  string `json:"raw_line_sha256,omitempty"`
+	Category       string `json:"category,omitempty"`
 }
 
 type eventSearchResponse struct {
@@ -735,6 +737,46 @@ type eventSearchResponse struct {
 	Source           string     `json:"source"`
 	AvailableFilters []string   `json:"available_filters"`
 	Query            any        `json:"query"`
+}
+
+var infrastructureSourceTypes = map[string]struct{}{
+	"syslog":     {},
+	"netflow_v5": {},
+	"snmp_trap":  {},
+}
+
+var infrastructureEventTypes = map[string]struct{}{
+	"netflow_flow": {},
+	"snmp_trap":    {},
+}
+
+func isInfrastructureCategory(raw string) bool {
+	return strings.EqualFold(strings.TrimSpace(raw), "infrastructure")
+}
+
+func isInfrastructureIncident(run incident) bool {
+	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(run.RuleID)), "R-INFRA-") {
+		return true
+	}
+	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(run.PlaybookID)), "PB-INFRA-") {
+		return true
+	}
+	if _, ok := infrastructureSourceTypes[strings.ToLower(strings.TrimSpace(run.SourceType))]; ok {
+		return true
+	}
+	_, ok := infrastructureEventTypes[strings.ToLower(strings.TrimSpace(run.EventType))]
+	return ok
+}
+
+func isInfrastructureEvent(row eventRow) bool {
+	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(row.RuleID)), "R-INFRA-") {
+		return true
+	}
+	if _, ok := infrastructureSourceTypes[strings.ToLower(strings.TrimSpace(row.SourceType))]; ok {
+		return true
+	}
+	_, ok := infrastructureEventTypes[strings.ToLower(strings.TrimSpace(row.EventType))]
+	return ok
 }
 
 type entityProfileSummary struct {
@@ -1082,6 +1124,8 @@ func main() {
 	mux.HandleFunc("GET /api/reports/soc/operations", a.withAuthRole(a.handleSOCOperationsReport, "analyst"))
 	mux.HandleFunc("GET /api/search", a.withAuthRole(a.handleSearch, "analyst"))
 	mux.HandleFunc("GET /api/search/events", a.withAuthRole(a.handleSearchEvents, "analyst"))
+	mux.HandleFunc("GET /api/infrastructure/topology", a.withAuthRole(a.handleInfrastructureTopology, "analyst"))
+	mux.HandleFunc("POST /api/infrastructure/eve/nodes/{node_id}/{action}", a.withAuthRole(a.handleInfrastructureEveNodeAction, "admin"))
 	mux.HandleFunc("GET /api/entities/ip/{ip}", a.withAuthRole(a.handleEntityIP, "analyst"))
 	mux.HandleFunc("GET /api/entities/user/{user}", a.withAuthRole(a.handleEntityUser, "analyst"))
 	mux.HandleFunc("GET /api/stream", a.withAuthRole(a.handleStream, "analyst"))
@@ -1711,6 +1755,8 @@ func (a *app) handleMeta(w http.ResponseWriter, _ *http.Request) {
 			{"method": "GET", "path": "/api/reports/soc/operations", "summary": "SOC operations report download", "query": []string{"window", "bucket", "format=json|html|pdf"}},
 			{"method": "GET", "path": "/api/search", "summary": "Global search across incidents and events", "query": []string{"q", "from", "to", "limit"}},
 			{"method": "GET", "path": "/api/search/events", "summary": "Fielded analyst search across normalized events", "query": []string{"q", "from", "to", "node_id", "user_name", "src_ip", "dst_ip", "dst_port", "protocol_family", "source_type", "event_type", "rule_id", "severity", "comm", "exec_path", "cmdline", "dns_name", "file_sha256", "exec_sha256", "event_idem_key", "raw_line_sha256", "page", "limit", "sort"}},
+			{"method": "GET", "path": "/api/infrastructure/topology", "summary": "Emulated infrastructure topology with live incident, event, collector, and action overlays", "query": []string{"from", "to"}},
+			{"method": "POST", "path": "/api/infrastructure/eve/nodes/{node_id}/{action}", "summary": "Admin-only EVE-NG node control action", "path_params": []string{"node_id", "action"}},
 			{"method": "GET", "path": "/api/models", "summary": "List editable rule/playbook/approval models (admin only)"},
 			{"method": "GET", "path": "/api/models/{kind}/{id}", "summary": "Load editable model detail (admin only)"},
 			{"method": "POST", "path": "/api/models/{kind}/{id}/validate", "summary": "Validate a staged model change (admin only)"},
@@ -1762,6 +1808,7 @@ func (a *app) handleIncidents(w http.ResponseWriter, r *http.Request) {
 	laneFilter := strings.TrimSpace(strings.ToUpper(r.URL.Query().Get("lane")))
 	lifecycleFilter := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("lifecycle")))
 	environmentFilter := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("environment")))
+	categoryFilter := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("category")))
 	viewFilter := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("view")))
 	if viewFilter == "" {
 		viewFilter = "active"
@@ -1832,6 +1879,9 @@ func (a *app) handleIncidents(w http.ResponseWriter, r *http.Request) {
 		if environmentFilter != "" && strings.ToLower(run.EnvironmentClass) != environmentFilter {
 			continue
 		}
+		if isInfrastructureCategory(categoryFilter) && !isInfrastructureIncident(run) {
+			continue
+		}
 		switch viewFilter {
 		case "active":
 			if run.Archived {
@@ -1864,6 +1914,9 @@ func (a *app) handleIncidents(w http.ResponseWriter, r *http.Request) {
 			if !strings.Contains(hay, q) {
 				continue
 			}
+		}
+		if isInfrastructureIncident(run) {
+			run.Category = "infrastructure"
 		}
 		items = append(items, run)
 	}
@@ -1960,13 +2013,30 @@ func (a *app) handleIncidentDetail(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	if isInfrastructureIncident(*found) {
+		found.Category = "infrastructure"
+	}
+
+	var linkedAction *responseActionView
+	if strings.EqualFold(strings.TrimSpace(found.RuleID), "R-INFRA-POST-CONTAINMENT-BLOCK-VERIFY") {
+		if view, ok := a.latestResponseActionByID(found.Target); ok {
+			linkedAction = &view
+			if found.TargetAgentID == "" {
+				found.TargetAgentID = strings.TrimSpace(view.TargetAgentID)
+			}
+			if found.NodeID == "" {
+				found.NodeID = strings.TrimSpace(view.NodeID)
+			}
+		}
+	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"run":         found,
-		"steps":       steps,
-		"ui_state":    a.loadUIStateForRun(runID),
-		"annotations": a.loadIncidentAnnotations(runID),
-		"source":      "exports",
+		"run":           found,
+		"steps":         steps,
+		"ui_state":      a.loadUIStateForRun(runID),
+		"annotations":   a.loadIncidentAnnotations(runID),
+		"linked_action": linkedAction,
+		"source":        "exports",
 	})
 }
 
@@ -5091,6 +5161,7 @@ type eventSearchRequest struct {
 	Q              string         `json:"q"`
 	FromMs         int64          `json:"from"`
 	ToMs           int64          `json:"to"`
+	Category       string         `json:"category,omitempty"`
 	NodeID         string         `json:"node_id,omitempty"`
 	UserName       string         `json:"user_name,omitempty"`
 	SrcIP          string         `json:"src_ip,omitempty"`
@@ -5120,6 +5191,7 @@ func parseEventSearchRequest(values url.Values, now time.Time) eventSearchReques
 		Q:              strings.TrimSpace(values.Get("q")),
 		FromMs:         parseInt64(values.Get("from"), 0),
 		ToMs:           parseInt64(values.Get("to"), 0),
+		Category:       strings.TrimSpace(values.Get("category")),
 		NodeID:         strings.TrimSpace(values.Get("node_id")),
 		UserName:       strings.TrimSpace(values.Get("user_name")),
 		SrcIP:          strings.TrimSpace(values.Get("src_ip")),
@@ -5162,6 +5234,7 @@ func parseEventSearchRequest(values url.Values, now time.Time) eventSearchReques
 	}
 	req.Filters = map[string]any{}
 	for key, value := range map[string]string{
+		"category":        req.Category,
 		"node_id":         req.NodeID,
 		"user_name":       req.UserName,
 		"src_ip":          req.SrcIP,
@@ -5222,6 +5295,9 @@ func eventSearchOrderBy(sortKey string) string {
 func buildEventSearchPredicates(req eventSearchRequest) ([]string, []any) {
 	clauses := []string{"recv_ts_unix_ms BETWEEN $1 AND $2"}
 	args := []any{req.FromMs, req.ToMs}
+	if isInfrastructureCategory(req.Category) {
+		clauses = append(clauses, `(COALESCE(rule_id,'') LIKE 'R-INFRA-%' OR source_type IN ('syslog','netflow_v5','snmp_trap') OR event_type IN ('netflow_flow','snmp_trap'))`)
+	}
 	appendExact := func(column, value string) {
 		if strings.TrimSpace(value) == "" {
 			return
@@ -5291,6 +5367,7 @@ func (a *app) handleSearchEvents(w http.ResponseWriter, r *http.Request) {
 			"q",
 			"from",
 			"to",
+			"category",
 			"node_id",
 			"user_name",
 			"src_ip",
@@ -5374,6 +5451,9 @@ LIMIT $` + strconv.Itoa(len(args)-1) + ` OFFSET $` + strconv.Itoa(len(args))
 		); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": fmt.Sprintf("scan event: %v", err)})
 			return
+		}
+		if isInfrastructureEvent(item) {
+			item.Category = "infrastructure"
 		}
 		items = append(items, item)
 	}

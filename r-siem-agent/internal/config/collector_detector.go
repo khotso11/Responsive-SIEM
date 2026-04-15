@@ -141,10 +141,33 @@ type DetectorInfrastructureLinkFlapConfig struct {
 	UpKeywords   []string `yaml:"up_keywords"`
 }
 
+type DetectorInfrastructureEastWestFlowScanConfig struct {
+	Threshold     int      `yaml:"threshold"`
+	WindowMs      int      `yaml:"window_ms"`
+	InternalCIDRs []string `yaml:"internal_cidrs"`
+	RiskyPorts    []int    `yaml:"risky_ports"`
+}
+
+type DetectorInfrastructureConfigChangeOutsideWindowConfig struct {
+	ChangeKeywords        []string `yaml:"change_keywords"`
+	ContextKeywords       []string `yaml:"context_keywords"`
+	OutsideWindowKeywords []string `yaml:"outside_window_keywords"`
+	AllowedStartHourLocal int      `yaml:"allowed_start_hour_local"`
+	AllowedEndHourLocal   int      `yaml:"allowed_end_hour_local"`
+}
+
+type DetectorInfrastructurePostContainmentBlockVerificationConfig struct {
+	Keywords        []string `yaml:"keywords"`
+	ContextKeywords []string `yaml:"context_keywords"`
+}
+
 type DetectorInfrastructureConfig struct {
-	FirewallDeny      DetectorInfrastructurePatternBurstConfig `yaml:"firewall_deny"`
-	NetworkAdminLogin DetectorInfrastructureAdminLoginConfig   `yaml:"network_admin_login"`
-	LinkFlap          DetectorInfrastructureLinkFlapConfig     `yaml:"link_flap"`
+	FirewallDeny               DetectorInfrastructurePatternBurstConfig                     `yaml:"firewall_deny"`
+	NetworkAdminLogin          DetectorInfrastructureAdminLoginConfig                       `yaml:"network_admin_login"`
+	LinkFlap                   DetectorInfrastructureLinkFlapConfig                         `yaml:"link_flap"`
+	EastWestFlowScan           DetectorInfrastructureEastWestFlowScanConfig                 `yaml:"east_west_flow_scan"`
+	ConfigChangeOutsideWindow  DetectorInfrastructureConfigChangeOutsideWindowConfig        `yaml:"config_change_outside_window"`
+	PostContainmentBlockVerify DetectorInfrastructurePostContainmentBlockVerificationConfig `yaml:"post_containment_block_verification"`
 }
 
 // LoadCollector reads and validates the collector configuration from disk.
@@ -308,6 +331,39 @@ func applyDetectorDefaults(c *DetectorConfig) {
 	if len(c.Infrastructure.LinkFlap.UpKeywords) == 0 {
 		c.Infrastructure.LinkFlap.UpKeywords = []string{"link up", "interface up", "changed state to up", "line protocol up", "port up", "flapping"}
 	}
+	if c.Infrastructure.EastWestFlowScan.Threshold <= 0 {
+		c.Infrastructure.EastWestFlowScan.Threshold = 5
+	}
+	if c.Infrastructure.EastWestFlowScan.WindowMs <= 0 {
+		c.Infrastructure.EastWestFlowScan.WindowMs = 60000
+	}
+	if len(c.Infrastructure.EastWestFlowScan.InternalCIDRs) == 0 {
+		c.Infrastructure.EastWestFlowScan.InternalCIDRs = []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}
+	}
+	if len(c.Infrastructure.EastWestFlowScan.RiskyPorts) == 0 {
+		c.Infrastructure.EastWestFlowScan.RiskyPorts = []int{22, 135, 139, 389, 445, 3389, 5985, 5986}
+	}
+	if len(c.Infrastructure.ConfigChangeOutsideWindow.ChangeKeywords) == 0 {
+		c.Infrastructure.ConfigChangeOutsideWindow.ChangeKeywords = []string{"config changed", "configuration changed", "commit complete", "policy installed", "acl updated", "rule changed", "configuration committed"}
+	}
+	if len(c.Infrastructure.ConfigChangeOutsideWindow.ContextKeywords) == 0 {
+		c.Infrastructure.ConfigChangeOutsideWindow.ContextKeywords = []string{"firewall", "policy", "acl", "rule", "config", "commit"}
+	}
+	if len(c.Infrastructure.ConfigChangeOutsideWindow.OutsideWindowKeywords) == 0 {
+		c.Infrastructure.ConfigChangeOutsideWindow.OutsideWindowKeywords = []string{"change_window=outside", "window=outside", "outside approved window", "outside maintenance window"}
+	}
+	if c.Infrastructure.ConfigChangeOutsideWindow.AllowedStartHourLocal < 0 || c.Infrastructure.ConfigChangeOutsideWindow.AllowedStartHourLocal > 23 {
+		c.Infrastructure.ConfigChangeOutsideWindow.AllowedStartHourLocal = 6
+	}
+	if c.Infrastructure.ConfigChangeOutsideWindow.AllowedEndHourLocal < 0 || c.Infrastructure.ConfigChangeOutsideWindow.AllowedEndHourLocal > 23 {
+		c.Infrastructure.ConfigChangeOutsideWindow.AllowedEndHourLocal = 18
+	}
+	if len(c.Infrastructure.PostContainmentBlockVerify.Keywords) == 0 {
+		c.Infrastructure.PostContainmentBlockVerify.Keywords = []string{"post_containment=blocked", "containment block verified", "response action block verified", "containment enforced"}
+	}
+	if len(c.Infrastructure.PostContainmentBlockVerify.ContextKeywords) == 0 {
+		c.Infrastructure.PostContainmentBlockVerify.ContextKeywords = []string{"response_action_id=", "action=drop", "action=deny", "dst=", "src=", "firewall", "gateway"}
+	}
 	if c.InternalScan.WindowMs <= 0 {
 		c.InternalScan.WindowMs = 60000
 	}
@@ -349,6 +405,11 @@ func validateDetector(c *DetectorConfig) error {
 	for _, cidr := range c.InternalScan.InternalCIDRs {
 		if strings.TrimSpace(cidr) == "" {
 			return fmt.Errorf("internal_scan.internal_cidrs contains empty value")
+		}
+	}
+	for _, cidr := range c.Infrastructure.EastWestFlowScan.InternalCIDRs {
+		if strings.TrimSpace(cidr) == "" {
+			return fmt.Errorf("infrastructure.east_west_flow_scan.internal_cidrs contains empty value")
 		}
 	}
 	return nil

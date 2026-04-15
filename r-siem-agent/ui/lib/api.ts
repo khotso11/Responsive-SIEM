@@ -15,6 +15,8 @@ import {
   IncidentLogicResponse,
   IncidentListResponse,
   InvestigationProvidersResponse,
+  InfrastructureTopologyResponse,
+  InfrastructureEveNodeActionResponse,
   InvestigationResponse,
   ModelCatalogResponse,
   ModelDetailResponse,
@@ -351,6 +353,23 @@ export async function getEndpointActions(nodeID: string): Promise<ResponseAction
   return apiFetch(`/api/endpoints/${encodeURIComponent(nodeID)}/actions`);
 }
 
+export async function getInfrastructureTopology(from?: number, to?: number): Promise<InfrastructureTopologyResponse> {
+  const qs = new URLSearchParams();
+  if (from) qs.set("from", String(from));
+  if (to) qs.set("to", String(to));
+  return apiFetch(`/api/infrastructure/topology${qs.toString() ? `?${qs.toString()}` : ""}`);
+}
+
+export async function postInfrastructureEveNodeAction(
+  nodeID: string,
+  action: "start" | "stop" | "wipe"
+): Promise<InfrastructureEveNodeActionResponse> {
+  return apiFetch(`/api/infrastructure/eve/nodes/${encodeURIComponent(nodeID)}/${encodeURIComponent(action)}`, {
+    method: "POST",
+    body: JSON.stringify({})
+  });
+}
+
 export async function getFleetActions(query: Record<string, string | number | undefined> = {}): Promise<ResponseActionFleetResponse> {
   const qs = new URLSearchParams();
   for (const [key, value] of Object.entries(query)) {
@@ -427,6 +446,7 @@ export async function getSearchEvents(query: EventSearchQuery = {}): Promise<Eve
     ["q", query.q],
     ["from", query.from],
     ["to", query.to],
+    ["category", query.category],
     ["node_id", query.node_id],
     ["user_name", query.user_name],
     ["src_ip", query.src_ip],

@@ -41,7 +41,7 @@ pick_port() {
 }
 
 TCPDUMP_PID=""
-HTTP_PID=""
+HONEYPOT_PID=""
 CAPTURE_STOPPED=0
 CAPTURE_END_RFC3339=""
 TCPDUMP_MODE="host"
@@ -64,9 +64,9 @@ stop_capture() {
 }
 
 cleanup() {
-  if [[ -n "${HTTP_PID}" ]] && kill -0 "${HTTP_PID}" >/dev/null 2>&1; then
-    kill "${HTTP_PID}" >/dev/null 2>&1 || true
-    wait "${HTTP_PID}" >/dev/null 2>&1 || true
+  if [[ -n "${HONEYPOT_PID}" ]] && kill -0 "${HONEYPOT_PID}" >/dev/null 2>&1; then
+    kill "${HONEYPOT_PID}" >/dev/null 2>&1 || true
+    wait "${HONEYPOT_PID}" >/dev/null 2>&1 || true
   fi
   stop_capture
 }
@@ -75,6 +75,8 @@ trap cleanup EXIT
 require_cmd tcpdump
 require_cmd sha256sum
 require_cmd python3
+require_cmd curl
+require_cmd go
 require_cmd ss
 require_cmd rg
 
@@ -94,12 +96,15 @@ mkdir -p demo_artifacts
 timestamp="$(date +%Y%m%d_%H%M%S)"
 fr04_dir="demo_artifacts/${timestamp}/fr04"
 mkdir -p "${fr04_dir}"
+host_name="$(hostname)"
 
 pcap_path="${fr04_dir}/capture.pcap"
 custody_path="${fr04_dir}/chain_of_custody.json"
 proof_path="${fr04_dir}/fr04_proof.json"
 tcpdump_log="${fr04_dir}/tcpdump.log"
-http_log="${fr04_dir}/http_server.log"
+honeypot_log="${fr04_dir}/honeypot.log"
+honeypot_bin="${fr04_dir}/honeypot"
+honeypot_config="${fr04_dir}/honeypot.yaml"
 
 ./scripts/demo_down.sh >/dev/null 2>&1 || true
 ./scripts/demo_up.sh >/dev/null
@@ -110,6 +115,8 @@ for _ in $(seq 1 40); do
 done
 [[ -f "logs/detector.log" ]] || fail_with_context "logs/detector.log not found after demo_up"
 base_detector_lines="$(wc -l < logs/detector.log | tr -d '[:space:]')"
+[[ -f "logs/master-roe.log" ]] || fail_with_context "logs/master-roe.log not found after demo_up"
+base_master_lines="$(wc -l < logs/master-roe.log | tr -d '[:space:]')"
 
 capture_start_rfc3339="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
@@ -161,26 +168,53 @@ esac
 port="$(pick_port || true)"
 [[ -n "${port}" ]] || fail_with_context "no free deterministic localhost port in range 18080-18090"
 
-python3 -m http.server "${port}" --bind 127.0.0.1 >"${http_log}" 2>&1 &
-HTTP_PID="$!"
+env GOCACHE="$ROOT_DIR/.cache/go-build" go build -mod=vendor -o "${honeypot_bin}" ./cmd/honeypot
+
+cat > "${honeypot_config}" <<EOF_HONEYPOT
+log_level: info
+node_id: honeypot-local
+host: honeypot-local
+response_target_agent_id: ${host_name}
+jetstream:
+  url: nats://127.0.0.1:4222
+  stream: RSIEM_EVENTS
+  subject: rsiem.events.raw
+  spool_path: ${fr04_dir}/honeypot.spool.jsonl
+  spool_fsync: false
+  retry_interval_ms: 1000
+limits:
+  read_timeout_ms: 2500
+  write_timeout_ms: 2500
+  max_payload_bytes: 2048
+  max_concurrent: 16
+services:
+  - id: decoy-admin-http
+    enabled: true
+    protocol: http
+    listen: 127.0.0.1:${port}
+    http_title: Restricted Administration Portal
+    realm: Operations Console
+EOF_HONEYPOT
+
+"${honeypot_bin}" -config "${honeypot_config}" >"${honeypot_log}" 2>&1 &
+HONEYPOT_PID="$!"
 sleep 1
-kill -0 "${HTTP_PID}" >/dev/null 2>&1 || fail_with_context "http listener failed to start" "${http_log}"
+kill -0 "${HONEYPOT_PID}" >/dev/null 2>&1 || fail_with_context "honeypot failed to start" "${honeypot_log}"
 
-python3 - "${port}" <<'PY'
-import sys
-import time
-import urllib.request
-
-port = int(sys.argv[1])
-for i in range(5):
-    with urllib.request.urlopen(f"http://127.0.0.1:{port}/?probe={i}", timeout=2) as resp:
-        resp.read(1)
-    time.sleep(0.1)
-PY
+for _ in $(seq 1 20); do
+  if rg -n "honeypot_service_listening.*decoy-admin-http" "${honeypot_log}" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.25
+done
+rg -n "honeypot_service_listening.*decoy-admin-http" "${honeypot_log}" >/dev/null 2>&1 || fail_with_context "honeypot listen evidence not found" "${honeypot_log}"
 
 event_ts_unix_ms="$(date +%s%3N)"
-src_ip="10.66.12.250"
-printf 'ALERT invalid user=honeypot src=%s attack=deception_tripwire ts=%s\n' "${src_ip}" "${event_ts_unix_ms}" >> tmp/demo.log
+curl -sS -o /dev/null \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -H 'X-RSIEM-Source-IP: 10.66.12.250' \
+  --data 'username=honeypot-admin&password=should_not_leak' \
+  "http://127.0.0.1:${port}/admin/login?probe=fr04" || fail_with_context "curl probe to honeypot failed" "${honeypot_log}"
 
 evidence_line=""
 severity=""
@@ -198,10 +232,20 @@ if [[ "${severity}" != "critical" && "${severity}" != "high" ]]; then
   fail_with_context "unexpected deception severity: ${severity}" "logs/detector.log"
 fi
 
+run_line=""
+for _ in $(seq 1 40); do
+  run_line="$(tail -n "+$((base_master_lines + 1))" logs/master-roe.log 2>/dev/null | rg "\"msg\":\"response_run_created\".*\"rule_id\":\"R-FR03-DECEPTION-TRIPWIRE\".*\"playbook_id\":\"PB-DECEPTION-HONEYPOT-TRIAGE\"" | tail -n 1 || true)"
+  if [[ -n "${run_line}" ]]; then
+    break
+  fi
+  sleep 0.25
+done
+[[ -n "${run_line}" ]] || fail_with_context "response run evidence not found for honeypot playbook" "logs/master-roe.log"
+
 stop_capture
-if [[ -n "${HTTP_PID}" ]] && kill -0 "${HTTP_PID}" >/dev/null 2>&1; then
-  kill "${HTTP_PID}" >/dev/null 2>&1 || true
-  wait "${HTTP_PID}" >/dev/null 2>&1 || true
+if [[ -n "${HONEYPOT_PID}" ]] && kill -0 "${HONEYPOT_PID}" >/dev/null 2>&1; then
+  kill "${HONEYPOT_PID}" >/dev/null 2>&1 || true
+  wait "${HONEYPOT_PID}" >/dev/null 2>&1 || true
 fi
 
 [[ -f "${pcap_path}" ]] || fail_with_context "pcap not found at ${pcap_path}" "${tcpdump_log}"
@@ -238,7 +282,6 @@ pcap_size_bytes="$(stat -c '%s' "${pcap_path}")"
 pcap_sha256="$(sha256sum "${pcap_path}" | awk '{print $1}')"
 [[ -n "${pcap_sha256}" ]] || fail_with_context "failed to compute pcap sha256"
 
-host_name="$(hostname)"
 generated_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 cat > "${custody_path}" <<EOF_CUSTODY
@@ -257,7 +300,9 @@ cat > "${custody_path}" <<EOF_CUSTODY
     "rule_id": "R-FR03-DECEPTION-TRIPWIRE",
     "severity": "$(json_escape "${severity}")",
     "evidence_log": "logs/detector.log",
-    "evidence_line": "$(json_escape "${evidence_line}")"
+    "evidence_line": "$(json_escape "${evidence_line}")",
+    "run_evidence_log": "logs/master-roe.log",
+    "run_evidence_line": "$(json_escape "${run_line}")"
   }
 }
 EOF_CUSTODY
@@ -272,9 +317,10 @@ cat > "${proof_path}" <<EOF_PROOF
   "alert_rule_id": "R-FR03-DECEPTION-TRIPWIRE",
   "severity": "$(json_escape "${severity}")",
   "detector_evidence_line": "$(json_escape "${evidence_line}")",
+  "run_evidence_line": "$(json_escape "${run_line}")",
   "pass": true
 }
 EOF_PROOF
 
-echo "PASS: FR-04 deception+pcap+chain_of_custody completed"
+echo "PASS: FR-04 live honeypot+pcap+chain_of_custody completed"
 echo "FR04_PROOF_JSON=${proof_path}"

@@ -2,11 +2,11 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { getSearchEvents } from "@/lib/api";
+import Link from "next/link";
+import { getSearch, getSearchEvents } from "@/lib/api";
 import { INCIDENT_MUTATED_EVENT, INCIDENTS_UPDATED_EVENT } from "@/lib/events";
-import { infrastructureBadgeClass, infrastructureShortLabel, isInfrastructureEvent } from "@/lib/infrastructure";
-import { EventRow, EventSearchQuery, EventSearchResponse } from "@/lib/types";
-import { EmptyState, ErrorState, LoadingState, unixMsToLocal } from "@/components/ui";
+import { EventRow, EventSearchQuery, EventSearchResponse, Incident } from "@/lib/types";
+import { EmptyState, ErrorState, LaneBadge, LoadingState, StatusBadge, unixMsToLocal } from "@/components/ui";
 
 function parseQueryTime(v: string | null): number | undefined {
   if (!v) return undefined;
@@ -99,7 +99,7 @@ type QueryToken = {
   value: string;
 };
 
-const SOURCE_TYPE_OPTIONS = ["", "auditd_connect", "auditd_exec", "proc_net", "dns_packet", "inotify", "tail", "syslog", "netflow_v5", "snmp_trap"];
+const SOURCE_TYPE_OPTIONS = ["", "auditd_connect", "auditd_exec", "proc_net", "dns_packet", "inotify", "tail", "syslog", "netflow_v5", "snmp_trap", "deception"];
 const EVENT_TYPE_OPTIONS = ["", "network_connection", "process_exec", "dns_query", "file_change", "auth_failed", "syslog", "netflow_flow", "snmp_trap"];
 const PROTOCOL_OPTIONS = ["", "rdp", "winrm", "ssh", "smb", "rpc", "ldap", "dns", "ftp"];
 const SEVERITY_OPTIONS = ["", "critical", "high", "medium", "low", "info"];
@@ -261,6 +261,7 @@ function tokenizeQuery(input: string): QueryToken[] {
 function normalizedQueryKey(raw?: string): string {
   const value = (raw || "").trim().toLowerCase().replace(/^@/, "");
   const map: Record<string, string> = {
+    "fields.run_id": "run_id",
     "fields.category": "category",
     "fields.node_id": "node_id",
     "fields.user_name": "user_name",
@@ -280,6 +281,7 @@ function normalizedQueryKey(raw?: string): string {
     "fields.exec_sha256": "exec_sha256",
     "fields.event_idem_key": "event_idem_key",
     "fields.raw_line_sha256": "raw_line_sha256",
+    run_id: "run_id",
     q: "q",
     text: "q"
   };
@@ -321,6 +323,7 @@ function filtersFromQuery(input: string, base: EventSearchQuery): EventSearchQue
     const value = token.value.trim();
     switch (key) {
       case "q":
+      case "run_id":
         if (value) freeText.push(value);
         break;
       case "dst_port":
@@ -461,6 +464,7 @@ export default function SearchPage() {
   const [filters, setFilters] = useState<EventSearchQuery>(() => initialQuery(searchParams));
   const [draftFilters, setDraftFilters] = useState<EventSearchQuery>(() => initialQuery(searchParams));
   const [result, setResult] = useState<EventSearchResponse | null>(null);
+  const [incidentMatches, setIncidentMatches] = useState<Incident[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [hasLoadedOnce, setHasLoadedOnce] = useState(false);
@@ -481,8 +485,13 @@ export default function SearchPage() {
     if (!hasLoadedOnceRef.current) setLoading(true);
     setError(null);
     try {
-      const res = await getSearchEvents(filters);
-      setResult(res);
+      const freeText = (filters.q || "").trim();
+      const [eventRes, searchRes] = await Promise.all([
+        getSearchEvents(filters),
+        freeText ? getSearch(freeText, filters.from, filters.to, 25) : Promise.resolve({ q: "", incidents: [], events: [], count_incidents: 0, count_events: 0 })
+      ]);
+      setResult(eventRes);
+      setIncidentMatches(searchRes.incidents || []);
       hasLoadedOnceRef.current = true;
       setHasLoadedOnce(true);
     } catch (err) {
@@ -595,19 +604,6 @@ export default function SearchPage() {
     }));
   };
 
-  const applyInfrastructurePivot = (patch: Partial<EventSearchQuery>) => {
-    const next = {
-      ...draftFilters,
-      category: "infrastructure",
-      page: 1,
-      ...patch
-    };
-    setDraftFilters(next);
-    setFilters(next);
-    setQueryText(buildSearchStatement(next));
-    pushFilters(next);
-  };
-
   const items = result?.items || [];
   const total = result?.total || 0;
   const currentPage = result?.page || filters.page || 1;
@@ -620,7 +616,7 @@ export default function SearchPage() {
   const maxTimelineCount = useMemo(() => Math.max(...timeline.map((bucket) => bucket.count), 1), [timeline]);
 
   return (
-    <section className="flex h-full min-h-0 flex-col gap-4 overflow-hidden">
+    <section className="flex min-h-full flex-col gap-4">
       <div className="flex items-center justify-between gap-3">
         <div>
           <div className="text-[11px] uppercase tracking-[0.22em] text-cyan-300">Search Operations</div>
@@ -635,16 +631,8 @@ export default function SearchPage() {
         <div className="rounded-2xl border border-cyan-900/60 bg-cyan-950/20 px-4 py-3">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
-              <div className="text-[11px] uppercase tracking-[0.2em] text-cyan-300">Infrastructure Quick Pivots</div>
-              <div className="mt-1 text-sm text-ink-300">Jump directly into infrastructure telemetry from syslog, NetFlow, and SNMP collectors.</div>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              <button className="btn-secondary px-3 py-2 text-xs" onClick={() => applyInfrastructurePivot({ source_type: "", event_type: "", rule_id: "" })}>All infrastructure</button>
-              <button className="btn-secondary px-3 py-2 text-xs" onClick={() => applyInfrastructurePivot({ source_type: "syslog", event_type: "syslog", rule_id: "" })}>Syslog</button>
-              <button className="btn-secondary px-3 py-2 text-xs" onClick={() => applyInfrastructurePivot({ source_type: "netflow_v5", event_type: "netflow_flow", rule_id: "" })}>NetFlow</button>
-              <button className="btn-secondary px-3 py-2 text-xs" onClick={() => applyInfrastructurePivot({ source_type: "snmp_trap", event_type: "snmp_trap", rule_id: "" })}>SNMP</button>
-              <button className="btn-secondary px-3 py-2 text-xs" onClick={() => applyInfrastructurePivot({ rule_id: "R-INFRA-EAST-WEST-FLOW-SCAN" })}>East-west scan</button>
-              <button className="btn-secondary px-3 py-2 text-xs" onClick={() => applyInfrastructurePivot({ rule_id: "R-INFRA-POST-CONTAINMENT-BLOCK-VERIFY" })}>Block verify</button>
+              <div className="text-[11px] uppercase tracking-[0.2em] text-cyan-300">Investigation Search</div>
+              <div className="mt-1 text-sm text-ink-300">Search by run ID, node, user, source IP, rule ID, event key, or raw event context without leaving the investigation workflow.</div>
             </div>
           </div>
         </div>
@@ -760,7 +748,6 @@ export default function SearchPage() {
                   <input className="input-field" placeholder="free_text" value={draftFilters.q || ""} onChange={(e) => updateDraftFilters((prev) => ({ ...prev, q: e.target.value, page: 1 }))} />
                   <select className="select-field" value={draftFilters.category || ""} onChange={(e) => updateDraftFilters((prev) => ({ ...prev, category: e.target.value, page: 1 }))}>
                     <option value="">all categories</option>
-                    <option value="infrastructure">infrastructure</option>
                   </select>
                   <input className="input-field" placeholder="node_id" value={draftFilters.node_id || ""} onChange={(e) => updateDraftFilters((prev) => ({ ...prev, node_id: e.target.value, page: 1 }))} />
                   <input className="input-field" placeholder="user_name" value={draftFilters.user_name || ""} onChange={(e) => updateDraftFilters((prev) => ({ ...prev, user_name: e.target.value, page: 1 }))} />
@@ -854,8 +841,44 @@ export default function SearchPage() {
         )}
       </div>
 
-      <div className="grid min-h-0 flex-1 grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1.65fr)_minmax(21rem,0.95fr)]">
-        <div className="panel-elevated flex min-h-0 flex-col overflow-hidden p-4">
+      <div className="grid grid-cols-1 items-start gap-4 xl:grid-cols-[minmax(0,1.65fr)_minmax(21rem,0.95fr)]">
+        <div className="panel-elevated flex flex-col p-4">
+          {incidentMatches.length > 0 ? (
+            <div className="mb-4 rounded-2xl border border-cyan-900/60 bg-cyan-950/20 p-4">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-[11px] uppercase tracking-[0.2em] text-cyan-300">Incident Matches</div>
+                  <div className="mt-1 text-sm text-ink-300">
+                    Direct incident hits for the current free-text query. This is the fastest path for `run_id` investigations.
+                  </div>
+                </div>
+                <div className="rounded-full border border-ink-700/80 bg-ink-900/70 px-3 py-1 text-xs text-ink-300">
+                  {incidentMatches.length} match{incidentMatches.length === 1 ? "" : "es"}
+                </div>
+              </div>
+              <div className="mt-3 grid gap-2">
+                {incidentMatches.map((incident) => (
+                  <div key={incident.run_id} className="rounded-xl border border-ink-800 bg-ink-950/35 p-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <Link className="font-mono text-sm text-cyan-100 underline decoration-cyan-700 underline-offset-2" href={`/incidents/${encodeURIComponent(incident.run_id)}`}>
+                        {incident.run_id}
+                      </Link>
+                      <div className="flex items-center gap-2">
+                        <LaneBadge lane={incident.lane} />
+                        <StatusBadge status={incident.status} />
+                      </div>
+                    </div>
+                    <div className="mt-2 grid gap-1 text-xs text-ink-300 md:grid-cols-2">
+                      <div>rule: {incident.rule_id || "-"}</div>
+                      <div>playbook: {incident.playbook_id || "-"}</div>
+                      <div>node: {incident.node_id || "-"}</div>
+                      <div>updated: {unixMsToLocal(incident.last_updated_at_unix_ms)}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
           <div className="flex items-center justify-between gap-3">
             <div>
               <div className="text-[11px] uppercase tracking-[0.2em] text-cyan-300">Time Analysis</div>
@@ -868,7 +891,7 @@ export default function SearchPage() {
             </div>
           </div>
 
-          <div className="mt-4 flex min-h-[18rem] flex-1 items-end gap-2 overflow-hidden rounded-2xl border border-ink-800 bg-[linear-gradient(180deg,rgba(7,12,26,0.55),rgba(3,7,18,0.96))] px-4 pb-6 pt-4">
+          <div className="mt-4 flex min-h-[18rem] items-end gap-2 overflow-hidden rounded-2xl border border-ink-800 bg-[linear-gradient(180deg,rgba(7,12,26,0.55),rgba(3,7,18,0.96))] px-4 pb-6 pt-4">
             {timeline.length > 0 ? timeline.map((bucket) => (
               <div key={bucket.ts} className="flex min-w-0 flex-1 flex-col items-center justify-end gap-2">
                 <div
@@ -885,7 +908,7 @@ export default function SearchPage() {
             )}
           </div>
 
-          <div className="mt-4 flex min-h-0 flex-1 flex-col overflow-hidden">
+          <div className="mt-4 flex flex-col">
             <div className="flex items-center justify-between gap-3">
               <div>
                 <div className="text-[11px] uppercase tracking-[0.2em] text-cyan-300">Result Log</div>
@@ -902,7 +925,7 @@ export default function SearchPage() {
             {!loading && error ? <ErrorState message={error} /> : null}
             {!loading && !error && items.length === 0 ? <EmptyState title="No events match the current search" detail="Broaden the timeframe or remove one or two exact-match filters." /> : null}
             {!loading && !error && items.length > 0 ? (
-              <div className="mt-3 min-h-[22rem] flex-1 overflow-auto rounded-2xl border border-ink-800 bg-ink-950/20">
+              <div className="mt-3 max-h-[38rem] min-h-[22rem] overflow-auto rounded-2xl border border-ink-800 bg-ink-950/20">
                 <table className="min-w-[116rem] text-sm">
                   <thead className="text-left">
                     <tr>
@@ -928,11 +951,6 @@ export default function SearchPage() {
                         </td>
                         <td className="p-2">
                           <div className="flex flex-wrap items-center gap-2">
-                            {isInfrastructureEvent(event) ? (
-                              <span className={`rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-[0.18em] ${infrastructureBadgeClass(event.rule_id)}`}>
-                                {infrastructureShortLabel(event.rule_id)}
-                              </span>
-                            ) : null}
                             <span className={eventTypeTone(event.source_type)}>{event.source_type}</span>
                             <span className="text-ink-200">{event.event_type}</span>
                           </div>
@@ -973,7 +991,7 @@ export default function SearchPage() {
           </div>
         </div>
 
-        <aside className="panel-elevated flex min-h-0 flex-col overflow-hidden p-4">
+        <aside className="panel-elevated flex flex-col p-4">
           <div className="flex items-center justify-between gap-3">
             <div>
               <div className="text-[11px] uppercase tracking-[0.2em] text-cyan-300">Quick Analysis</div>
@@ -981,7 +999,7 @@ export default function SearchPage() {
                 Based on all {items.length} events in the current visible result set.
               </div>
             </div>
-            <select className="select-field max-w-[10rem]" value={analysisMode} onChange={(e) => setAnalysisMode(e.target.value as AnalysisMode)}>
+            <select className="select-field w-full sm:max-w-[10rem]" value={analysisMode} onChange={(e) => setAnalysisMode(e.target.value as AnalysisMode)}>
               <option value="source_type">Source type</option>
               <option value="event_type">Event type</option>
               <option value="rule_id">Rule</option>
@@ -999,7 +1017,7 @@ export default function SearchPage() {
             </div>
           </div>
 
-          <div className="mt-4 min-h-[18rem] flex-1 overflow-auto rounded-2xl border border-ink-800 bg-ink-950/20">
+          <div className="mt-4 max-h-[38rem] min-h-[18rem] overflow-auto rounded-2xl border border-ink-800 bg-ink-950/20">
             <table className="min-w-full text-sm">
               <thead className="text-left">
                 <tr>

@@ -1,0 +1,38 @@
+log_level: info
+node_id: honeypot-local
+host: honeypot-local
+response_target_agent_id: ""
+
+jetstream:
+  url: nats://127.0.0.1:4222
+  stream: RSIEM_EVENTS
+  subject: rsiem.events.raw
+  spool_path: tmp/honeypot.spool.jsonl
+  spool_fsync: false
+  retry_interval_ms: 2000
+
+limits:
+  read_timeout_ms: 2500
+  write_timeout_ms: 2500
+  max_payload_bytes: 2048
+  max_concurrent: 64
+
+services:
+  - id: decoy-admin-http
+    enabled: true
+    protocol: http
+    listen: 127.0.0.1:18081
+    http_title: Restricted Administration Portal
+    realm: Operations Console
+
+  - id: decoy-ssh
+    enabled: true
+    protocol: ssh_banner
+    listen: 127.0.0.1:2222
+    banner: SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6
+
+  - id: decoy-telnet
+    enabled: true
+    protocol: telnet_banner
+    listen: 127.0.0.1:2323
+    banner: R-SIEM operations gateway

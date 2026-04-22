@@ -235,9 +235,17 @@ export type ResponseActionCatalogEntry = {
   execution_mode: string;
   default_duration_ms: number;
   clear_supported: boolean;
+  requires_targets?: boolean;
   requires_incident_scope?: boolean;
   available: boolean;
   unavailable_reason?: string;
+};
+
+export type ResponseActionTargetDraft = {
+  kind: "ip" | "dns" | "hostname" | "cidr";
+  value: string;
+  port?: number;
+  protocol?: "tcp" | "udp" | "any" | "";
 };
 
 export type ResponseActionView = {
@@ -255,6 +263,7 @@ export type ResponseActionView = {
   action_type: string;
   command_id?: string;
   target?: string;
+  targets?: ResponseActionTargetDraft[];
   direction?: string;
   reason?: string;
   reference?: string;
@@ -332,6 +341,35 @@ export type EventRow = {
   event_idem_key: string;
   raw_line_sha256?: string;
   category?: string;
+};
+
+export type HoneypotProfileService = {
+  id: string;
+  enabled: boolean;
+  protocol: string;
+  listen: string;
+  banner?: string;
+  http_title?: string;
+  realm?: string;
+};
+
+export type HoneypotProfileResponse = {
+  config_path: string;
+  node_id?: string;
+  host?: string;
+  response_target_agent_id?: string;
+  jetstream_url?: string;
+  stream?: string;
+  subject?: string;
+  services: HoneypotProfileService[];
+  rule_id: string;
+  escalation_rule_id: string;
+  playbook_id: string;
+  escalation_playbook_id: string;
+  verify_script: string;
+  start_command: string;
+  probe_command: string;
+  source: string;
 };
 
 export type EndpointSummary = {

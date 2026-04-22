@@ -22,11 +22,6 @@ The strongest defense claim is not that R-SIEM is finished in every possible are
 6. analysts and admins have distinct responsibilities
 7. the UI now supports investigation, response, governance, and evidence review
 
-One accuracy note you should say clearly if asked:
-
-- Linux endpoint support is the strongest validated live path today
-- Windows endpoint support is implemented in the repo and deployable, but it has been exercised less than Linux in the live demonstrations
-
 Use this sentence repeatedly:
 
 "R-SIEM is now an operational response-capable SIEM. It does not stop at detection. It ingests, detects, decides, responds, and audits."
@@ -109,6 +104,48 @@ Show the left navigation and explain the main surfaces briefly:
 ### Key point
 "The UI is not disconnected from the backend. Every surface now maps to a real backend API and real system state."
 
+## Part 2b. Quick Database Access for Questions
+If a judge asks to see the backing data, use the local Timescale/Postgres database that the UI reads from.
+
+The key tables are:
+- `normalized_events`
+- `incident_observables`
+- `observable_enrichments`
+- `enrichment_jobs`
+
+Fast access command:
+
+```bash
+docker exec -it rsiem-timescale psql -U rsiem -d rsiem
+```
+
+Useful demo queries:
+
+```sql
+\dt
+SELECT event_ts_unix_ms, recv_ts_unix_ms, node_id, source_type, event_type, user_name, src_ip, dst_ip, rule_id
+FROM normalized_events
+ORDER BY recv_ts_unix_ms DESC
+LIMIT 10;
+```
+
+```sql
+SELECT run_id, observable_kind, observable_value, observable_role, observable_source
+FROM incident_observables
+ORDER BY created_at_unix_ms DESC
+LIMIT 10;
+```
+
+```sql
+SELECT observable_kind, observable_value, provider, provider_verdict, provider_score, status, summary
+FROM observable_enrichments
+ORDER BY fetched_at_unix_ms DESC
+LIMIT 10;
+```
+
+### What to say
+"The database is not hidden. It is the same evidence store the UI uses. `normalized_events` is the event ledger, `incident_observables` is the incident-specific evidence set, `observable_enrichments` is the reputation and intelligence layer, and `enrichment_jobs` shows the enrichment workflow state."
+
 ## Part 3. Prove the Endpoint Is Live
 Run:
 
@@ -124,9 +161,6 @@ Show that the services are `active`.
 
 ### Key point
 "The endpoint plane is real and installed. The tests I run next are observed locally by the installed collectors."
-
-### Accuracy note if asked
-"Linux is the most heavily tested live endpoint path in this project. Windows endpoint support also exists through the installer, service registration, and configuration packaging in this repo, but Linux has received the deeper runtime validation so far."
 
 ## Part 4. Explain Roles: Analyst vs Admin
 Say this before the first live test.
@@ -175,7 +209,7 @@ sudo sshd -T | rg 'passwordauthentication'
 Run the live test:
 
 ```bash
-for i in $(seq 1 5); do
+for i in $(seq 1 2); do
   echo "attempt $i"
   ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1 rsiemtest@127.0.0.1
 done
@@ -307,10 +341,27 @@ Use the incident `Actions` tab, the endpoint workspace, or the fleet `/actions` 
 Recommended example:
 - `block_matching_connections`
 - duration: `2 hours`
-- target: a destination IP or DNS name from the incident context
+- explicit targets: one or more destination IPs, CIDRs, DNS names, or hostnames from the incident context
+
+Example target set:
+- `102.132.104.60:443`
+- `proof-rsiem-demo.invalid`
+- `172.30.50.13`
 
 ### What to say before launching
-"Autonomy is not the only response path. Operators also need manual bounded actions. So I can launch a response action directly, with a defined scope and a defined duration."
+"Autonomy is not the only response path. Operators also need manual bounded actions. So I can launch a response action directly, with a defined scope, a defined duration, and an explicit target list that the endpoint will enforce."
+
+### What to do in the UI
+On the incident `Actions` tab or `/actions` page:
+- choose `block_matching_connections`, `block_all_incoming`, or `block_all_outgoing`
+- enter one or more explicit block targets
+- include IP, DNS / hostname, port, and protocol if the action requires them
+- launch the action
+- confirm the action appears in the active ledger with the same endpoint and target list
+- if the action is clearable, use the clear button to restore normal state
+
+### What the panel should hear
+ "A target like `102.132.104.60:443` blocks that specific endpoint and port, not all HTTPS traffic. A DNS or hostname target is handled as the named destination and is enforced through the agent’s writable response-action hosts file under `/var/lib/rsiem/response_actions/hosts` unless an override is configured. The clear path uses the same canonical target list, so restore is deterministic and reversible."
 
 ### What to show
 Show the response action surfaces now available:
@@ -336,7 +387,7 @@ Explain the action lifecycle buckets:
 - `enforce_pattern_of_life`
 
 ### Key point
-"The system now supports explicit response control windows, not just incident decisions."
+"The system now supports explicit response control windows, not just incident decisions. For block actions, the operator enters the targets directly. For `102.132.104.60:443`, the block is destination-specific and port-specific, so unrelated HTTPS stays up. For quarantine, the endpoint is moved into a restricted-network containment state that blocks incident-scoped internal targets and can be cleared back to normal."
 
 ## Part 10. Show Endpoint Event Logs Before and After the Action
 Open the endpoint workspace for the affected node.
@@ -481,9 +532,14 @@ Then explain:
 - some expire automatically
 - some degrade safely to marker mode when enforcement would be invalid or over-broad
 - actions are context-aware, so the UI now marks them as `Eligible` or `Not Eligible` before launch
+- blocking actions are endpoint-scoped and require explicit targets from the operator
+- a block such as `102.132.104.60:443` means that exact endpoint and port, not all HTTPS traffic
+- DNS and hostname entries are preserved in canonical form, enforced through the runtime response-action hosts file when needed, and restored using the same normalized target list
+- quarantine is a restricted-network containment state for incident-scoped internal targets, not just a label
+- the same action record is visible in the incident view, endpoint view, fleet ledger, logs, and audit trail
 
 ### Good example explanation
-"For example, `block_matching_connections` can be launched for two hours and then cleared early. `quarantine_device` can enforce or safely degrade to marker mode depending on incident context. The important point is that response is bounded, explicit, and auditable."
+"For example, `block_matching_connections` can be launched for two hours and then cleared early. The operator must enter the IPs, DNS names, or hostnames that will be blocked on that endpoint, and if a port is included, the system blocks only that destination and port. `quarantine_device` moves the endpoint into a restricted-network state that blocks incident-scoped internal targets and can be restored through the clear path. The important point is that response is bounded, explicit, endpoint-scoped, and auditable."
 
 ## Part 15. Show the Models Workspace and Governance Story
 Open `Models` as admin.
@@ -583,45 +639,10 @@ Use this wording near the end:
 
 "My claim is not that the system is perfect. My claim is that the core architecture is built and working end to end: telemetry, detection, policy, response, search, action lifecycle, model governance, and audit. Remaining work is refinement, hardening, and deployment maturity, not the invention of the core capability."
 
-## Part 20. Infrastructure Expansion Position
-Use this wording if you need to explain the next major module:
-
-"The current strongest live proof is the endpoint plane. The next expansion is the infrastructure plane. That means routers, firewalls, switch-linked segments, and server networks exporting telemetry into the same R-SIEM backend."
-
-Then say:
-
-"I am not positioning that as a theoretical redesign. The infrastructure collectors already exist in this repo for syslog, NetFlow v5, and SNMP traps. The next step is to stand them up in an emulated virtual environment, not just on isolated endpoint hosts."
-
-### What to point at if challenged
-- infrastructure collectors already implemented:
-  - `cmd/collector-syslog/main.go`
-  - `cmd/collector-netflowv5/main.go`
-  - `cmd/collector-snmptrap/main.go`
-- exact lab specification:
-  - `configs/labs/emulated_infrastructure_lab.yaml`
-- implementation plan and telemetry mapping:
-  - `docs/deploy/emulated_infrastructure_lab.md`
-- current ingestion proof wrapper:
-  - `scripts/verify_infrastructure_plane_phase1.sh`
-- current detection proof wrapper:
-  - `scripts/verify_infrastructure_plane_phase2.sh`
-- expanded detection proof wrapper:
-  - `scripts/verify_infrastructure_plane_phase3.sh`
-- infrastructure detections now implemented:
-  - `R-INFRA-FIREWALL-DENY-BURST`
-  - `R-INFRA-NETWORK-ADMIN-LOGIN`
-  - `R-INFRA-LINK-FLAP-BURST`
-  - `R-INFRA-EAST-WEST-FLOW-SCAN`
-  - `R-INFRA-FIREWALL-CONFIG-CHANGE-OOW`
-  - `R-INFRA-POST-CONTAINMENT-BLOCK-VERIFY`
-
-### Exact wording to use
-"So the project is no longer only about endpoints. The architecture already supports an infrastructure telemetry plane. The collection-side proof is already in place, six infrastructure detections are now implemented with proof scripts, and the next robust step is to feed that plane from a fuller emulated network environment and extend the response playbook depth."
-
 ## Closing Line
 Use this if you want a firm ending:
 
-"R-SIEM now proves that it can ingest, detect, decide, respond, investigate, govern, and audit on live managed endpoints, with Linux validated most deeply and Windows support implemented. The same architecture is now active on infrastructure telemetry and six verified infrastructure detection paths, and is ready to extend further into the infrastructure plane."
+"R-SIEM now proves that it can ingest, detect, decide, respond, investigate, govern, and audit on a live endpoint. That is the core contribution of the project."
 
 ## Fast Reference: Commands in Order
 

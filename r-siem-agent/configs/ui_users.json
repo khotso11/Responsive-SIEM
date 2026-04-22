@@ -11,32 +11,8 @@
       "role": "analyst"
     },
     {
-      "username": "smoke_analyst_20260307_125242",
-      "password_hash": "$2a$10$BMotJ8nR3I3wg0txIemE1eIC8//pNYhpbBIkM3/5YFJL8rsP8GdWy",
-      "role": "analyst",
-      "disabled": true
-    },
-    {
-      "username": "smoke_analyst_20260307_125803",
-      "password_hash": "$2a$10$0BhD3WsF8KqratF0eRjwcOAA.EQgtdKNQaQRNLxJP.//fmYMOAAIq",
-      "role": "analyst",
-      "disabled": true
-    },
-    {
-      "username": "smoke_analyst_20260307_131802",
-      "password_hash": "$2a$10$XjYJiIjVC5kfnLzS5HIYaeXuTmyuyE9etq0W86lbZkxtL1T4NWSKu",
-      "role": "analyst",
-      "disabled": true
-    },
-    {
-      "username": "smoke_analyst_20260307_134021",
-      "password_hash": "$2a$10$GR8Bpw2ujkXVDZyXsYCorexDuXh5.uwoooWBnLJVu5/cZ3CLm/WHy",
-      "role": "analyst",
-      "disabled": true
-    },
-    {
-      "username": "smoke_analyst_20260307_134642",
-      "password_hash": "$2a$10$GPYP3913mBdCiv/Mv1Pjs.olfkbdR9.XgslltyiVcqCW1YF.u5nYe",
+      "username": "smoke_analyst_20260309_190140",
+      "password_hash": "$2a$10$bTPHWqVqmWvj/IlTOebnVO/sPcA51.juzyzK2ybJPoiSYpeGRtzFe",
       "role": "analyst",
       "disabled": true
     }

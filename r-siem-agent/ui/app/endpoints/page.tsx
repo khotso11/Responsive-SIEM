@@ -4,8 +4,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { clearEndpointAction, getEndpointActions, getEndpointEvents, getEndpointRuns, getEndpoints, getEndpointSummary, postEndpointAction, postEndpointTargetedTest } from "@/lib/api";
 import { INCIDENT_MUTATED_EVENT, INCIDENTS_UPDATED_EVENT } from "@/lib/events";
-import { EndpointDetailSummary, EndpointSummary, EventRow, Incident, ResponseActionListResponse, ResponseActionView } from "@/lib/types";
+import { EndpointDetailSummary, EndpointSummary, EventRow, Incident, ResponseActionListResponse, ResponseActionTargetDraft, ResponseActionView } from "@/lib/types";
 import { EmptyState, ErrorState, LaneBadge, LoadingState, StatusBadge, unixMsToLocal } from "@/components/ui";
+import { ResponseTargetBuilder } from "@/components/response-target-builder";
 
 const ACTION_DURATION_PRESETS: Array<{ label: string; value: number }> = [
   { label: "2 hours", value: 2 * 60 * 60 * 1000 },
@@ -28,6 +29,13 @@ function eligibilityTone(available: boolean): string {
   return available
     ? "border-emerald-700/60 bg-emerald-950/20 text-emerald-100"
     : "border-amber-700/60 bg-amber-950/20 text-amber-100";
+}
+
+function renderTargetSummary(targets?: ResponseActionTargetDraft[]): string {
+  if (!Array.isArray(targets) || targets.length === 0) return "";
+  return targets
+    .map((target) => [target.kind, target.value, target.port ? `:${target.port}` : "", target.protocol ? `/${target.protocol}` : ""].join(""))
+    .join(", ");
 }
 
 function actionBuckets(items?: ResponseActionView[]) {
@@ -55,14 +63,21 @@ function matchesActionTarget(event: EventRow, action: ResponseActionView): boole
   const ipTarget = String(action.details?.dst_ip || "").trim();
   const execPath = typeof action.details?.exec_path === "string" ? action.details.exec_path : "";
   const comm = typeof action.details?.comm === "string" ? action.details.comm : "";
+  const explicitTargets = Array.isArray(action.targets) ? action.targets : [];
+  const matchesExplicitTargets = explicitTargets.some((entry) => {
+    const value = String(entry.value || "").trim().toLowerCase();
+    if (!value) return false;
+    return Boolean((event.dst_ip || "").toLowerCase() === value || (event.src_ip || "").toLowerCase() === value || (event.dns_name || "").toLowerCase() === value);
+  });
   switch (action.action_name) {
     case "block_all_outgoing":
-      return Boolean(event.dst_ip);
+      return Boolean(event.dst_ip) && (explicitTargets.length === 0 ? true : matchesExplicitTargets || explicitTargets.some((entry) => String(entry.kind || "").toLowerCase() === "ip" && String(entry.value || "").trim() === event.dst_ip));
     case "block_all_incoming":
-      return Boolean(event.src_ip);
+      return Boolean(event.src_ip) && (explicitTargets.length === 0 ? true : matchesExplicitTargets || explicitTargets.some((entry) => String(entry.kind || "").toLowerCase() === "ip" && String(entry.value || "").trim() === event.src_ip));
     case "block_matching_connections":
       return Boolean(
         (target && (event.dst_ip === target || (event.dns_name || "").toLowerCase() === target)) ||
+        matchesExplicitTargets ||
         (dnsTarget && (event.dns_name || "").toLowerCase() === dnsTarget) ||
         (ipTarget && event.dst_ip === ipTarget)
       );
@@ -117,6 +132,7 @@ export default function EndpointsPage() {
   const [endpointActionReason, setEndpointActionReason] = useState("");
   const [endpointActionReference, setEndpointActionReference] = useState("");
   const [endpointActionTarget, setEndpointActionTarget] = useState("");
+  const [endpointActionTargets, setEndpointActionTargets] = useState<ResponseActionTargetDraft[]>([{ kind: "ip", value: "", port: undefined, protocol: "" }]);
   const [eventFocus, setEventFocus] = useState("");
   const [endpointActionBusy, setEndpointActionBusy] = useState(false);
 
@@ -178,6 +194,7 @@ export default function EndpointsPage() {
       setNodeEvents(evRes.items || []);
       setNodeRuns(runRes.items || []);
       setNodeActions(actionRes);
+      setEndpointActionTargets([{ kind: "ip", value: "", port: undefined, protocol: "" }]);
       if ((actionRes.available_actions || []).length > 0) {
         const first = actionRes.available_actions.find((item) => item.available) || actionRes.available_actions[0];
         setEndpointActionName(first?.id || "");
@@ -228,6 +245,11 @@ export default function EndpointsPage() {
     [endpointActionName, nodeActions?.available_actions]
   );
   const actionItems = nodeActions?.items || [];
+
+  useEffect(() => {
+    setEndpointActionTargets([{ kind: "ip", value: "", port: undefined, protocol: "" }]);
+    setEndpointActionTarget("");
+  }, [selectedEndpointAction?.id]);
   const filteredNodeEvents = useMemo(() => {
     const needle = eventFocus.trim().toLowerCase();
     if (!needle) return nodeEvents;
@@ -259,6 +281,18 @@ export default function EndpointsPage() {
       return;
     }
     try {
+      const targetPayload = endpointActionTargets
+        .map((item) => ({
+          kind: item.kind,
+          value: item.value.trim(),
+          port: item.port,
+          protocol: item.protocol
+        }))
+        .filter((item) => item.value.length > 0);
+      if (selectedEndpointAction.requires_targets && targetPayload.length === 0) {
+        setActionMsg("This endpoint action requires at least one explicit target.");
+        return;
+      }
       setEndpointActionBusy(true);
       await postEndpointAction(selectedNode.node_id, {
         actor,
@@ -266,13 +300,15 @@ export default function EndpointsPage() {
         duration_ms: endpointActionDurationMs,
         reason: endpointActionReason.trim(),
         reference: endpointActionReference.trim(),
-        target: endpointActionTarget.trim(),
+        target: targetPayload.map((item) => item.value).join(", "),
+        targets: targetPayload,
         target_agent_id: selectedNode.node_id
       });
       setActionMsg(`Endpoint action launched: ${selectedEndpointAction.label}`);
       setEndpointActionReason("");
       setEndpointActionReference("");
-      setEndpointActionTarget("");
+      setEndpointActionTarget(targetPayload.map((item) => item.value).join(", "));
+      setEndpointActionTargets([{ kind: "ip", value: "", port: undefined, protocol: "" }]);
       setNodeActions(await getEndpointActions(selectedNode.node_id));
     } catch (e) {
       setActionMsg(`Endpoint action failed: ${(e as Error).message}`);
@@ -450,6 +486,7 @@ export default function EndpointsPage() {
                   <div className="mt-1 flex flex-wrap gap-2">
                     <span className="badge-info">mode:{selectedEndpointAction.execution_mode}</span>
                     <span className="badge-info">clear:{selectedEndpointAction.clear_supported ? "supported" : "expiry only"}</span>
+                    {selectedEndpointAction.requires_targets ? <span className="badge-info">targets:required</span> : null}
                     <span className="badge-info">default:{humanDuration(selectedEndpointAction.default_duration_ms)}</span>
                   </div>
                   {!selectedEndpointAction.available ? (
@@ -457,6 +494,17 @@ export default function EndpointsPage() {
                       {selectedEndpointAction.unavailable_reason || "This action is not available for this endpoint."}
                     </div>
                   ) : null}
+                </div>
+              ) : null}
+              {selectedEndpointAction?.requires_targets ? (
+                <div className="mt-2">
+                  <ResponseTargetBuilder
+                    title="Explicit block targets"
+                    description="Enter one or more IPs, CIDRs, DNS names, hostnames, or protocol-aware targets for this endpoint."
+                    targets={endpointActionTargets}
+                    onChange={setEndpointActionTargets}
+                    disabled={endpointActionBusy}
+                  />
                 </div>
               ) : null}
               {(nodeActions?.available_actions || []).length > 0 ? (
@@ -473,6 +521,7 @@ export default function EndpointsPage() {
                         </span>
                       </div>
                       <div className="mt-1 text-ink-300">{item.description}</div>
+                      {item.requires_targets ? <div className="mt-1 text-ink-400">Requires explicit targets entered by the operator.</div> : null}
                       {!item.available && item.unavailable_reason ? (
                         <div className="mt-2 text-amber-100">{item.unavailable_reason}</div>
                       ) : null}
@@ -481,7 +530,13 @@ export default function EndpointsPage() {
                 </div>
               ) : null}
               <div className="grid grid-cols-1 gap-2 md:grid-cols-3">
-                <input value={endpointActionTarget} onChange={(e) => setEndpointActionTarget(e.target.value)} className="input-field mt-2 w-full md:col-span-1" placeholder="optional target override: IP, CIDR, or dns name" />
+                <input
+                  value={endpointActionTarget}
+                  onChange={(e) => setEndpointActionTarget(e.target.value)}
+                  className="input-field mt-2 w-full md:col-span-1"
+                  placeholder="target summary (auto-derived from explicit targets)"
+                  readOnly
+                />
                 <input value={endpointActionReference} onChange={(e) => setEndpointActionReference(e.target.value)} className="input-field mt-2 w-full md:col-span-1" placeholder="change / case reference" />
                 <input value={endpointActionReason} onChange={(e) => setEndpointActionReason(e.target.value)} className="input-field mt-2 w-full md:col-span-1" placeholder="operator reason" />
               </div>
@@ -680,14 +735,17 @@ export default function EndpointsPage() {
                         <div className="space-y-2">
                           {(nodeActionGroups[bucket] || []).map((item) => (
                             <div key={item.action_id} className="rounded border border-ink-700 bg-ink-900/40 px-3 py-2 text-xs">
-                              <div className="flex items-center justify-between gap-2">
-                                <span className="font-medium">{item.label}</span>
-                                <StatusBadge status={item.status} />
-                              </div>
-                              <div className="mt-1 text-ink-300">{item.target || selectedNode.node_id} • {item.execution_mode || item.action_type}</div>
-                              <div className="mt-1 text-ink-400">
-                                {item.started_at_unix_ms ? unixMsToLocal(item.started_at_unix_ms) : "-"} • expires {item.expires_at_unix_ms ? unixMsToLocal(item.expires_at_unix_ms) : "-"} • {humanDuration(item.duration_ms)}
-                              </div>
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="font-medium">{item.label}</span>
+                              <StatusBadge status={item.status} />
+                            </div>
+                            <div className="mt-1 text-ink-300">{item.target || selectedNode.node_id} • {item.execution_mode || item.action_type}</div>
+                            {Array.isArray(item.targets) && item.targets.length > 0 ? (
+                              <div className="mt-1 text-ink-400">targets: {renderTargetSummary(item.targets)}</div>
+                            ) : null}
+                            <div className="mt-1 text-ink-400">
+                              {item.started_at_unix_ms ? unixMsToLocal(item.started_at_unix_ms) : "-"} • expires {item.expires_at_unix_ms ? unixMsToLocal(item.expires_at_unix_ms) : "-"} • {humanDuration(item.duration_ms)}
+                            </div>
                               {item.clear_supported && item.bucket === "active" ? (
                                 <button disabled={endpointActionBusy} className="btn-secondary mt-2 disabled:opacity-60" onClick={() => clearNodeAction(item.action_id)}>
                                   Clear Action

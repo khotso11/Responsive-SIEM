@@ -1,5 +1,6 @@
 "use client";
 
+import dynamic from "next/dynamic";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import {
@@ -21,8 +22,23 @@ import {
 import { INCIDENT_MUTATED_EVENT, INCIDENTS_UPDATED_EVENT, emitIncidentMutated, emitIncidentsUpdated } from "@/lib/events";
 import { AuditEntry, AuthUser, DashboardIncidentPoint, DashboardSummary, EndpointGeoSummary, EventRow, Incident } from "@/lib/types";
 import { EmptyState, ErrorState, LaneBadge, LoadingState, StatusBadge, unixMsToLocal } from "@/components/ui";
-import { IncidentDrawer } from "@/components/incident-drawer";
-import { GeoPostureMap } from "@/components/geo-posture-map";
+
+const GeoPostureMap = dynamic(
+  () => import("@/components/geo-posture-map").then((mod) => mod.GeoPostureMap),
+  {
+    ssr: false,
+    loading: () => (
+      <div className="flex h-full min-h-[20rem] items-center justify-center text-sm text-ink-400">
+        Loading geo posture map...
+      </div>
+    )
+  }
+);
+
+const IncidentDrawer = dynamic(
+  () => import("@/components/incident-drawer").then((mod) => mod.IncidentDrawer),
+  { ssr: false }
+);
 
 function MiniBars({ data, colorClass }: { data: Array<{ label: string; value: number }>; colorClass: string }) {
   const max = Math.max(1, ...data.map((d) => d.value));
@@ -242,25 +258,26 @@ export default function DashboardPage() {
   const [endpointEvents, setEndpointEvents] = useState<EventRow[]>([]);
   const [endpointRuns, setEndpointRuns] = useState<Incident[]>([]);
   const [endpointLoading, setEndpointLoading] = useState(false);
+  const [geoLoading, setGeoLoading] = useState(true);
+  const [geoHasLoadedOnce, setGeoHasLoadedOnce] = useState(false);
 
   const fromMs = useMemo(() => parseQueryTime(searchParams.get("gfrom")), [searchParams]);
   const toMs = useMemo(() => parseQueryTime(searchParams.get("gto")), [searchParams]);
 
-  const load = useCallback(async () => {
+  const loadPrimary = useCallback(async () => {
     if (!hasLoadedOnceRef.current) {
       setLoading(true);
     }
     setError("");
     try {
-      const [s, i, sev, lane, t, inc, audit, geo] = await Promise.all([
+      const [s, i, sev, lane, t, inc, audit] = await Promise.all([
         getDashboardSummary("24h"),
         getDashboardIncidentsSeries(range, seriesBucketForRange(range)),
         getDashboardSeverity(range),
         getDashboardLanes(range),
         getDashboardTopEntities(range === "7d" ? "24h" : "1h"),
         getIncidents("limit=20&sort=updated_desc"),
-        getAudit("limit=20"),
-        getEndpointsGeo("1h")
+        getAudit("limit=20")
       ]);
       setSummary(s);
       setSeries(i.items || []);
@@ -269,8 +286,6 @@ export default function DashboardPage() {
       setTop({ src_ip: t.src_ip || [], user_name: t.user_name || [], node_id: t.node_id || [] });
       setLiveIncidents(inc.items || []);
       setAuditItems(audit.items || []);
-      setGeoEndpoints(geo.endpoints || []);
-      setGeoGeneratedAt(geo.generated_at || "");
       hasLoadedOnceRef.current = true;
       setHasLoadedOnce(true);
     } catch (e) {
@@ -280,11 +295,27 @@ export default function DashboardPage() {
     }
   }, [range]);
 
+  const loadGeo = useCallback(async () => {
+    if (!geoHasLoadedOnce) {
+      setGeoLoading(true);
+    }
+    try {
+      const geo = await getEndpointsGeo("1h");
+      setGeoEndpoints(geo.endpoints || []);
+      setGeoGeneratedAt(geo.generated_at || "");
+    } catch (e) {
+      setError((prev) => prev || (e as Error).message);
+    } finally {
+      setGeoHasLoadedOnce(true);
+      setGeoLoading(false);
+    }
+  }, [geoHasLoadedOnce]);
+
   useEffect(() => {
     let cancelled = false;
     const run = async () => {
       if (cancelled) return;
-      await load();
+      await Promise.allSettled([loadPrimary(), loadGeo()]);
     };
     run();
     const t = setInterval(run, 15000);
@@ -292,7 +323,7 @@ export default function DashboardPage() {
       cancelled = true;
       clearInterval(t);
     };
-  }, [load, refreshNonce]);
+  }, [loadGeo, loadPrimary, refreshNonce]);
 
   useEffect(() => {
     const onRefresh = () => setRefreshNonce((v) => v + 1);
@@ -365,7 +396,7 @@ export default function DashboardPage() {
     }
   };
 
-  const quickDecision = async (runID: string, decision: "approve" | "reject") => {
+  const quickDecision = useCallback(async (runID: string, decision: "approve" | "reject") => {
     setActionBusyRun(runID);
     try {
       if (decision === "approve") {
@@ -373,7 +404,8 @@ export default function DashboardPage() {
       } else {
         await rejectIncident(runID, "dashboard.quick");
       }
-      await load();
+      await loadPrimary();
+      void loadGeo();
       emitIncidentMutated(runID);
       emitIncidentsUpdated({ runID });
     } catch (e) {
@@ -381,7 +413,7 @@ export default function DashboardPage() {
     } finally {
       setActionBusyRun("");
     }
-  };
+  }, [loadGeo, loadPrimary]);
 
   return (
     <section className="flex h-full min-h-0 flex-col gap-4">
@@ -490,14 +522,22 @@ export default function DashboardPage() {
                 </aside>
               ) : null}
 
-              <GeoPostureMap
-                endpoints={geoEndpoints}
-                generatedAt={geoGeneratedAt}
-                onSelectEndpoint={openEndpoint}
-                probeHover={searchParams.get("geo_hover_probe") === "1"}
-                useSiteAggregateForUnlocated={useSiteAggregate}
-                siteAggregate={siteAggregate}
-              />
+              <div className="relative min-h-0">
+                <GeoPostureMap
+                  endpoints={geoEndpoints}
+                  generatedAt={geoGeneratedAt}
+                  loading={!geoHasLoadedOnce && geoLoading}
+                  onSelectEndpoint={openEndpoint}
+                  probeHover={searchParams.get("geo_hover_probe") === "1"}
+                  useSiteAggregateForUnlocated={useSiteAggregate}
+                  siteAggregate={siteAggregate}
+                />
+                {!geoHasLoadedOnce && geoLoading ? (
+                  <div className="pointer-events-none absolute left-4 top-4 rounded border border-ink-700/80 bg-ink-950/85 px-3 py-2 text-xs text-ink-300">
+                    Updating geo posture...
+                  </div>
+                ) : null}
+              </div>
             </div>
           </div>
 

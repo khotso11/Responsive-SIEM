@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"r-siem-agent/internal/investigation"
 )
 
 func TestApplyIncidentRetentionPolicyUsesServiceAccountRule(t *testing.T) {
@@ -256,6 +258,7 @@ func TestBuildResponseActionRequestSupportsDNSDestination(t *testing.T) {
 		"node-1",
 		incident{RunID: "run-1", NodeID: "node-1", DNSName: "proof-rsiem-demo.zip", DstIP: "104.18.32.47"},
 		"",
+		[]responseActionTargetSpec{{Kind: "dns", Value: "proof-rsiem-demo.zip"}, {Kind: "ip", Value: "104.18.32.47"}},
 		60000,
 		"manual dns block",
 		"case-1",
@@ -266,11 +269,41 @@ func TestBuildResponseActionRequestSupportsDNSDestination(t *testing.T) {
 	if req.command.ActionType != "network_block" {
 		t.Fatalf("action_type=%q, want network_block", req.command.ActionType)
 	}
-	if req.command.Target != "proof-rsiem-demo.zip" {
-		t.Fatalf("target=%q, want dns target", req.command.Target)
+	if req.command.Target != "proof-rsiem-demo.zip, 104.18.32.47" {
+		t.Fatalf("target=%q, want summarized targets", req.command.Target)
 	}
-	if got := strings.TrimSpace(strVal(req.command.Params["resolved_targets"])); got != "104.18.32.47" {
-		t.Fatalf("resolved_targets=%q, want 104.18.32.47", got)
+	resolved, ok := req.command.Params["resolved_targets"].([]string)
+	if !ok || len(resolved) != 1 || resolved[0] != "104.18.32.47" {
+		t.Fatalf("resolved_targets=%#v, want [104.18.32.47]", req.command.Params["resolved_targets"])
+	}
+	if got := req.command.Params["targets"]; got == nil {
+		t.Fatalf("expected structured targets in command params")
+	}
+	if len(req.targets) != 2 {
+		t.Fatalf("targets=%d, want 2", len(req.targets))
+	}
+}
+
+func TestBuildResponseActionRequestRequiresExplicitTargets(t *testing.T) {
+	template, ok := responseActionTemplateByID("block_all_outgoing")
+	if !ok {
+		t.Fatalf("missing block_all_outgoing template")
+	}
+	if _, err := buildResponseActionRequest(
+		template,
+		"uiact_empty",
+		"analyst",
+		"run-1",
+		"node-1",
+		"node-1",
+		incident{RunID: "run-1", NodeID: "node-1"},
+		"",
+		nil,
+		60000,
+		"manual outbound block",
+		"case-1",
+	); err == nil {
+		t.Fatalf("expected explicit target validation error")
 	}
 }
 
@@ -665,13 +698,14 @@ func TestDeriveIncidentConfidenceUsesEvidenceFactors(t *testing.T) {
 
 func TestBuildRunObservablesIncludesHashesDomainsAndURLs(t *testing.T) {
 	run := incident{
-		SrcIP:      "10.0.0.8",
-		DstIP:      "104.18.32.47",
-		ExecSHA256: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-		FileSHA256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-		DNSName:    "api.example.com",
-		Target:     "https://portal.example.com/login",
-		Cmdline:    `curl https://download.example.net/tool.sh`,
+		SrcIP:           "10.0.0.8",
+		DstIP:           "104.18.32.47",
+		TopDestinations: []string{"172.30.50.11", "files.internal", "172.30.50.11"},
+		ExecSHA256:      "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+		FileSHA256:      "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		DNSName:         "api.example.com",
+		Target:          "https://portal.example.com/login",
+		Cmdline:         `curl https://download.example.net/tool.sh`,
 	}
 
 	obs := buildRunObservables(run)
@@ -681,7 +715,10 @@ func TestBuildRunObservablesIncludesHashesDomainsAndURLs(t *testing.T) {
 	}
 
 	want := []string{
+		"ip:10.0.0.8",
 		"ip:104.18.32.47",
+		"ip:172.30.50.11",
+		"domain:files.internal",
 		"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 		"domain:api.example.com",
@@ -695,24 +732,19 @@ func TestBuildRunObservablesIncludesHashesDomainsAndURLs(t *testing.T) {
 			t.Fatalf("missing observable %q in %v", candidate, got)
 		}
 	}
-	for _, item := range got {
-		if item == "ip:10.0.0.8" {
-			t.Fatalf("unexpected private IP observable in %v", got)
-		}
-	}
 }
 
 func TestBuildRunObservablesRejectsInvalidHashesAndDomains(t *testing.T) {
 	run := incident{
 		ExecSHA256: "not-a-hash",
 		FileSHA256: "short",
-		DNSName:    "172.30.50.14",
+		DstIP:      "172.30.50.14",
 		Target:     "not a url",
 		Cmdline:    "echo example",
 	}
 
 	obs := buildRunObservables(run)
-	if len(obs) != 0 {
-		t.Fatalf("observables=%v, want empty for invalid inputs", obs)
+	if len(obs) != 1 || obs[0].Kind != investigation.ObservableIP || obs[0].Value != "172.30.50.14" {
+		t.Fatalf("observables=%v, want only dst IP observable for numeric DNS-like target", obs)
 	}
 }

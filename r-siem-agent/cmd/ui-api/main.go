@@ -36,6 +36,7 @@ import (
 
 	"r-siem-agent/internal/config"
 	"r-siem-agent/internal/investigation"
+	"r-siem-agent/internal/investigation/providers"
 	"r-siem-agent/internal/logging"
 	"r-siem-agent/internal/roe/trigger"
 )
@@ -739,6 +740,47 @@ type eventSearchResponse struct {
 	Query            any        `json:"query"`
 }
 
+type honeypotProfileService struct {
+	ID        string `json:"id" yaml:"id"`
+	Enabled   bool   `json:"enabled" yaml:"enabled"`
+	Protocol  string `json:"protocol" yaml:"protocol"`
+	Listen    string `json:"listen" yaml:"listen"`
+	Banner    string `json:"banner,omitempty" yaml:"banner"`
+	HTTPTitle string `json:"http_title,omitempty" yaml:"http_title"`
+	Realm     string `json:"realm,omitempty" yaml:"realm"`
+}
+
+type honeypotProfileConfig struct {
+	NodeID                string `yaml:"node_id"`
+	Host                  string `yaml:"host"`
+	ResponseTargetAgentID string `yaml:"response_target_agent_id"`
+	JetStream             struct {
+		URL     string `yaml:"url"`
+		Stream  string `yaml:"stream"`
+		Subject string `yaml:"subject"`
+	} `yaml:"jetstream"`
+	Services []honeypotProfileService `yaml:"services"`
+}
+
+type honeypotProfileResponse struct {
+	ConfigPath            string                   `json:"config_path"`
+	NodeID                string                   `json:"node_id,omitempty"`
+	Host                  string                   `json:"host,omitempty"`
+	ResponseTargetAgentID string                   `json:"response_target_agent_id,omitempty"`
+	JetStreamURL          string                   `json:"jetstream_url,omitempty"`
+	Stream                string                   `json:"stream,omitempty"`
+	Subject               string                   `json:"subject,omitempty"`
+	Services              []honeypotProfileService `json:"services"`
+	RuleID                string                   `json:"rule_id"`
+	EscalationRuleID      string                   `json:"escalation_rule_id"`
+	PlaybookID            string                   `json:"playbook_id"`
+	EscalationPlaybookID  string                   `json:"escalation_playbook_id"`
+	VerifyScript          string                   `json:"verify_script"`
+	StartCommand          string                   `json:"start_command"`
+	ProbeCommand          string                   `json:"probe_command"`
+	Source                string                   `json:"source"`
+}
+
 var infrastructureSourceTypes = map[string]struct{}{
 	"syslog":     {},
 	"netflow_v5": {},
@@ -1124,6 +1166,7 @@ func main() {
 	mux.HandleFunc("GET /api/reports/soc/operations", a.withAuthRole(a.handleSOCOperationsReport, "analyst"))
 	mux.HandleFunc("GET /api/search", a.withAuthRole(a.handleSearch, "analyst"))
 	mux.HandleFunc("GET /api/search/events", a.withAuthRole(a.handleSearchEvents, "analyst"))
+	mux.HandleFunc("GET /api/honeypot/profile", a.withAuthRole(a.handleHoneypotProfile, "analyst"))
 	mux.HandleFunc("GET /api/infrastructure/topology", a.withAuthRole(a.handleInfrastructureTopology, "analyst"))
 	mux.HandleFunc("POST /api/infrastructure/eve/nodes/{node_id}/{action}", a.withAuthRole(a.handleInfrastructureEveNodeAction, "admin"))
 	mux.HandleFunc("GET /api/entities/ip/{ip}", a.withAuthRole(a.handleEntityIP, "analyst"))
@@ -3420,10 +3463,6 @@ func (a *app) handleInvestigationRefresh(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "db unavailable"})
 		return
 	}
-	if a.nc == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "nats unavailable"})
-		return
-	}
 
 	runs, _, _ := a.loadState()
 	var run *incident
@@ -3442,6 +3481,7 @@ func (a *app) handleInvestigationRefresh(w http.ResponseWriter, r *http.Request)
 	// Build observables from run context and dedupe with existing DB rows.
 	fresh := dedupeInvestigationObservables(buildRunObservables(*run))
 	existing := map[string]struct{}{}
+	existingObservables := make([]investigation.Observable, 0, len(fresh))
 	rows, _ := a.db.QueryContext(ctx, `SELECT observable_kind, observable_value FROM incident_observables WHERE run_id=$1`, runID)
 	if rows != nil {
 		defer rows.Close()
@@ -3449,6 +3489,10 @@ func (a *app) handleInvestigationRefresh(w http.ResponseWriter, r *http.Request)
 			var k, v string
 			if err := rows.Scan(&k, &v); err == nil {
 				existing[k+"|"+v] = struct{}{}
+				existingObservables = append(existingObservables, investigation.Observable{
+					Kind:  investigation.ObservableKind(k),
+					Value: v,
+				})
 			}
 		}
 	}
@@ -3468,28 +3512,14 @@ ON CONFLICT DO NOTHING;
 `, runID, string(o.Kind), o.Value, o.Role, o.Source, nowMs)
 	}
 
-	// Prepare job payload for enricher.
 	rc := roleFromRequest(r)
 	jobID := strings.ReplaceAll(nats.NewInbox(), "INBOX.", "enrich.")
-	payload := map[string]any{
-		"job_id":       jobID,
-		"run_id":       runID,
-		"observables":  trimmed,
-		"requested_by": rc.Username,
-		"refresh":      true,
-	}
-	data, _ := json.Marshal(payload)
-	if err := a.nc.Publish(defaultInvestigationSubj, data); err != nil {
+	allObservables := dedupeInvestigationObservables(append(existingObservables, trimmed...))
+	if err := a.runInvestigationRefreshSync(ctx, jobID, runID, rc.Username, allObservables, true); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-	_, _ = a.db.ExecContext(ctx, `
-INSERT INTO enrichment_jobs (job_id, run_id, status, requested_by, requested_at_unix_ms, refresh)
-VALUES ($1,$2,'requested',$3,EXTRACT(EPOCH FROM now())*1000,$4)
-ON CONFLICT (job_id) DO NOTHING;
-`, jobID, runID, rc.Username, true)
-
-	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "job_id": jobID, "observables": len(trimmed)})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "job_id": jobID, "observables": len(allObservables)})
 }
 
 func (a *app) loadInvestigation(ctx context.Context, runID string) (investigationResponse, error) {
@@ -3632,8 +3662,6 @@ func (a *app) loadInvestigationProviders(ctx context.Context) (investigationProv
 	catalog := map[string]providerMeta{
 		"abuseipdb":  {label: "AbuseIPDB", envVar: "ABUSEIPDB_API_KEY", supportedKinds: []string{"ip"}},
 		"virustotal": {label: "VirusTotal", envVar: "VT_API_KEY", supportedKinds: []string{"ip", "domain", "url", "sha256"}},
-		"greynoise":  {label: "GreyNoise", envVar: "GREYNOISE_API_KEY", supportedKinds: []string{"ip"}},
-		"urlscan":    {label: "urlscan", envVar: "URLSCAN_API_KEY", supportedKinds: []string{"domain", "url"}},
 	}
 	enabled := parseEnabledProvidersLocal(os.Getenv("INVESTIGATION_ENABLED_PROVIDERS"))
 	enabledSet := make(map[string]struct{}, len(enabled))
@@ -3711,6 +3739,103 @@ func parseEnabledProvidersLocal(raw string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func newLocalInvestigationEngine(enabled []string) *investigation.Engine {
+	all := map[string]investigation.Provider{
+		"abuseipdb":  providers.NewAbuseIPDB(),
+		"virustotal": providers.NewVirusTotal(),
+	}
+	if len(enabled) == 0 {
+		return investigation.NewEngine(all["abuseipdb"], all["virustotal"])
+	}
+	selected := make([]investigation.Provider, 0, len(enabled))
+	for _, name := range enabled {
+		if p, ok := all[strings.ToLower(strings.TrimSpace(name))]; ok {
+			selected = append(selected, p)
+		}
+	}
+	if len(selected) == 0 {
+		selected = append(selected, all["abuseipdb"], all["virustotal"])
+	}
+	return investigation.NewEngine(selected...)
+}
+
+func mustJSONBytes(v any) []byte {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return []byte(`{}`)
+	}
+	return data
+}
+
+func (a *app) runInvestigationRefreshSync(ctx context.Context, jobID, runID, requestedBy string, observables []investigation.Observable, refresh bool) error {
+	if a.db == nil {
+		return fmt.Errorf("db unavailable")
+	}
+	_, _ = a.db.ExecContext(ctx, `
+INSERT INTO enrichment_jobs (job_id, run_id, status, requested_by, requested_at_unix_ms, refresh, error_text)
+VALUES ($1,$2,'running',$3,EXTRACT(EPOCH FROM now())*1000,$4,'')
+ON CONFLICT (job_id)
+DO UPDATE SET status='running', error_text='';
+`, jobID, runID, chooseNonEmpty(strings.TrimSpace(requestedBy), "ui"), refresh)
+
+	if len(observables) == 0 {
+		_, _ = a.db.ExecContext(ctx, `
+INSERT INTO enrichment_jobs (job_id, run_id, status, requested_by, requested_at_unix_ms, completed_at_unix_ms, refresh, error_text)
+VALUES ($1,$2,'skipped',$3,EXTRACT(EPOCH FROM now())*1000,EXTRACT(EPOCH FROM now())*1000,$4,'no observables')
+ON CONFLICT (job_id)
+DO UPDATE SET status='skipped', completed_at_unix_ms=EXCLUDED.completed_at_unix_ms, error_text='no observables';
+`, jobID, runID, chooseNonEmpty(strings.TrimSpace(requestedBy), "ui"), refresh)
+		return nil
+	}
+
+	timeout := 12 * time.Second
+	if raw := strings.TrimSpace(os.Getenv("INVESTIGATION_JOB_TIMEOUT")); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+			timeout = d
+		}
+	}
+	jobCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	engine := newLocalInvestigationEngine(parseEnabledProvidersLocal(os.Getenv("INVESTIGATION_ENABLED_PROVIDERS")))
+	totalResults := 0
+	for _, obs := range observables {
+		results, _ := engine.Enrich(jobCtx, obs)
+		for _, res := range results {
+			totalResults++
+			_, _ = a.db.ExecContext(jobCtx, `
+INSERT INTO observable_enrichments (
+  observable_kind, observable_value, provider, status, provider_verdict, provider_score, summary,
+  evidence_url, data_json, fetched_at_unix_ms, expires_at_unix_ms
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+ON CONFLICT (observable_kind, observable_value, provider)
+DO UPDATE SET status=EXCLUDED.status,
+  provider_verdict=EXCLUDED.provider_verdict,
+  provider_score=EXCLUDED.provider_score,
+  summary=EXCLUDED.summary,
+  evidence_url=EXCLUDED.evidence_url,
+  data_json=EXCLUDED.data_json,
+  fetched_at_unix_ms=EXCLUDED.fetched_at_unix_ms,
+  expires_at_unix_ms=EXCLUDED.expires_at_unix_ms;
+`, string(obs.Kind), obs.Value, res.Provider, res.Status, res.Verdict, res.Score, res.Summary, res.EvidenceURL, mustJSONBytes(res.Data), res.FetchedAtUnix, res.ExpiresAtUnix)
+		}
+	}
+
+	status := "completed"
+	errorText := ""
+	if totalResults == 0 {
+		status = "skipped"
+		errorText = "no provider results"
+	}
+	_, _ = a.db.ExecContext(ctx, `
+INSERT INTO enrichment_jobs (job_id, run_id, status, requested_by, requested_at_unix_ms, completed_at_unix_ms, refresh, error_text)
+VALUES ($1,$2,$3,$4,EXTRACT(EPOCH FROM now())*1000,EXTRACT(EPOCH FROM now())*1000,$5,$6)
+ON CONFLICT (job_id)
+DO UPDATE SET status=EXCLUDED.status, completed_at_unix_ms=EXCLUDED.completed_at_unix_ms, error_text=EXCLUDED.error_text;
+`, jobID, runID, status, chooseNonEmpty(strings.TrimSpace(requestedBy), "ui"), refresh, errorText)
+	return nil
 }
 
 func (a *app) loadEntityIPProfile(ctx context.Context, ip string) (entityProfileResponse, error) {
@@ -3955,11 +4080,20 @@ func stringAny(v any) string {
 
 func buildRunObservables(run incident) []investigation.Observable {
 	obs := []investigation.Observable{}
-	if isPublicIP(run.SrcIP) {
+	if validIPObservable(run.SrcIP) {
 		obs = append(obs, investigation.Observable{Kind: investigation.ObservableIP, Value: run.SrcIP, Role: "src_ip", Source: "incident.run.src_ip"})
 	}
-	if isPublicIP(run.DstIP) {
+	if validIPObservable(run.DstIP) {
 		obs = append(obs, investigation.Observable{Kind: investigation.ObservableIP, Value: run.DstIP, Role: "dst_ip", Source: "incident.run.dst_ip"})
+	}
+	for _, dst := range dedupeStrings(run.TopDestinations) {
+		if validIPObservable(dst) {
+			obs = append(obs, investigation.Observable{Kind: investigation.ObservableIP, Value: dst, Role: "top_destination", Source: "incident.run.top_destinations"})
+			continue
+		}
+		if domain := normalizeDomainObservable(dst); domain != "" {
+			obs = append(obs, investigation.Observable{Kind: investigation.ObservableDomain, Value: domain, Role: "top_destination_domain", Source: "incident.run.top_destinations"})
+		}
 	}
 	if hash := normalizeSHA256Observable(run.ExecSHA256); hash != "" {
 		obs = append(obs, investigation.Observable{Kind: investigation.ObservableSHA256, Value: hash, Role: "exec_sha256", Source: "incident.run.exec_sha256"})
@@ -3977,6 +4111,10 @@ func buildRunObservables(run incident) []investigation.Observable {
 		obs = append(obs, investigation.Observable{Kind: investigation.ObservableDomain, Value: domain, Role: "domain", Source: "incident.run.domain"})
 	}
 	return obs
+}
+
+func validIPObservable(raw string) bool {
+	return net.ParseIP(strings.TrimSpace(raw)) != nil
 }
 
 func normalizeSHA256Observable(raw string) string {
@@ -5462,6 +5600,55 @@ LIMIT $` + strconv.Itoa(len(args)-1) + ` OFFSET $` + strconv.Itoa(len(args))
 	writeJSON(w, http.StatusOK, resp)
 }
 
+func honeypotConfigPath() string {
+	if _, err := os.Stat("tmp/honeypot_demo.yaml"); err == nil {
+		return "tmp/honeypot_demo.yaml"
+	}
+	return "configs/honeypot.yaml"
+}
+
+func (a *app) handleHoneypotProfile(w http.ResponseWriter, r *http.Request) {
+	path := honeypotConfigPath()
+	body, err := os.ReadFile(path)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": fmt.Sprintf("read honeypot config: %v", err)})
+		return
+	}
+
+	var cfg honeypotProfileConfig
+	if err := yaml.Unmarshal(body, &cfg); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": fmt.Sprintf("parse honeypot config: %v", err)})
+		return
+	}
+
+	resp := honeypotProfileResponse{
+		ConfigPath:            path,
+		NodeID:                strings.TrimSpace(cfg.NodeID),
+		Host:                  strings.TrimSpace(cfg.Host),
+		ResponseTargetAgentID: chooseNonEmpty(strings.TrimSpace(cfg.ResponseTargetAgentID), strings.TrimSpace(cfg.NodeID)),
+		JetStreamURL:          strings.TrimSpace(cfg.JetStream.URL),
+		Stream:                strings.TrimSpace(cfg.JetStream.Stream),
+		Subject:               strings.TrimSpace(cfg.JetStream.Subject),
+		Services:              cfg.Services,
+		RuleID:                "R-FR03-DECEPTION-TRIPWIRE",
+		EscalationRuleID:      "R-DECEPTION-HONEYPOT-PROBE-BURST-SRCIP",
+		PlaybookID:            "PB-DECEPTION-HONEYPOT-TRIAGE",
+		EscalationPlaybookID:  "PB-DECEPTION-HONEYPOT-SOURCE-CONTAIN",
+		VerifyScript:          "./scripts/verify_fr04.sh",
+		StartCommand:          "START_HONEYPOT=1 REAL_SYSTEM=1 UI_WEB_PORT=3100 ./scripts/demo_local_endpoint_clean_start.sh",
+		ProbeCommand:          "curl -sS -o /dev/null -H 'X-RSIEM-Source-IP: 10.66.12.250' -H 'Content-Type: application/x-www-form-urlencoded' --data 'username=honeypot-admin&password=bad' http://127.0.0.1:18081/admin/login?probe=demo",
+		Source:                "config",
+	}
+	if resp.Stream == "" {
+		resp.Stream = "RSIEM_EVENTS"
+	}
+	if resp.Subject == "" {
+		resp.Subject = "rsiem.events.raw"
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
 func (a *app) handleStream(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -5951,6 +6138,7 @@ func (a *app) collectAuditEntries(roleCtx roleContext, q string, fromMs, toMs in
 	entries = append(entries, parseAuditLog(a.cfg.MasterLogPath, "master")...)
 	entries = append(entries, parseAuditLog(a.cfg.UIAPILogPath, "ui-api")...)
 	entries = append(entries, a.parseUIStateAudit()...)
+	entries = append(entries, a.parseResponseActionAudit()...)
 	filtered := make([]auditEntry, 0, len(entries))
 	for _, entry := range entries {
 		if fromMs > 0 || toMs > 0 {
@@ -5968,7 +6156,15 @@ func (a *app) collectAuditEntries(roleCtx roleContext, q string, fromMs, toMs in
 			}
 		}
 		if q != "" {
-			hay := strings.ToLower(strings.Join([]string{entry.Msg, entry.RunID, entry.Actor, entry.Decision, entry.Status, entry.Source}, "|"))
+			hay := strings.ToLower(strings.Join([]string{
+				entry.Msg,
+				entry.RunID,
+				entry.Actor,
+				entry.Decision,
+				entry.Status,
+				entry.Source,
+				stringifyAuditDetails(entry.Details),
+			}, "|"))
 			if !strings.Contains(hay, q) {
 				continue
 			}
@@ -5989,6 +6185,42 @@ func (a *app) collectAuditEntries(roleCtx roleContext, q string, fromMs, toMs in
 		filtered = filtered[:limit]
 	}
 	return filtered
+}
+
+func stringifyAuditDetails(details map[string]any) string {
+	if len(details) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(details)*2)
+	var appendValue func(any)
+	appendValue = func(v any) {
+		switch t := v.(type) {
+		case string:
+			if strings.TrimSpace(t) != "" {
+				parts = append(parts, t)
+			}
+		case fmt.Stringer:
+			value := strings.TrimSpace(t.String())
+			if value != "" {
+				parts = append(parts, value)
+			}
+		case []any:
+			for _, item := range t {
+				appendValue(item)
+			}
+		case map[string]any:
+			for _, item := range t {
+				appendValue(item)
+			}
+		default:
+			value := strings.TrimSpace(fmt.Sprint(v))
+			if value != "" && value != "<nil>" {
+				parts = append(parts, value)
+			}
+		}
+	}
+	appendValue(details)
+	return strings.Join(parts, "|")
 }
 
 func (a *app) handleArtifacts(w http.ResponseWriter, r *http.Request) {
@@ -7382,6 +7614,42 @@ func (a *app) parseUIStateAudit() []auditEntry {
 	return entries
 }
 
+func (a *app) parseResponseActionAudit() []auditEntry {
+	entries := make([]auditEntry, 0, 128)
+	_ = scanJSONLines(a.responseActionsStatePath(), func(obj map[string]any) {
+		actionID := strVal(obj["action_id"])
+		if actionID == "" {
+			return
+		}
+		action := strVal(obj["action"])
+		if action == "" {
+			action = "response_action"
+		}
+		entries = append(entries, auditEntry{
+			TS:       strVal(obj["ts"]),
+			Msg:      "ui_response_action_" + action,
+			RunID:    strVal(obj["run_id"]),
+			Actor:    strVal(obj["actor"]),
+			Decision: "",
+			Status:   strVal(obj["status"]),
+			Details: map[string]any{
+				"action_id":     actionID,
+				"scope_type":    strVal(obj["scope_type"]),
+				"node_id":       strVal(obj["node_id"]),
+				"action_name":   strVal(obj["action_name"]),
+				"label":         strVal(obj["label"]),
+				"target":        strVal(obj["target"]),
+				"reference":     strVal(obj["reference"]),
+				"reason":        strVal(obj["reason"]),
+				"bucket":        strVal(obj["bucket"]),
+				"status_detail": strVal(obj["status_detail"]),
+			},
+			Source: "ui-response-actions",
+		})
+	})
+	return entries
+}
+
 func (a *app) loadIncidentAnnotations(runID string) []auditEntry {
 	annotations := make([]auditEntry, 0, 8)
 	_ = scanJSONLines(a.cfg.MasterLogPath, func(obj map[string]any) {
@@ -7472,7 +7740,7 @@ func parseAuditLog(path string, source string) []auditEntry {
 		}
 		keep := false
 		switch msg {
-		case "approval_received", "approval_approved", "approval_denied", "approval_timed_out", "response_run_manual_review_required", "response_run_partial_completion", "response_run_corroborated", "ui_approval_published", "ui_user_upserted", "ui_user_disabled", "ui_user_deleted", "ui_model_change_proposed", "ui_model_change_approved", "ui_model_change_rejected", "ui_model_change_applied", "identity_verification_completed", "identity_verification_failed_safe", "identity_verification_failed", "auth_access_restored", "auth_restore_failed_safe", "auth_access_restore_failed":
+		case "approval_received", "approval_approved", "approval_denied", "approval_timed_out", "response_run_manual_review_required", "response_run_partial_completion", "response_run_corroborated", "ui_approval_published", "ui_user_upserted", "ui_user_disabled", "ui_user_deleted", "ui_model_change_proposed", "ui_model_change_approved", "ui_model_change_rejected", "ui_model_change_applied", "identity_verification_completed", "identity_verification_failed_safe", "identity_verification_failed", "auth_access_restored", "auth_restore_failed_safe", "auth_access_restore_failed", "ui_response_action_event", "ui_response_reissued":
 			keep = true
 		case "response_run_updated":
 			status := strings.ToUpper(strVal(obj["status"]))

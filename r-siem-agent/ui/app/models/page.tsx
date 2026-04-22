@@ -381,8 +381,7 @@ export default function ModelsPage() {
   const proposalsScrollRef = usePersistentPaneScroll("rsiem:models:proposals", `${proposals.length}:${lastStatusRefreshTs}`);
 
   const loadCatalog = useCallback(async () => {
-    const [meRes, catalogRes, proposalsRes] = await Promise.all([me(), getModels(), getModelProposals()]);
-    setAuthUser(meRes.user);
+    const [catalogRes, proposalsRes] = await Promise.all([getModels(), getModelProposals()]);
     setCatalog(catalogRes.items || []);
     setProposals(proposalsRes.items || []);
     setRestartTargets(mergeRestartTargets(catalogRes.restart_targets, proposalsRes.restart_targets));
@@ -409,6 +408,20 @@ export default function ModelsPage() {
       mounted = false;
     };
   }, [loadCatalog]);
+
+  useEffect(() => {
+    let mounted = true;
+    me()
+      .then((res) => {
+        if (mounted) setAuthUser(res.user);
+      })
+      .catch(() => {
+        if (mounted) setAuthUser(null);
+      });
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (!selectedKey) {

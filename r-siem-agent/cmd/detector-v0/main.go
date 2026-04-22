@@ -31,6 +31,7 @@ const (
 	countFailedPwSrcRuleID     = "R-COUNT-FAILED-PW-SRCIP"
 	authBurstUserRuleID        = "R-AUTH-FAILED-PW-BURST-USER"
 	authBurstSrcRuleID         = "R-AUTH-FAILED-PW-BURST-SRCIP"
+	deceptionBurstSrcRuleID    = "R-DECEPTION-HONEYPOT-PROBE-BURST-SRCIP"
 	statProcessRuleID          = "R-STAT-PROCESS-MED"
 	processCountRuleID         = "R-COUNT-PROCESS-HOST"
 	fileSensitiveRuleID        = "R-FILE-SENSITIVE-CHANGE"
@@ -75,6 +76,8 @@ const (
 	authBurstUserWindowMs      = 300000
 	authBurstSrcThreshold      = 8
 	authBurstSrcWindowMs       = 300000
+	deceptionBurstSrcThreshold = 3
+	deceptionBurstSrcWindowMs  = 120000
 	fr03HostBurstThreshold     = 3
 	fr03HostBurstWindowMs      = 5000
 	defaultPullBatch           = 10
@@ -106,6 +109,7 @@ var (
 	countFailedPwSrcTracker               = newBurstTracker(countFailedPwWindowMs, countFailedPwThreshold)
 	authFailedPwBurstUserTracker          = newBurstTracker(authBurstUserWindowMs, authBurstUserThreshold)
 	authFailedPwBurstSrcTracker           = newBurstTracker(authBurstSrcWindowMs, authBurstSrcThreshold)
+	deceptionProbeBurstSrcTracker         = newBurstTracker(deceptionBurstSrcWindowMs, deceptionBurstSrcThreshold)
 	infrastructureFirewallDenyTracker     *burstTracker
 	infrastructureLinkFlapTracker         *burstTracker
 	infrastructureEastWestFlowTracker     *uniqueDestTracker
@@ -644,11 +648,21 @@ func matchRule(message string, evt rawEvent) (ruleMatch, bool) {
 		if groupKey == "" {
 			groupKey = extractIPv4(message)
 		}
+		if groupKey != "" && deceptionProbeBurstSrcTracker.Observe(groupKey, evt.ObservedAtUnixMs) {
+			return ruleMatch{
+				RuleID:          deceptionBurstSrcRuleID,
+				Lane:            fr03Lane,
+				Severity:        detectorSeverityCritical,
+				GroupKey:        groupKey,
+				ConfidenceScore: 98,
+			}, true
+		}
 		return ruleMatch{
-			RuleID:   fr03DeceptionRuleID,
-			Lane:     fr03Lane,
-			Severity: detectorSeverityCritical,
-			GroupKey: groupKey,
+			RuleID:          fr03DeceptionRuleID,
+			Lane:            fr03Lane,
+			Severity:        detectorSeverityCritical,
+			GroupKey:        groupKey,
+			ConfidenceScore: 95,
 		}, true
 	}
 
@@ -1427,6 +1441,8 @@ func alertKeyForRule(ruleID, eventID string) string {
 		return "A-AUTH-FAILED-PW-BURST-USER-" + eventID
 	case authBurstSrcRuleID:
 		return "A-AUTH-FAILED-PW-BURST-SRCIP-" + eventID
+	case deceptionBurstSrcRuleID:
+		return "A-DECEPTION-HONEYPOT-PROBE-BURST-SRCIP-" + eventID
 	case statProcessRuleID:
 		return "A-STAT-PROCESS-MED-" + eventID
 	case processCountRuleID:

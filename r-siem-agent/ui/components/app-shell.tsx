@@ -13,7 +13,6 @@ const NAV = [
   { href: "/incidents", label: "Incidents", icon: ListChecks },
   { href: "/endpoints", label: "Endpoints", icon: Activity },
   { href: "/actions", label: "Actions", icon: Zap },
-  { href: "/infrastructure", label: "Infrastructure", icon: Clock3 },
   { href: "/search", label: "Search", icon: Search },
   { href: "/audit", label: "Audit", icon: ShieldCheck }
 ];
@@ -71,6 +70,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   const [loginPass, setLoginPass] = useState("");
   const [loginErr, setLoginErr] = useState("");
   const scrollStorageKey = useMemo(() => `rsiem:scroll:${pathname}`, [pathname]);
+  const probeToken = useMemo(() => (searchParams.get("ui_probe_token") || "").trim(), [searchParams]);
 
   useEffect(() => {
     const now = Date.now();
@@ -116,11 +116,9 @@ export function AppShell({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     let cancelled = false;
-    const probeToken = (searchParams.get("ui_probe_token") || "").trim();
     if (probeToken) {
       setAuthToken(probeToken);
     }
-    setAuthLoading(true);
     me()
       .then((res) => {
         if (!cancelled) {
@@ -141,7 +139,7 @@ export function AppShell({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, [searchParams]);
+  }, [probeToken]);
 
   useEffect(() => {
     const onAuthRequired = () => {
@@ -298,7 +296,7 @@ export function AppShell({ children }: { children: ReactNode }) {
         <div className="mb-4 flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
           <div>
             <h1 className="text-[24px] font-semibold tracking-tight">R-SIEM Console</h1>
-            <p className="text-sm text-ink-300">Posture dashboard, triage, investigations, approvals, endpoints, infrastructure, and audit.</p>
+            <p className="text-sm text-ink-300">Posture dashboard, triage, investigations, approvals, endpoints, search, and audit.</p>
           </div>
           <div className="flex flex-wrap items-center gap-2 rounded-lg border border-ink-700 bg-ink-900/70 px-3 py-2 text-xs text-ink-200">
             <Clock3 className="h-4 w-4" />
@@ -381,6 +379,7 @@ export function AppShell({ children }: { children: ReactNode }) {
                 <Link
                   key={item.href}
                   href={`${item.href}?${searchParams.toString()}`}
+                  prefetch={false}
                   className={`flex items-center justify-between rounded-lg px-3 py-2.5 text-sm transition ${
                     active ? "bg-ink-700 text-white" : "text-ink-200 hover:bg-ink-800"
                   }`}

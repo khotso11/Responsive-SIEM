@@ -10,6 +10,7 @@ import {
   EventSearchResponse,
   EventRow,
   EntityProfileResponse,
+  HoneypotProfileResponse,
   Incident,
   IncidentDetailResponse,
   IncidentLogicResponse,
@@ -26,6 +27,7 @@ import {
   ResponseHistoryResponse,
   ResponseActionFleetResponse,
   ResponseActionListResponse,
+  ResponseActionTargetDraft,
   SearchResponse,
   StepResult
 } from "@/lib/types";
@@ -34,6 +36,16 @@ import { emitAuthRequired } from "@/lib/events";
 const API_BASE = process.env.NEXT_PUBLIC_UI_API_BASE || "http://127.0.0.1:8090";
 const API_KEY = process.env.NEXT_PUBLIC_UI_API_KEY || "dev-ui-key";
 const TOKEN_KEY = "rsiem_ui_token";
+const AUTH_CACHE_TTL_MS = 60_000;
+
+let meCache:
+  | {
+      value: { ok: boolean; user: AuthUser };
+      expiresAt: number;
+      token: string;
+    }
+  | null = null;
+let meInflight: Promise<{ ok: boolean; user: AuthUser }> | null = null;
 
 export class UnauthorizedError extends Error {
   constructor(message = "Session expired. Please log in again.") {
@@ -54,6 +66,8 @@ export function setAuthToken(token: string): void {
   } else {
     window.localStorage.removeItem(TOKEN_KEY);
   }
+  meCache = null;
+  meInflight = null;
 }
 
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
@@ -115,7 +129,27 @@ export async function logout(): Promise<void> {
 }
 
 export async function me(): Promise<{ ok: boolean; user: AuthUser }> {
-  return apiFetch("/api/auth/me");
+  const token = authToken();
+  const now = Date.now();
+  if (meCache && meCache.token === token && meCache.expiresAt > now) {
+    return meCache.value;
+  }
+  if (meInflight) {
+    return meInflight;
+  }
+  meInflight = apiFetch<{ ok: boolean; user: AuthUser }>("/api/auth/me")
+    .then((res) => {
+      meCache = {
+        value: res,
+        expiresAt: Date.now() + AUTH_CACHE_TTL_MS,
+        token
+      };
+      return res;
+    })
+    .finally(() => {
+      meInflight = null;
+    });
+  return meInflight;
 }
 
 export async function getDashboardSummary(window = "24h"): Promise<DashboardSummary> {
@@ -165,7 +199,7 @@ export async function getIncidentActions(runId: string): Promise<ResponseActionL
 
 export async function postIncidentAction(
   runId: string,
-  body: { actor?: string; action_name: string; duration_ms?: number; reason?: string; reference?: string; target?: string; target_agent_id?: string }
+  body: { actor?: string; action_name: string; duration_ms?: number; reason?: string; reference?: string; target?: string; target_agent_id?: string; targets?: ResponseActionTargetDraft[] }
 ): Promise<{ ok: boolean; action: any }> {
   return apiFetch(`/api/incidents/${encodeURIComponent(runId)}/actions`, {
     method: "POST",
@@ -382,7 +416,7 @@ export async function getFleetActions(query: Record<string, string | number | un
 
 export async function postEndpointAction(
   nodeID: string,
-  body: { actor?: string; action_name: string; duration_ms?: number; reason?: string; reference?: string; target?: string; target_agent_id?: string }
+  body: { actor?: string; action_name: string; duration_ms?: number; reason?: string; reference?: string; target?: string; target_agent_id?: string; targets?: ResponseActionTargetDraft[] }
 ): Promise<{ ok: boolean; action: any }> {
   return apiFetch(`/api/endpoints/${encodeURIComponent(nodeID)}/actions`, {
     method: "POST",
@@ -475,6 +509,10 @@ export async function getSearchEvents(query: EventSearchQuery = {}): Promise<Eve
     }
   }
   return apiFetch(`/api/search/events${qs.toString() ? `?${qs.toString()}` : ""}`);
+}
+
+export async function getHoneypotProfile(): Promise<HoneypotProfileResponse> {
+  return apiFetch("/api/honeypot/profile");
 }
 
 export async function getEntityIP(ip: string): Promise<EntityProfileResponse> {

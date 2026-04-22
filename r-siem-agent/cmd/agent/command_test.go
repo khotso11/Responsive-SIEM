@@ -93,12 +93,15 @@ func TestNetworkBlockApplyAndClear(t *testing.T) {
 		RunID:      "run-1",
 		StepID:     "step-1",
 		ActionType: "network_block",
-		Target:     "10.0.0.1",
 		Params: map[string]any{
 			"direction":          "ingress",
 			"duration_ms":        60000,
 			"response_action_id": "uiact_123",
 			"node_id":            "node-1",
+			"targets":            []string{"10.0.0.1"},
+			"target_specs": []map[string]any{
+				{"kind": "ip", "value": "10.0.0.1", "port": 443, "protocol": "tcp"},
+			},
 		},
 	})
 	if apply.Status != "ok" || apply.ExitCode != 0 {
@@ -119,11 +122,14 @@ func TestNetworkBlockApplyAndClear(t *testing.T) {
 		RunID:      "run-1",
 		StepID:     "step-2",
 		ActionType: "network_block",
-		Target:     "10.0.0.1",
+		Target:     "ip 10.0.0.1 tcp :443",
 		Params: map[string]any{
 			"direction":          "ingress",
 			"mode":               "clear",
 			"response_action_id": "uiact_123",
+			"target_specs": []map[string]any{
+				{"kind": "ip", "value": "10.0.0.1", "port": 443, "protocol": "tcp"},
+			},
 		},
 	})
 	if clear.Status != "ok" || clear.ExitCode != 0 {
@@ -135,6 +141,128 @@ func TestNetworkBlockApplyAndClear(t *testing.T) {
 	}
 	if !strings.Contains(string(data), "\"status\": \"cleared\"") {
 		t.Fatalf("network block record missing cleared status: %s", string(data))
+	}
+}
+
+func TestNetworkBlockSupportsMultipleExplicitTargets(t *testing.T) {
+	t.Setenv("RSIEM_AGENT_RESPONSE_ACTION_ROOT", t.TempDir())
+	hostsPath := filepath.Join(t.TempDir(), "hosts")
+	if err := os.WriteFile(hostsPath, []byte("127.0.0.1 localhost\n"), 0o644); err != nil {
+		t.Fatalf("write hosts: %v", err)
+	}
+	t.Setenv("RSIEM_AGENT_HOSTS_PATH", hostsPath)
+	prevLookPath := execLookPath
+	execLookPath = func(file string) (string, error) {
+		if file != "nft" {
+			return "", os.ErrNotExist
+		}
+		return "/usr/sbin/nft", nil
+	}
+	defer func() { execLookPath = prevLookPath }()
+
+	runner := &recordingRunner{}
+	exec := &commandExecutor{
+		logger:      slog.Default(),
+		timeout:     time.Second,
+		runner:      runner,
+		outputLimit: 4096,
+	}
+
+	reply := exec.handle(context.Background(), commandRequest{
+		RunID:      "run-multi-1",
+		StepID:     "step-multi-1",
+		ActionType: "network_block",
+		Params: map[string]any{
+			"direction":          "egress",
+			"duration_ms":        60000,
+			"response_action_id": "uiact_multi_123",
+			"node_id":            "node-1",
+			"targets":            []string{"203.0.113.11", "proof-rsiem-demo.invalid", "203.0.113.12"},
+		},
+	})
+	if reply.Status != "ok" || reply.ExitCode != 0 {
+		t.Fatalf("unexpected apply reply: %#v", reply)
+	}
+	record, err := os.ReadFile(reply.Stdout)
+	if err != nil {
+		t.Fatalf("read network block record: %v", err)
+	}
+	if !strings.Contains(string(record), "203.0.113.11") || !strings.Contains(string(record), "proof-rsiem-demo.invalid") || !strings.Contains(string(record), "203.0.113.12") {
+		t.Fatalf("expected all explicit targets in record, got %s", string(record))
+	}
+	if len(runner.specs) == 0 {
+		t.Fatalf("expected nft commands to be issued for explicit targets")
+	}
+}
+
+func TestNetworkBlockPortSpecificTargetUsesPortAwareRule(t *testing.T) {
+	t.Setenv("RSIEM_AGENT_RESPONSE_ACTION_ROOT", t.TempDir())
+	prevLookPath := execLookPath
+	execLookPath = func(file string) (string, error) {
+		if file != "nft" {
+			return "", os.ErrNotExist
+		}
+		return "/usr/sbin/nft", nil
+	}
+	defer func() { execLookPath = prevLookPath }()
+
+	runner := &recordingRunner{}
+	exec := &commandExecutor{
+		logger:      slog.Default(),
+		timeout:     time.Second,
+		runner:      runner,
+		outputLimit: 4096,
+	}
+
+	reply := exec.handle(context.Background(), commandRequest{
+		RunID:      "run-port-1",
+		StepID:     "step-port-1",
+		ActionType: "network_block",
+		Params: map[string]any{
+			"direction":          "egress",
+			"duration_ms":        60000,
+			"response_action_id": "uiact_port_123",
+			"node_id":            "node-1",
+			"targets":            []string{"102.132.104.60"},
+			"target_specs": []map[string]any{
+				{"kind": "ip", "value": "102.132.104.60", "port": 443, "protocol": "tcp"},
+			},
+		},
+	})
+	if reply.Status != "ok" || reply.ExitCode != 0 {
+		t.Fatalf("unexpected apply reply: %#v", reply)
+	}
+	if len(runner.specs) == 0 {
+		t.Fatalf("expected nft commands to be issued")
+	}
+	foundPortRule := false
+	for _, spec := range runner.specs {
+		joined := strings.Join(spec.Args, " ")
+		if strings.Contains(joined, "network_block_egress_tcp_v4") && strings.Contains(joined, "102.132.104.60 . 443") {
+			foundPortRule = true
+			break
+		}
+	}
+	if !foundPortRule {
+		t.Fatalf("expected a port-specific nft rule, got specs=%v", runner.specs)
+	}
+
+	clear := exec.handle(context.Background(), commandRequest{
+		RunID:      "run-port-1",
+		StepID:     "step-port-2",
+		ActionType: "network_block",
+		Target:     "102.132.104.60:443",
+		Params: map[string]any{
+			"direction":          "egress",
+			"mode":               "clear",
+			"response_action_id": "uiact_port_123",
+			"target_specs": []map[string]any{
+				{"kind": "ip", "value": "102.132.104.60", "port": 443, "protocol": "tcp"},
+			},
+		},
+	})
+	if clear.Status != "ok" || clear.ExitCode != 0 {
+		t.Fatalf("unexpected clear reply: %#v", clear)
 	}
 }
 
@@ -214,6 +342,69 @@ func TestNetworkBlockHostnameApplyAndClear(t *testing.T) {
 	}
 	if strings.Contains(string(hostsData), "proof-rsiem-demo.invalid") {
 		t.Fatalf("hosts file still contains blocked hostname after clear: %s", string(hostsData))
+	}
+}
+
+func TestNetworkBlockHostnameUsesResponseActionRootByDefault(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("RSIEM_AGENT_RESPONSE_ACTION_ROOT", root)
+	t.Setenv("RSIEM_AGENT_HOSTS_PATH", "")
+	prevLookPath := execLookPath
+	execLookPath = func(file string) (string, error) {
+		if file != "nft" {
+			return "", os.ErrNotExist
+		}
+		return "/usr/sbin/nft", nil
+	}
+	defer func() { execLookPath = prevLookPath }()
+
+	runner := &recordingRunner{}
+	exec := &commandExecutor{
+		logger:      slog.Default(),
+		timeout:     time.Second,
+		runner:      runner,
+		outputLimit: 4096,
+	}
+
+	apply := exec.handle(context.Background(), commandRequest{
+		RunID:      "run-host-default-1",
+		StepID:     "step-host-default-1",
+		ActionType: "network_block",
+		Params: map[string]any{
+			"direction":          "egress",
+			"duration_ms":        60000,
+			"response_action_id": "uiact_dns_default",
+			"node_id":            "node-1",
+			"targets":            []string{"proof-rsiem-demo.invalid"},
+		},
+	})
+	if apply.Status != "ok" || apply.ExitCode != 0 {
+		t.Fatalf("unexpected hostname apply reply: %#v", apply)
+	}
+	hostsPath := filepath.Join(root, "hosts")
+	if _, err := os.Stat(hostsPath); err != nil {
+		t.Fatalf("expected default hosts path under response action root: %v", err)
+	}
+	recordData, err := os.ReadFile(apply.Stdout)
+	if err != nil {
+		t.Fatalf("read network block record: %v", err)
+	}
+	if !strings.Contains(string(recordData), `"hosts_path": `) {
+		t.Fatalf("record missing hosts_path: %s", string(recordData))
+	}
+	clear := exec.handle(context.Background(), commandRequest{
+		RunID:      "run-host-default-1",
+		StepID:     "step-host-default-2",
+		ActionType: "network_block",
+		Target:     "proof-rsiem-demo.invalid",
+		Params: map[string]any{
+			"direction":          "egress",
+			"mode":               "clear",
+			"response_action_id": "uiact_dns_default",
+		},
+	})
+	if clear.Status != "ok" || clear.ExitCode != 0 {
+		t.Fatalf("unexpected hostname clear reply: %#v", clear)
 	}
 }
 
@@ -616,6 +807,74 @@ func TestHaltLateralMovementFirewallModeProgramsNFT(t *testing.T) {
 		if !seen {
 			t.Fatalf("expected nft add element for target %s, got %#v", target, runner.specs)
 		}
+	}
+}
+
+func TestRestoreLateralMovementFirewallModeClearsNFT(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("RSIEM_AGENT_LATERAL_CONTROL_MODE", "firewall")
+	t.Setenv("RSIEM_AGENT_RESPONSE_ACTION_ROOT", filepath.Join(base, "response-actions"))
+
+	prevLookPath := execLookPath
+	execLookPath = func(file string) (string, error) {
+		if file == "nft" {
+			return "/usr/sbin/nft", nil
+		}
+		return "", os.ErrNotExist
+	}
+	defer func() { execLookPath = prevLookPath }()
+
+	statePath := filepath.Join(base, "response-actions", "lateral", "run-lateral-fw", "state.json")
+	if err := writeLateralContainmentRecord(statePath, lateralContainmentRecord{
+		Version:           1,
+		RunID:             "run-lateral-fw",
+		Mode:              "firewall",
+		Backend:           "nft",
+		Targets:           []string{"172.30.50.13", "172.30.50.14"},
+		ContainedAtUnixMs: time.Now().UnixMilli(),
+		ExpiresAtUnixMs:   time.Now().Add(15 * time.Minute).UnixMilli(),
+	}); err != nil {
+		t.Fatalf("write lateral state: %v", err)
+	}
+
+	runner := &recordingRunner{
+		results: func(spec execSpec) execResult {
+			return execResult{ExitCode: 0, Stdout: ""}
+		},
+	}
+	exec := &commandExecutor{
+		logger:      slog.Default(),
+		timeout:     time.Second,
+		runner:      runner,
+		allowlist:   map[string]execSpec{"restore_lateral_movement": {}},
+		outputLimit: 4096,
+	}
+	reply := exec.handle(context.Background(), commandRequest{
+		RunID:      "restore-run",
+		StepID:     "step-restore",
+		ActionType: "agent_command",
+		Params: map[string]any{
+			"command":            "restore_lateral_movement",
+			"containment_run_id": "run-lateral-fw",
+		},
+	})
+	if reply.Status != "ok" || reply.ExitCode != 0 {
+		t.Fatalf("unexpected restore reply: %#v", reply)
+	}
+
+	var sawDelete13 bool
+	var sawDelete14 bool
+	for _, spec := range runner.specs {
+		joined := strings.Join(spec.Args, " ")
+		if strings.Contains(joined, "delete element inet rsiem_contain lateral_block_v4 { 172.30.50.13 }") {
+			sawDelete13 = true
+		}
+		if strings.Contains(joined, "delete element inet rsiem_contain lateral_block_v4 { 172.30.50.14 }") {
+			sawDelete14 = true
+		}
+	}
+	if !sawDelete13 || !sawDelete14 {
+		t.Fatalf("expected nft delete element calls, got %#v", runner.specs)
 	}
 }
 

@@ -1,25 +1,27 @@
 provider:
   kind: eve_ng
   name: rsiem-eve-ng-lab
-  ui_url: https://eve-ng.local/
-  api_base_url: https://eve-ng.local
+  ui_url: http://192.168.59.128/
+  api_base_url: http://192.168.59.128
   api_lab_path: /R-SIEM/rsiem-infrastructure.unl
   username_env: RSIEM_EVE_NG_USERNAME
   password_env: RSIEM_EVE_NG_PASSWORD
-  allow_insecure_tls: true
+  allow_insecure_tls: false
   project_path: /opt/unetlab/labs/R-SIEM/
   lab_file: /opt/unetlab/labs/R-SIEM/rsiem-infrastructure.unl
   topology_import_path: eve_ng_rsiem_infrastructure.unl
   notes: >-
     EVE-NG is the emulated lab source of truth. R-SIEM imports the lab topology file
-    and overlays live incidents, telemetry, and response actions on top of it.
+    and overlays live incidents, telemetry, and response actions on top of it. In the
+    current Ubuntu host plus VMware NAT deployment, EVE runs in a VM at 192.168.59.128
+    and the R-SIEM stack remains on the host outside the emulated topology.
 
 lab:
   id: emulated-infrastructure-v1
   description: >-
     Emulated infrastructure plane for R-SIEM using virtual routers, firewall
-    gateways, switch segments, Windows and Linux endpoints, and a management node
-    running the master stack.
+    gateways, switch segments, Windows and Linux endpoints, and a host-side control
+    plane anchor that represents the collector endpoints reached from the EVE lab.
 
 management_plane:
   rsiem_master:
@@ -28,6 +30,9 @@ management_plane:
     hostname: rsiem-master-01
     role: management
     ip: 10.10.0.10/24
+    note: >-
+      Logical management anchor for the host-side R-SIEM stack. Export RSIEM_INFRA_HOST_COLLECTOR_IP
+      to rewrite the collector destinations to the VMware host address reachable from the EVE VM.
     services:
       - nats-jetstream
       - master-roe

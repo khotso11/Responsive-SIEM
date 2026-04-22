@@ -39,6 +39,7 @@ type responseActionRecord struct {
 	CommandID       string         `json:"command_id,omitempty"`
 	ClearCommandID  string         `json:"clear_command_id,omitempty"`
 	Target          string         `json:"target,omitempty"`
+	Targets         []responseActionTargetSpec `json:"targets,omitempty"`
 	Direction       string         `json:"direction,omitempty"`
 	Reason          string         `json:"reason,omitempty"`
 	Reference       string         `json:"reference,omitempty"`
@@ -70,6 +71,7 @@ type responseActionView struct {
 	ActionType      string         `json:"action_type"`
 	CommandID       string         `json:"command_id,omitempty"`
 	Target          string         `json:"target,omitempty"`
+	Targets         []responseActionTargetSpec `json:"targets,omitempty"`
 	Direction       string         `json:"direction,omitempty"`
 	Reason          string         `json:"reason,omitempty"`
 	Reference       string         `json:"reference,omitempty"`
@@ -97,6 +99,14 @@ type responseActionTemplate struct {
 	DefaultDuration int64
 	ClearSupported  bool
 	IncidentOnly    bool
+	RequiresTargets bool
+}
+
+type responseActionTargetSpec struct {
+	Kind     string `json:"kind"`
+	Value    string `json:"value"`
+	Port     int    `json:"port,omitempty"`
+	Protocol string `json:"protocol,omitempty"`
 }
 
 type responseActionCatalogEntry struct {
@@ -108,6 +118,7 @@ type responseActionCatalogEntry struct {
 	ExecutionMode         string `json:"execution_mode"`
 	DefaultDurationMs     int64  `json:"default_duration_ms"`
 	ClearSupported        bool   `json:"clear_supported"`
+	RequiresTargets       bool   `json:"requires_targets,omitempty"`
 	RequiresIncidentScope bool   `json:"requires_incident_scope,omitempty"`
 	Available             bool   `json:"available"`
 	UnavailableReason     string `json:"unavailable_reason,omitempty"`
@@ -137,38 +148,43 @@ var responseActionTemplates = []responseActionTemplate{
 	{
 		ID:              "block_all_outgoing",
 		Label:           "Block all outgoing traffic",
-		Description:     "Host-scoped outbound network containment using nftables-backed enforcement with bounded expiry.",
+		Description:     "Block the analyst-entered outbound target list on the selected endpoint using nftables-backed enforcement with bounded expiry.",
 		ActionType:      "network_block",
 		ExecutionMode:   "enforced",
 		DefaultDuration: defaultManualActionDurationMs,
 		ClearSupported:  true,
+		RequiresTargets: true,
 	},
 	{
 		ID:              "block_all_incoming",
 		Label:           "Block all incoming traffic",
-		Description:     "Host-scoped inbound network containment using nftables-backed enforcement with bounded expiry.",
+		Description:     "Block the analyst-entered inbound target list on the selected endpoint using nftables-backed enforcement with bounded expiry.",
 		ActionType:      "network_block",
 		ExecutionMode:   "enforced",
 		DefaultDuration: defaultManualActionDurationMs,
 		ClearSupported:  true,
+		RequiresTargets: true,
 	},
 	{
 		ID:              "block_matching_connections",
 		Label:           "Block matching destination",
-		Description:     "Contain a matching destination IP/CIDR or DNS hostname from the incident or an analyst-supplied target. Supports early clear.",
+		Description:     "Contain the analyst-entered destination IP/CIDR or DNS target list on the selected endpoint. Supports early clear.",
 		ActionType:      "network_block",
 		ExecutionMode:   "enforced",
 		DefaultDuration: defaultManualActionDurationMs,
 		ClearSupported:  true,
+		RequiresTargets: true,
 	},
 	{
 		ID:              "quarantine_device",
 		Label:           "Quarantine device",
-		Description:     "Halt lateral movement from the device to incident-scoped internal targets. Expires automatically.",
+		Description:     "Move the endpoint into a restricted-network containment state that halts lateral movement to incident-scoped internal targets. Supports early clear and still expires automatically.",
 		ActionType:      "agent_command",
 		CommandID:       "halt_lateral_movement",
+		ClearCommandID:  "restore_lateral_movement",
 		ExecutionMode:   "enforced_or_marker",
 		DefaultDuration: defaultManualActionDurationMs,
+		ClearSupported:  true,
 	},
 	{
 		ID:              "enforce_pattern_of_life",
@@ -222,12 +238,13 @@ func responseActionCatalog(scopeType string, run incident, nodeID string) []resp
 			ActionType:            item.ActionType,
 			CommandID:             item.CommandID,
 			ExecutionMode:         item.ExecutionMode,
-			DefaultDurationMs:     item.DefaultDuration,
-			ClearSupported:        item.ClearSupported,
-			RequiresIncidentScope: item.IncidentOnly,
-			Available:             available,
-			UnavailableReason:     unavailableReason,
-		})
+		DefaultDurationMs:     item.DefaultDuration,
+		ClearSupported:        item.ClearSupported,
+		RequiresIncidentScope: item.IncidentOnly,
+		RequiresTargets:       item.RequiresTargets,
+		Available:             available,
+		UnavailableReason:     unavailableReason,
+	})
 	}
 	return out
 }
@@ -316,6 +333,7 @@ func (a *app) loadActionRecords() []responseActionRecord {
 			CommandID:       strVal(obj["command_id"]),
 			ClearCommandID:  strVal(obj["clear_command_id"]),
 			Target:          strVal(obj["target"]),
+			Targets:         responseActionTargetsVal(obj["targets"], mapVal(obj["details"])),
 			Direction:       strVal(obj["direction"]),
 			Reason:          strVal(obj["reason"]),
 			Reference:       strVal(obj["reference"]),
@@ -367,6 +385,16 @@ func deriveActionBucket(status string, expiresAt, clearedAt int64) string {
 }
 
 func actionViewFromRecord(rec responseActionRecord) responseActionView {
+	if !rec.ClearSupported || strings.TrimSpace(rec.ClearCommandID) == "" {
+		if template, ok := responseActionTemplateByID(rec.ActionName); ok {
+			if !rec.ClearSupported {
+				rec.ClearSupported = template.ClearSupported
+			}
+			if strings.TrimSpace(rec.ClearCommandID) == "" {
+				rec.ClearCommandID = template.ClearCommandID
+			}
+		}
+	}
 	status := strings.TrimSpace(rec.Status)
 	if status == "" {
 		status = "active"
@@ -390,6 +418,7 @@ func actionViewFromRecord(rec responseActionRecord) responseActionView {
 		ActionType:      rec.ActionType,
 		CommandID:       rec.CommandID,
 		Target:          rec.Target,
+		Targets:         append([]responseActionTargetSpec(nil), rec.Targets...),
 		Direction:       rec.Direction,
 		Reason:          rec.Reason,
 		Reference:       rec.Reference,
@@ -568,6 +597,7 @@ func filterFleetActionViews(items []responseActionView, q url.Values) []response
 				item.Label,
 				item.Status,
 				item.Target,
+				responseActionTargetSummary(item.Targets),
 				item.Direction,
 				item.Reason,
 				item.Reference,
@@ -742,6 +772,7 @@ func (a *app) launchResponseAction(r *http.Request, scopeType string, runID stri
 		Reference     string `json:"reference"`
 		Target        string `json:"target"`
 		TargetAgentID string `json:"target_agent_id"`
+		Targets       []responseActionTargetSpec `json:"targets"`
 	}
 	if err := decodeJSONBody(r.Body, &body); err != nil {
 		return responseActionView{}, &responseActionHTTPError{status: http.StatusBadRequest, message: err.Error()}
@@ -768,7 +799,7 @@ func (a *app) launchResponseAction(r *http.Request, scopeType string, runID stri
 		return responseActionView{}, &responseActionHTTPError{status: http.StatusConflict, message: "missing target_agent_id"}
 	}
 
-	req, detailErr := buildResponseActionRequest(template, actionID, actor, runID, nodeID, targetAgentID, run, strings.TrimSpace(body.Target), durationMs, strings.TrimSpace(body.Reason), strings.TrimSpace(body.Reference))
+	req, detailErr := buildResponseActionRequest(template, actionID, actor, runID, nodeID, targetAgentID, run, strings.TrimSpace(body.Target), body.Targets, durationMs, strings.TrimSpace(body.Reason), strings.TrimSpace(body.Reference))
 	if detailErr != nil {
 		return responseActionView{}, &responseActionHTTPError{status: http.StatusBadRequest, message: detailErr.Error()}
 	}
@@ -792,6 +823,7 @@ func (a *app) launchResponseAction(r *http.Request, scopeType string, runID stri
 		CommandID:       template.CommandID,
 		ClearCommandID:  template.ClearCommandID,
 		Target:          req.displayTarget,
+		Targets:         append([]responseActionTargetSpec(nil), req.targets...),
 		Direction:       req.direction,
 		Reason:          strings.TrimSpace(body.Reason),
 		Reference:       strings.TrimSpace(body.Reference),
@@ -828,9 +860,10 @@ type builtResponseActionRequest struct {
 	direction     string
 	executionMode string
 	details       map[string]any
+	targets       []responseActionTargetSpec
 }
 
-func buildResponseActionRequest(template responseActionTemplate, actionID, actor, runID, nodeID, targetAgentID string, run incident, overrideTarget string, durationMs int64, reason, reference string) (builtResponseActionRequest, error) {
+func buildResponseActionRequest(template responseActionTemplate, actionID, actor, runID, nodeID, targetAgentID string, run incident, overrideTarget string, targetInputs []responseActionTargetSpec, durationMs int64, reason, reference string) (builtResponseActionRequest, error) {
 	nowMs := time.Now().UnixMilli()
 	req := builtResponseActionRequest{
 		command: agentCommandRequest{
@@ -859,49 +892,100 @@ func buildResponseActionRequest(template responseActionTemplate, actionID, actor
 	}
 	switch template.ID {
 	case "block_all_outgoing":
-		req.command.Target = "0.0.0.0/0"
-		req.command.Params["direction"] = "egress"
-		req.displayTarget = req.command.Target
-		req.direction = "egress"
-	case "block_all_incoming":
-		req.command.Target = "0.0.0.0/0"
-		req.command.Params["direction"] = "ingress"
-		req.displayTarget = req.command.Target
-		req.direction = "ingress"
-	case "block_matching_connections":
-		target := chooseFirstResponseValue(strings.TrimSpace(overrideTarget), strings.TrimSpace(run.DNSName), strings.TrimSpace(run.DstIP), strings.TrimSpace(run.Target))
-		if target == "" {
-			return builtResponseActionRequest{}, fmt.Errorf("block_matching_connections requires dst_ip, dns_name, or target")
+		targets, err := normalizeResponseActionTargets(targetInputs, overrideTarget)
+		if err != nil {
+			return builtResponseActionRequest{}, err
 		}
-		target = strings.TrimSpace(target)
+		if len(targets) == 0 {
+			return builtResponseActionRequest{}, fmt.Errorf("block_all_outgoing requires explicit targets")
+		}
+		req.command.Target = responseActionTargetSummary(targets)
+		req.command.Params["targets"] = responseActionTargetValues(targets)
+		req.command.Params["target_specs"] = targets
+		if resolved := responseActionResolvedTargetValues(targets, run); len(resolved) > 0 {
+			req.command.Params["resolved_targets"] = resolved
+		}
+		req.command.Params["direction"] = "egress"
+		req.displayTarget = responseActionTargetSummary(targets)
+		req.direction = "egress"
+		req.targets = targets
+		req.details["targets"] = targets
+	case "block_all_incoming":
+		targets, err := normalizeResponseActionTargets(targetInputs, overrideTarget)
+		if err != nil {
+			return builtResponseActionRequest{}, err
+		}
+		if len(targets) == 0 {
+			return builtResponseActionRequest{}, fmt.Errorf("block_all_incoming requires explicit targets")
+		}
+		req.command.Target = responseActionTargetSummary(targets)
+		req.command.Params["targets"] = responseActionTargetValues(targets)
+		req.command.Params["target_specs"] = targets
+		if resolved := responseActionResolvedTargetValues(targets, run); len(resolved) > 0 {
+			req.command.Params["resolved_targets"] = resolved
+		}
+		req.command.Params["direction"] = "ingress"
+		req.displayTarget = responseActionTargetSummary(targets)
+		req.direction = "ingress"
+		req.targets = targets
+		req.details["targets"] = targets
+	case "block_matching_connections":
+		targets, err := normalizeResponseActionTargets(targetInputs, overrideTarget)
+		if err != nil {
+			return builtResponseActionRequest{}, err
+		}
+		if len(targets) == 0 {
+			return builtResponseActionRequest{}, fmt.Errorf("block_matching_connections requires at least one explicit target")
+		}
 		req.command.ActionType = "network_block"
 		req.command.Params["direction"] = "egress"
-		if ip := strings.TrimSpace(strings.TrimSuffix(target, "/32")); net.ParseIP(ip) != nil {
-			req.command.Target = ip
-			req.displayTarget = ip
-			req.details["dst_ip"] = ip
-		} else if validHostname(target) {
-			req.command.Target = strings.ToLower(target)
-			req.command.Params["dns_name"] = strings.ToLower(target)
-			req.displayTarget = strings.ToLower(target)
-			req.details["dns_name"] = strings.ToLower(target)
-			if ip := strings.TrimSpace(run.DstIP); ip != "" {
-				req.command.Params["resolved_targets"] = ip
-				req.details["resolved_targets"] = []string{ip}
-			}
-		} else if _, _, err := net.ParseCIDR(target); err == nil {
-			req.command.Target = target
-			req.displayTarget = target
-			req.details["cidr"] = target
-		} else {
-			return builtResponseActionRequest{}, fmt.Errorf("block_matching_connections target must be an IP, CIDR, or DNS hostname")
+		req.command.Target = responseActionTargetSummary(targets)
+		req.command.Params["targets"] = responseActionTargetValues(targets)
+		req.command.Params["target_specs"] = targets
+		if resolved := responseActionResolvedTargetValues(targets, run); len(resolved) > 0 {
+			req.command.Params["resolved_targets"] = resolved
 		}
+		req.displayTarget = responseActionTargetSummary(targets)
 		req.direction = "egress"
+		req.targets = targets
+		req.details["targets"] = targets
 	case "quarantine_device":
 		req.command.ActionType = "agent_command"
 		req.command.Target = chooseFirstResponseValue(strings.TrimSpace(run.DstIP), strings.TrimSpace(overrideTarget), strings.TrimSpace(run.Target), strings.TrimSpace(run.NodeID))
 		req.command.Params["command"] = template.CommandID
 		req.command.Params["protocol_family"] = chooseNonEmpty(strings.TrimSpace(run.ProtocolFamily), "host")
+		req.command.Params["containment_profile"] = "restricted_network"
+		quarantineInputs := append([]responseActionTargetSpec(nil), targetInputs...)
+		if len(quarantineInputs) == 0 {
+			if strings.TrimSpace(run.DstIP) != "" {
+				quarantineInputs = append(quarantineInputs, responseActionTargetSpec{Kind: "ip", Value: strings.TrimSpace(run.DstIP)})
+			}
+			if strings.TrimSpace(run.DNSName) != "" {
+				quarantineInputs = append(quarantineInputs, responseActionTargetSpec{Kind: "dns", Value: strings.TrimSpace(run.DNSName)})
+			}
+			for _, dst := range run.TopDestinations {
+				dst = strings.TrimSpace(dst)
+				if dst == "" {
+					continue
+				}
+				if validIPOrCIDR(dst) {
+					quarantineInputs = append(quarantineInputs, responseActionTargetSpec{Kind: "ip", Value: dst})
+				} else if validHostname(dst) {
+					quarantineInputs = append(quarantineInputs, responseActionTargetSpec{Kind: "dns", Value: dst})
+				}
+			}
+		}
+		if len(quarantineInputs) > 0 {
+			quarantineTargets, err := normalizeResponseActionTargets(quarantineInputs, overrideTarget)
+			if err != nil {
+				return builtResponseActionRequest{}, err
+			}
+			req.command.Params["targets"] = responseActionTargetValues(quarantineTargets)
+			req.command.Params["target_specs"] = quarantineTargets
+			req.details["targets"] = quarantineTargets
+			req.targets = quarantineTargets
+			req.displayTarget = responseActionTargetSummary(quarantineTargets)
+		}
 		if len(run.TopDestinations) > 0 {
 			req.command.Params["top_destinations"] = strings.Join(run.TopDestinations, ",")
 			req.details["top_destinations"] = append([]string(nil), run.TopDestinations...)
@@ -909,7 +993,9 @@ func buildResponseActionRequest(template responseActionTemplate, actionID, actor
 		if run.DstIP != "" {
 			req.command.Params["dst_ip"] = strings.TrimSpace(run.DstIP)
 		}
-		req.displayTarget = chooseFirstResponseValue(strings.TrimSpace(run.NodeID), strings.TrimSpace(nodeID))
+		if req.displayTarget == "" {
+			req.displayTarget = chooseFirstResponseValue(strings.TrimSpace(run.NodeID), strings.TrimSpace(nodeID))
+		}
 	case "enforce_pattern_of_life":
 		req.command.ActionType = "agent_command"
 		req.command.Target = chooseFirstResponseValue(strings.TrimSpace(run.NodeID), strings.TrimSpace(nodeID))
@@ -933,6 +1019,207 @@ func buildResponseActionRequest(template responseActionTemplate, actionID, actor
 	req.details["reference"] = reference
 	req.details["target"] = req.displayTarget
 	return req, nil
+}
+
+func responseActionTargetSummary(targets []responseActionTargetSpec) string {
+	if len(targets) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(targets))
+	for _, target := range targets {
+		parts = append(parts, responseActionTargetLabel(target))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func responseActionTargetLabel(target responseActionTargetSpec) string {
+	label := strings.TrimSpace(target.Value)
+	if label == "" {
+		label = strings.TrimSpace(target.Kind)
+	}
+	parts := []string{label}
+	if p := strings.TrimSpace(target.Protocol); p != "" {
+		parts = append(parts, strings.ToLower(p))
+	}
+	if target.Port > 0 {
+		parts = append(parts, fmt.Sprintf(":%d", target.Port))
+	}
+	return strings.Join(parts, " ")
+}
+
+func responseActionTargetValues(targets []responseActionTargetSpec) []string {
+	out := make([]string, 0, len(targets))
+	for _, target := range targets {
+		out = append(out, target.Value)
+	}
+	return uniqueStrings(out)
+}
+
+func responseActionResolvedTargetValues(targets []responseActionTargetSpec, run incident) []string {
+	out := make([]string, 0, len(targets)+1)
+	for _, target := range targets {
+		value := strings.TrimSpace(target.Value)
+		if value == "" {
+			continue
+		}
+		if validIPOrCIDR(value) {
+			out = append(out, value)
+		}
+	}
+	if len(out) == 0 && strings.TrimSpace(run.DstIP) != "" && validIPOrCIDR(strings.TrimSpace(run.DstIP)) {
+		out = append(out, strings.TrimSpace(run.DstIP))
+	}
+	return uniqueStrings(out)
+}
+
+func normalizeResponseActionTargets(inputs []responseActionTargetSpec, overrideTarget string) ([]responseActionTargetSpec, error) {
+	candidates := make([]responseActionTargetSpec, 0, len(inputs)+1)
+	candidates = append(candidates, inputs...)
+	if strings.TrimSpace(overrideTarget) != "" {
+		candidates = append(candidates, responseActionTargetSpec{Value: overrideTarget})
+	}
+	out := make([]responseActionTargetSpec, 0, len(candidates))
+	seen := make(map[string]struct{}, len(candidates))
+	for _, item := range candidates {
+		norm, err := normalizeResponseActionTarget(item)
+		if err != nil {
+			return nil, err
+		}
+		key := strings.Join([]string{norm.Kind, norm.Value, strconv.Itoa(norm.Port), strings.ToLower(norm.Protocol)}, "|")
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, norm)
+	}
+	return out, nil
+}
+
+func normalizeResponseActionTarget(input responseActionTargetSpec) (responseActionTargetSpec, error) {
+	kind := strings.ToLower(strings.TrimSpace(input.Kind))
+	value := strings.TrimSpace(input.Value)
+	port := input.Port
+	protocol := strings.ToLower(strings.TrimSpace(input.Protocol))
+	if kind == "" {
+		switch {
+		case validHostname(value):
+			kind = "dns"
+		case validIPOrCIDR(value):
+			kind = "ip"
+		default:
+			kind = "dns"
+		}
+	}
+	switch kind {
+	case "ip", "cidr":
+		if !validIPOrCIDR(value) {
+			return responseActionTargetSpec{}, fmt.Errorf("invalid block target %q", value)
+		}
+		if strings.Contains(value, "/") {
+			if _, network, err := net.ParseCIDR(value); err == nil && network != nil {
+				value = network.String()
+			}
+		} else if ip := net.ParseIP(value); ip != nil {
+			value = ip.String()
+		}
+	case "dns", "hostname":
+		if !validHostname(value) {
+			return responseActionTargetSpec{}, fmt.Errorf("invalid block target %q", value)
+		}
+		value = strings.ToLower(value)
+	default:
+		return responseActionTargetSpec{}, fmt.Errorf("invalid block target kind %q", input.Kind)
+	}
+	if port < 0 || port > 65535 {
+		return responseActionTargetSpec{}, fmt.Errorf("invalid block target port %d", port)
+	}
+	switch protocol {
+	case "", "any", "tcp", "udp":
+	default:
+		return responseActionTargetSpec{}, fmt.Errorf("invalid block target protocol %q", input.Protocol)
+	}
+	if protocol == "any" {
+		protocol = ""
+	}
+	return responseActionTargetSpec{
+		Kind:     kind,
+		Value:    value,
+		Port:     port,
+		Protocol: protocol,
+	}, nil
+}
+
+func responseActionTargetsVal(v any, details map[string]any) []responseActionTargetSpec {
+	out := responseActionTargetsFromAny(v)
+	if len(out) > 0 {
+		return out
+	}
+	if details == nil {
+		return nil
+	}
+	return responseActionTargetsFromAny(details["targets"])
+}
+
+func responseActionTargetsFromAny(v any) []responseActionTargetSpec {
+	rawList, ok := v.([]any)
+	if !ok {
+		if typed, ok := v.([]map[string]any); ok {
+			out := make([]responseActionTargetSpec, 0, len(typed))
+			for _, item := range typed {
+				out = append(out, responseActionTargetSpec{
+					Kind:     strVal(item["kind"]),
+					Value:    strVal(item["value"]),
+					Port:     int(intVal(item["port"], 0)),
+					Protocol: strVal(item["protocol"]),
+				})
+			}
+			return out
+		}
+		return nil
+	}
+	out := make([]responseActionTargetSpec, 0, len(rawList))
+	for _, item := range rawList {
+		obj, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		out = append(out, responseActionTargetSpec{
+			Kind:     strVal(obj["kind"]),
+			Value:    strVal(obj["value"]),
+			Port:     int(intVal(obj["port"], 0)),
+			Protocol: strVal(obj["protocol"]),
+		})
+	}
+	return out
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
+func validIPOrCIDR(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	if ip := net.ParseIP(value); ip != nil {
+		return true
+	}
+	_, _, err := net.ParseCIDR(value)
+	return err == nil
 }
 
 func validHostname(host string) bool {
@@ -994,6 +1281,16 @@ func (a *app) handleClearResponseAction(w http.ResponseWriter, r *http.Request, 
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "action not found"})
 		return
 	}
+	if !latest.ClearSupported || strings.TrimSpace(latest.ClearCommandID) == "" {
+		if template, ok := responseActionTemplateByID(latest.ActionName); ok {
+			if !latest.ClearSupported {
+				latest.ClearSupported = template.ClearSupported
+			}
+			if strings.TrimSpace(latest.ClearCommandID) == "" {
+				latest.ClearCommandID = template.ClearCommandID
+			}
+		}
+	}
 	if !latest.ClearSupported || (strings.TrimSpace(latest.ClearCommandID) == "" && latest.ActionType != "network_block") {
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "selected action does not support manual clear"})
 		return
@@ -1033,7 +1330,10 @@ func (a *app) handleClearResponseAction(w http.ResponseWriter, r *http.Request, 
 			"reference":          strings.TrimSpace(body.Reference),
 			"response_action_id": latest.ActionID,
 			"containment_run_id": chooseFirstResponseValue(strings.TrimSpace(latest.RunID), latest.ActionID),
+			"targets":            responseActionTargetValues(latest.Targets),
+			"target_specs":       latest.Targets,
 		}
+		req.Target = ""
 	}
 	if latest.CommandID == "contain_destination_ip" {
 		req.Params["dst_ip"] = target

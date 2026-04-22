@@ -4,12 +4,15 @@ import (
 	"bufio"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type queuedMessage struct {
@@ -82,29 +85,82 @@ func (s *messageSpool) loadNextSeq() error {
 		return fmt.Errorf("seek spool: %w", err)
 	}
 	defer s.file.Seek(0, 2)
-	scanner := bufio.NewScanner(s.file)
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 2*1024*1024)
+
+	reader := bufio.NewReader(s.file)
 	var maxSeq uint64
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+	var (
+		offset         int64
+		lastGoodOffset int64
+		lineNumber     int
+	)
+	for {
+		lineBytes, err := reader.ReadBytes('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return fmt.Errorf("scan spool: %w", err)
+		}
+		if len(lineBytes) == 0 && errors.Is(err, io.EOF) {
+			break
+		}
+
+		lineNumber++
+		nextOffset := offset + int64(len(lineBytes))
+		line := strings.TrimSpace(string(lineBytes))
 		if line == "" {
+			offset = nextOffset
+			lastGoodOffset = nextOffset
+			if errors.Is(err, io.EOF) {
+				break
+			}
 			continue
 		}
 		var msg queuedMessage
 		if err := json.Unmarshal([]byte(line), &msg); err != nil {
-			return fmt.Errorf("decode spool record: %w", err)
+			if repairErr := s.repairCorruptTail(lastGoodOffset, lineNumber, err); repairErr != nil {
+				return repairErr
+			}
+			break
 		}
 		if msg.Seq > maxSeq {
 			maxSeq = msg.Seq
 		}
+		offset = nextOffset
+		lastGoodOffset = nextOffset
+		if errors.Is(err, io.EOF) {
+			break
+		}
 	}
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("scan spool: %w", err)
-	}
+
 	s.nextSeq = maxSeq + 1
+	if s.committed >= maxSeq {
+		s.nextSeq = s.committed + 1
+	}
 	if s.nextSeq == 0 {
 		s.nextSeq = 1
+	}
+	return nil
+}
+
+func (s *messageSpool) repairCorruptTail(lastGoodOffset int64, lineNumber int, decodeErr error) error {
+	if _, err := s.file.Seek(0, 0); err != nil {
+		return fmt.Errorf("seek spool for repair: %w", err)
+	}
+	backupPath := fmt.Sprintf("%s.corrupt.%d", s.path, time.Now().UnixNano())
+	backup, err := os.OpenFile(backupPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("backup corrupt spool: %w", err)
+	}
+	if _, err := io.Copy(backup, s.file); err != nil {
+		_ = backup.Close()
+		return fmt.Errorf("copy corrupt spool backup: %w", err)
+	}
+	if err := backup.Close(); err != nil {
+		return fmt.Errorf("close corrupt spool backup: %w", err)
+	}
+	if err := s.file.Truncate(lastGoodOffset); err != nil {
+		return fmt.Errorf("truncate corrupt spool after backup: %w", err)
+	}
+	if _, err := s.file.Seek(lastGoodOffset, 0); err != nil {
+		return fmt.Errorf("seek repaired spool: %w", err)
 	}
 	return nil
 }

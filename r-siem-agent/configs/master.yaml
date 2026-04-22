@@ -247,6 +247,59 @@ playbooks:
           command: "ping"
           target: "127.0.0.1"
 
+  - id: "PB-DECEPTION-HONEYPOT-TRIAGE"
+    version: 1
+    enabled: true
+    selectors:
+      rule_ids: ["R-FR03-DECEPTION-TRIPWIRE"]
+    policy_requirements:
+      approval: "required_for_critical"
+      max_blast_radius: 1
+      auto_min_confidence: 95
+    steps:
+      - name: "notify_honeypot_tripwire"
+        action_type: "notify"
+        reversibility: "reversible"
+        timeout_ms: 2000
+        retries: 0
+        backoff_ms: 0
+        target_from: "group_key"
+
+  - id: "PB-DECEPTION-HONEYPOT-SOURCE-CONTAIN"
+    version: 1
+    enabled: true
+    selectors:
+      rule_ids: ["R-DECEPTION-HONEYPOT-PROBE-BURST-SRCIP"]
+    policy_requirements:
+      approval: "required_for_critical"
+      max_blast_radius: 1
+      auto_min_confidence: 98
+      require_approval_for_local_src: true
+      default_containment_duration_ms: 7200000
+      max_containment_duration_ms: 86400000
+    steps:
+      - name: "contain_repeated_honeypot_probe_source"
+        action_type: "network_block"
+        reversibility: "reversible"
+        timeout_ms: 5000
+        retries: 1
+        backoff_ms: 500
+        target_from: "group_key"
+        params:
+          direction: "ingress"
+          duration_ms: 7200000
+          reason: "honeypot_probe_burst:{rule_id}"
+          reference: "{run_id}"
+          actor: "system:roe"
+          containment_run_id: "{run_id}"
+      - name: "notify_honeypot_probe_burst"
+        action_type: "notify"
+        reversibility: "reversible"
+        timeout_ms: 2000
+        retries: 0
+        backoff_ms: 0
+        target_from: "group_key"
+
   - id: "PB-AUTH-ABUSE-CONTAIN"
     version: 1
     enabled: true
@@ -1810,6 +1863,18 @@ rce:
       kind: trigger
       severity: critical
       group_by: src_ip
+      when:
+        type: auth
+        fields:
+          message_contains: "attack=deception_tripwire"
+
+    - id: R-DECEPTION-HONEYPOT-PROBE-BURST-SRCIP
+      enabled: true
+      kind: count
+      severity: critical
+      group_by: src_ip
+      window_ms: 120000
+      threshold: 3
       when:
         type: auth
         fields:

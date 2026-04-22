@@ -119,6 +119,7 @@ func resetDetectorRegressionState(cfg *config.DetectorConfig) {
 	countFailedPwSrcTracker = newBurstTracker(countFailedPwWindowMs, countFailedPwThreshold)
 	authFailedPwBurstUserTracker = newBurstTracker(authBurstUserWindowMs, authBurstUserThreshold)
 	authFailedPwBurstSrcTracker = newBurstTracker(authBurstSrcWindowMs, authBurstSrcThreshold)
+	deceptionProbeBurstSrcTracker = newBurstTracker(deceptionBurstSrcWindowMs, deceptionBurstSrcThreshold)
 	recentAuthByNode = newLastSeenTracker(5 * time.Minute)
 	recentLocalAdminByNode = newLastSeenTracker(2 * time.Minute)
 	recentSuspiciousProcByNode = newLastSeenTracker(2 * time.Minute)

@@ -22,6 +22,7 @@ import (
 )
 
 const defaultInfrastructureLabPath = "configs/labs/emulated_infrastructure_lab.yaml"
+const defaultInfrastructureCollectorHost = "10.10.0.10"
 
 type infrastructureLabFile struct {
 	Provider        infrastructureProviderSpec           `yaml:"provider"`
@@ -446,7 +447,69 @@ func applyInfrastructureEnvOverrides(spec infrastructureLabFile) infrastructureL
 	if v := strings.TrimSpace(os.Getenv("RSIEM_EVE_NG_ALLOW_INSECURE_TLS")); v != "" {
 		spec.Provider.AllowInsecureTLS = strings.EqualFold(v, "1") || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
 	}
+	if v := strings.TrimSpace(os.Getenv("RSIEM_INFRA_HOST_COLLECTOR_IP")); v != "" {
+		spec = applyInfrastructureCollectorHostOverride(spec, v)
+	}
 	return spec
+}
+
+func applyInfrastructureCollectorHostOverride(spec infrastructureLabFile, host string) infrastructureLabFile {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return spec
+	}
+	spec.ManagementPlane.Master.IP = replaceLiteralHost(spec.ManagementPlane.Master.IP, defaultInfrastructureCollectorHost, host)
+	spec.ManagementPlane.Master.MgmtIP = replaceLiteralHost(spec.ManagementPlane.Master.MgmtIP, defaultInfrastructureCollectorHost, host)
+	for i, ip := range spec.ManagementPlane.Master.DataIPs {
+		spec.ManagementPlane.Master.DataIPs[i] = replaceLiteralHost(ip, defaultInfrastructureCollectorHost, host)
+	}
+	for key, value := range spec.ManagementPlane.Master.CollectorTargets {
+		spec.ManagementPlane.Master.CollectorTargets[key] = rewriteCollectorDestination(value, host)
+	}
+	for i := range spec.Nodes {
+		spec.Nodes[i].IP = replaceLiteralHost(spec.Nodes[i].IP, defaultInfrastructureCollectorHost, host)
+		spec.Nodes[i].MgmtIP = replaceLiteralHost(spec.Nodes[i].MgmtIP, defaultInfrastructureCollectorHost, host)
+		for j, ip := range spec.Nodes[i].DataIPs {
+			spec.Nodes[i].DataIPs[j] = replaceLiteralHost(ip, defaultInfrastructureCollectorHost, host)
+		}
+		for key, value := range spec.Nodes[i].CollectorTargets {
+			spec.Nodes[i].CollectorTargets[key] = rewriteCollectorDestination(value, host)
+		}
+		for j, export := range spec.Nodes[i].TelemetryExports {
+			spec.Nodes[i].TelemetryExports[j].Destination = rewriteCollectorDestination(export.Destination, host)
+		}
+	}
+	for i := range spec.StartupSequence {
+		spec.StartupSequence[i].BootCommand = replaceLiteralHost(spec.StartupSequence[i].BootCommand, defaultInfrastructureCollectorHost, host)
+		spec.StartupSequence[i].ValidationHint = replaceLiteralHost(spec.StartupSequence[i].ValidationHint, defaultInfrastructureCollectorHost, host)
+	}
+	return spec
+}
+
+func rewriteCollectorDestination(destination, host string) string {
+	destination = strings.TrimSpace(destination)
+	if destination == "" {
+		return destination
+	}
+	parsedHost, parsedPort, err := net.SplitHostPort(destination)
+	if err == nil {
+		if strings.TrimSpace(parsedHost) == defaultInfrastructureCollectorHost {
+			return net.JoinHostPort(host, parsedPort)
+		}
+		return destination
+	}
+	return replaceLiteralHost(destination, defaultInfrastructureCollectorHost, host)
+}
+
+func replaceLiteralHost(value, oldHost, newHost string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return value
+	}
+	if strings.Contains(value, oldHost) {
+		return strings.ReplaceAll(value, oldHost, newHost)
+	}
+	return value
 }
 
 func buildInfrastructureTopologyNodeView(spec infrastructureNodeSpec, networks map[string]infrastructureNetworkSpec, eveImport eveNGTopologyImport) infrastructureTopologyNodeView {

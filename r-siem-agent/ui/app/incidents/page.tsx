@@ -5,7 +5,6 @@ import { useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getIncidents, me, purgeDemoTestIncidents } from "@/lib/api";
 import { INCIDENT_MUTATED_EVENT, INCIDENTS_UPDATED_EVENT } from "@/lib/events";
-import { infrastructureBadgeClass, infrastructureShortLabel, isInfrastructureIncident } from "@/lib/infrastructure";
 import { AuthUser, Incident, IncidentListResponse } from "@/lib/types";
 import { IncidentDrawer } from "@/components/incident-drawer";
 import { EmptyState, ErrorState, LaneBadge, LoadingState, StatusBadge, unixMsToLocal } from "@/components/ui";
@@ -185,11 +184,10 @@ export default function IncidentsPage() {
       setLoading(true);
     }
     setError(null);
-    return Promise.all([getIncidents(params.toString()), me().catch(() => null)])
-      .then(([res, meRes]: [IncidentListResponse, { ok: boolean; user: AuthUser } | null]) => {
+    return getIncidents(params.toString())
+      .then((res: IncidentListResponse) => {
         setItems(res.items || []);
         setTotal(res.total || res.count || 0);
-        setAuthUser(meRes?.user || null);
         hasLoadedOnceRef.current = true;
         setHasLoadedOnce(true);
       })
@@ -204,6 +202,20 @@ export default function IncidentsPage() {
   }, [load, refreshNonce]);
 
   useEffect(() => {
+    let cancelled = false;
+    me()
+      .then((res) => {
+        if (!cancelled) setAuthUser(res.user);
+      })
+      .catch(() => {
+        if (!cancelled) setAuthUser(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     const onRefresh = () => setRefreshNonce((v) => v + 1);
     window.addEventListener(INCIDENTS_UPDATED_EVENT, onRefresh);
     window.addEventListener(INCIDENT_MUTATED_EVENT, onRefresh);
@@ -211,6 +223,13 @@ export default function IncidentsPage() {
       window.removeEventListener(INCIDENTS_UPDATED_EVENT, onRefresh);
       window.removeEventListener(INCIDENT_MUTATED_EVENT, onRefresh);
     };
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setRefreshNonce((v) => v + 1);
+    }, 10_000);
+    return () => window.clearInterval(timer);
   }, []);
 
   const pages = useMemo(() => Math.max(1, Math.ceil(total / limit)), [total, limit]);
@@ -307,20 +326,10 @@ export default function IncidentsPage() {
         <div>
           <h2 className="text-[18px] font-semibold">Threat Tray</h2>
           <p className="text-[13px] text-ink-300">Primary analyst queue for triage, approvals, investigation pivots, and response execution.</p>
-          {requestedCategory === "infrastructure" ? (
-            <div className="mt-2">
-              <span className="rounded-full border border-cyan-700/60 bg-cyan-950/40 px-2.5 py-1 text-[11px] uppercase tracking-[0.18em] text-cyan-100">
-                Infrastructure slice
-              </span>
-            </div>
-          ) : null}
         </div>
         <div className="flex flex-wrap items-center gap-2 text-xs">
           <Link className="btn-secondary px-3 py-1 text-xs" href="/search">
             Advanced Search
-          </Link>
-          <Link className="btn-secondary px-3 py-1 text-xs" href="/infrastructure">
-            Infrastructure
           </Link>
           <Link className="btn-secondary px-3 py-1 text-xs" href="/endpoints">
             Entity Pages
@@ -488,13 +497,6 @@ export default function IncidentsPage() {
                   <td className="p-2">
                     <div className="font-medium">{it.rule_id || "-"}</div>
                     <div className="text-xs text-ink-300">{it.playbook_id || "-"}</div>
-                    {isInfrastructureIncident(it) ? (
-                      <div className="mt-2">
-                        <span className={`rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-[0.18em] ${infrastructureBadgeClass(it.rule_id)}`}>
-                          {infrastructureShortLabel(it.rule_id)}
-                        </span>
-                      </div>
-                    ) : null}
                   </td>
                   <td className="p-2">
                     <div className="font-medium">{it.node_id || "-"}</div>

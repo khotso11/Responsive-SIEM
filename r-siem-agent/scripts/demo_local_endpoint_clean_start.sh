@@ -19,6 +19,8 @@ DEMO_USER="${DEMO_USER:-demo_local}"
 DEMO_SRC_IP="${DEMO_SRC_IP:-10.99.1.31}"
 IDENTITY_DEMO_ROUTE="${IDENTITY_DEMO_ROUTE:-$IDENTITY_DEMO_ROUTE_DEFAULT}"
 START_INVESTIGATION_ENRICHER="${START_INVESTIGATION_ENRICHER:-1}"
+START_HONEYPOT="${START_HONEYPOT:-0}"
+HONEYPOT_HTTP_LISTEN="${HONEYPOT_HTTP_LISTEN:-127.0.0.1:18081}"
 MODE_LABEL="demo_local_endpoint"
 if [[ "$REAL_SYSTEM" == "1" ]]; then
   MODE_LABEL="real_local_endpoint"
@@ -220,6 +222,8 @@ pkill -f '/detector-v0 --config' 2>/dev/null || true
 pkill -f 'go run -mod=vendor ./cmd/detector-v0 --config' 2>/dev/null || true
 pkill -f '/collector-tail --config configs/collector.yaml' 2>/dev/null || true
 pkill -f '/agent --config configs/agent.yaml' 2>/dev/null || true
+pkill -f '/honeypot -config tmp/honeypot_demo.yaml' 2>/dev/null || true
+pkill -f 'go run -mod=vendor ./cmd/honeypot -config tmp/honeypot_demo.yaml' 2>/dev/null || true
 pkill -f '/investigation-enricher' 2>/dev/null || true
 pkill -f 'go run ./cmd/investigation-enricher' 2>/dev/null || true
 sleep 2
@@ -318,6 +322,45 @@ DETECTOR_STARTED_LINE="$(rg -n '"msg":"detector_started"' logs/detector.log | ta
 echo "$DETECTOR_STARTED_LINE"
 if [[ "$IDENTITY_DEMO_ROUTE" == "1" ]]; then
   echo "IDENTITY_DEMO_ROUTE=PB-AUTH-ABUSE-CONTAIN"
+fi
+
+if [[ "$START_HONEYPOT" == "1" ]]; then
+  cat > tmp/honeypot_demo.yaml <<EOF_HONEYPOT
+log_level: info
+node_id: honeypot-local
+host: honeypot-local
+response_target_agent_id: ${AGENT_ID}
+jetstream:
+  url: ${NATS_URL}
+  stream: RSIEM_EVENTS
+  subject: rsiem.events.raw
+  spool_path: tmp/honeypot_demo.spool.jsonl
+  spool_fsync: false
+  retry_interval_ms: 1000
+limits:
+  read_timeout_ms: 2500
+  write_timeout_ms: 2500
+  max_payload_bytes: 2048
+  max_concurrent: 16
+services:
+  - id: decoy-admin-http
+    enabled: true
+    protocol: http
+    listen: ${HONEYPOT_HTTP_LISTEN}
+    http_title: Restricted Administration Portal
+    realm: Operations Console
+EOF_HONEYPOT
+
+  : > logs/honeypot.log
+  start_repo_proc "honeypot" ".pids/honeypot.pid" "logs/honeypot.log" \
+    go run -mod=vendor ./cmd/honeypot -config tmp/honeypot_demo.yaml
+  if ! wait_for_log '"msg":"honeypot_service_listening"' logs/honeypot.log 20; then
+    echo "FAIL: honeypot_service_listening not observed in logs/honeypot.log" >&2
+    tail -n 80 logs/honeypot.log >&2 || true
+    exit 1
+  fi
+  HONEYPOT_STARTED_LINE="$(rg -n '"msg":"honeypot_service_listening"' logs/honeypot.log | tail -n 1 || true)"
+  echo "$HONEYPOT_STARTED_LINE"
 fi
 
 echo "[5/10] Re-installing local endpoint against current LAN IP"

@@ -43,6 +43,7 @@ stop_from_pidfile() {
 stop_from_pidfile "collector-tail" "$PID_DIR/collector.pid"
 stop_from_pidfile "detector-v0" "$PID_DIR/detector.pid"
 stop_from_pidfile "agent" "$PID_DIR/agent.pid"
+stop_from_pidfile "honeypot" "$PID_DIR/honeypot.pid"
 stop_from_pidfile "master-roe-worker" "$PID_DIR/worker.pid"
 stop_from_pidfile "master-roe" "$PID_DIR/master-roe.pid"
 

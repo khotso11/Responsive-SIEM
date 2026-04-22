@@ -12,6 +12,7 @@ type SiteAggregate = {
 type GeoPostureMapProps = {
   endpoints: EndpointGeoSummary[];
   generatedAt?: string;
+  loading?: boolean;
   onSelectEndpoint?: (nodeID: string) => void;
   probeHover?: boolean;
   useSiteAggregateForUnlocated?: boolean;
@@ -151,6 +152,7 @@ function markerRadius(events1h: number): number {
 export function GeoPostureMap({
   endpoints,
   generatedAt,
+  loading = false,
   onSelectEndpoint,
   probeHover = false,
   useSiteAggregateForUnlocated = false,
@@ -406,7 +408,7 @@ export function GeoPostureMap({
         ) : null}
       </svg>
 
-      {locatedEndpoints.length === 0 ? (
+      {locatedEndpoints.length === 0 && !loading ? (
         <div
           className="pointer-events-none absolute left-1/2 top-1/2 z-20 w-[92%] max-w-2xl -translate-x-1/2 -translate-y-1/2 rounded-lg border border-ink-700 bg-[#0B1324]/92 px-4 py-3 text-center text-sm text-ink-100"
           data-geo-empty-overlay="1"

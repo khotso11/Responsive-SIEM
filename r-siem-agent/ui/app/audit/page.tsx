@@ -101,13 +101,8 @@ export default function AuditPage() {
     }
     setError(null);
     try {
-      const [auditRes, meRes] = await Promise.all([getAudit(params.toString()), me()]);
+      const auditRes = await getAudit(params.toString());
       setItems(auditRes.items || []);
-      setAuthUser(meRes.user);
-      if (meRes.user?.role === "admin") {
-        const userRes = await getAdminUsers();
-        setUsers(userRes.items || []);
-      }
       hasLoadedOnceRef.current = true;
       setHasLoadedOnce(true);
     } catch (e) {
@@ -136,6 +131,38 @@ export default function AuditPage() {
   useEffect(() => {
     setQ(searchParams.get("gq") || "");
   }, [searchParams]);
+
+  useEffect(() => {
+    let cancelled = false;
+    me()
+      .then((res) => {
+        if (!cancelled) setAuthUser(res.user);
+      })
+      .catch(() => {
+        if (!cancelled) setAuthUser(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (authUser?.role !== "admin") {
+      setUsers([]);
+      return;
+    }
+    let cancelled = false;
+    getAdminUsers()
+      .then((res) => {
+        if (!cancelled) setUsers(res.items || []);
+      })
+      .catch(() => {
+        if (!cancelled) setUsers([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [authUser?.role]);
 
   const filtered = useMemo(() => {
     return items.filter((entry) => {

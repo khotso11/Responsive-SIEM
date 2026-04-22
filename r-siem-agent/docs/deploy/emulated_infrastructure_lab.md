@@ -11,6 +11,18 @@ It is anchored in what already exists in this repo:
 
 This is not a theoretical note. It is the implementation plan for an emulated lab that can drive real telemetry into the existing stack.
 
+## Current deployment boundary
+
+The current working deployment is:
+
+- Ubuntu 24 laptop host runs the R-SIEM stack locally
+- EVE-NG Community Edition runs inside VMware Workstation Pro
+- current EVE VM IP: `192.168.59.128`
+- current working EVE web path: `http://192.168.59.128`
+- VMware NAT is the current active network mode
+
+This means the infrastructure lab is not containerized and not colocated inside Docker. EVE is a separate VM, and the emulated nodes must export telemetry back to the host-side R-SIEM collectors.
+
 ## Current Endpoint Plane Statement
 Use this wording consistently:
 
@@ -39,10 +51,14 @@ An emulated virtual environment is a better fit because it lets the project show
 The machine-readable source of truth for this lab is:
 - `configs/labs/emulated_infrastructure_lab.yaml`
 
-### Management Node
+### Management Anchor
 - `rsiem-master-01`
-- Management IP: `10.10.0.10/24`
-- Runs:
+- Logical collector anchor default: `10.10.0.10/24`
+- Real deployment model:
+  - the actual R-SIEM services run on the Ubuntu host outside EVE
+  - the topology keeps `rsiem-master-01` as the management anchor shown in the UI
+  - export `RSIEM_INFRA_HOST_COLLECTOR_IP` before starting `ui-api` to rewrite this logical address to the real host IP reachable from the EVE VM
+- Host-side services represented by that anchor:
   - NATS JetStream
   - `master-roe`
   - `master-roe-worker`
@@ -52,10 +68,18 @@ The machine-readable source of truth for this lab is:
   - `investigation-enricher`
   - Postgres / TimescaleDB
 
-### Collector Endpoints on the Management Node
-- Syslog UDP collector destination: `10.10.0.10:5140`
-- NetFlow v5 collector destination: `10.10.0.10:2055`
-- SNMP trap collector destination: `10.10.0.10:9162`
+### Collector Endpoints on the Management Anchor
+- Default logical syslog UDP collector destination: `10.10.0.10:5140`
+- Default logical NetFlow v5 collector destination: `10.10.0.10:2055`
+- Default logical SNMP trap collector destination: `10.10.0.10:9162`
+
+For the live VMware NAT lab, those destinations should be rendered to `<RSIEM_INFRA_HOST_COLLECTOR_IP>:port` by setting:
+
+```bash
+export RSIEM_INFRA_HOST_COLLECTOR_IP='<host-ip-reachable-from-eve>'
+```
+
+Use the host address on the VMware NAT segment, not the EVE VM address.
 
 ### Networks
 - `management`: `10.10.0.0/24`
@@ -332,7 +356,7 @@ Build in this order.
 
 ### Phase 2. Stand up the emulated lab
 - Build the exact nodes listed in `configs/labs/emulated_infrastructure_lab.yaml`
-- Route all infrastructure telemetry to the existing collector endpoints on `rsiem-master-01`
+- Route all infrastructure telemetry to the host-side collector endpoints represented by `rsiem-master-01`
 
 ### Phase 3. Add first infrastructure detections
 Implemented now:

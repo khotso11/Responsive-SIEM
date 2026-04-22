@@ -12,7 +12,14 @@ import {
   postIncidentAction
 } from "@/lib/api";
 import { INCIDENT_MUTATED_EVENT, INCIDENTS_UPDATED_EVENT } from "@/lib/events";
-import { ResponseActionCatalogEntry, ResponseActionFleetResponse, ResponseActionListResponse, ResponseActionView } from "@/lib/types";
+import {
+  ResponseActionCatalogEntry,
+  ResponseActionFleetResponse,
+  ResponseActionListResponse,
+  ResponseActionTargetDraft,
+  ResponseActionView
+} from "@/lib/types";
+import { ResponseTargetBuilder } from "@/components/response-target-builder";
 import { EmptyState, ErrorState, LoadingState, unixMsToLocal } from "@/components/ui";
 
 function tone(bucket?: string): string {
@@ -48,6 +55,13 @@ function eligibilityTone(available: boolean): string {
     : "border-amber-700/60 bg-amber-950/20 text-amber-100";
 }
 
+function renderTargetSummary(targets?: ResponseActionTargetDraft[]): string {
+  if (!Array.isArray(targets) || targets.length === 0) return "";
+  return targets
+    .map((target) => [target.kind, target.value, target.port ? `:${target.port}` : "", target.protocol ? `/${target.protocol}` : ""].join(""))
+    .join(", ");
+}
+
 export default function ActionsPage() {
   const [data, setData] = useState<ResponseActionFleetResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -65,6 +79,7 @@ export default function ActionsPage() {
   const [reason, setReason] = useState("");
   const [reference, setReference] = useState("");
   const [target, setTarget] = useState("");
+  const [targets, setTargets] = useState<ResponseActionTargetDraft[]>([{ kind: "ip", value: "", port: undefined, protocol: "" }]);
   const [actionBusy, setActionBusy] = useState(false);
   const [actionMsg, setActionMsg] = useState("");
 
@@ -78,7 +93,7 @@ export default function ActionsPage() {
         bucket: bucket || undefined,
         scope_type: scopeType || undefined,
         page: nextPage,
-        limit: 100
+        limit: 50
       });
       setData(res);
       setPage(res.page || nextPage);
@@ -150,11 +165,17 @@ export default function ActionsPage() {
     setAvailableActions([]);
     setSelectedActionName("");
     setActionMsg("");
+    setTargets([{ kind: "ip", value: "", port: undefined, protocol: "" }]);
   }, [launchScopeType]);
 
   useEffect(() => {
     if (!selectedAction) return;
     setDurationMs(selectedAction.default_duration_ms || 2 * 60 * 60 * 1000);
+  }, [selectedAction?.id]);
+
+  useEffect(() => {
+    setTargets([{ kind: "ip", value: "", port: undefined, protocol: "" }]);
+    setTarget("");
   }, [selectedAction?.id]);
 
   const launchAction = async () => {
@@ -168,6 +189,18 @@ export default function ActionsPage() {
       return;
     }
     try {
+      const targetPayload = targets
+        .map((item) => ({
+          kind: item.kind,
+          value: item.value.trim(),
+          port: item.port,
+          protocol: item.protocol
+        }))
+        .filter((item) => item.value.length > 0);
+      if (selectedAction.requires_targets && targetPayload.length === 0) {
+        setActionMsg("This action requires at least one explicit target.");
+        return;
+      }
       setActionBusy(true);
       if (launchScopeType === "incident") {
         await postIncidentAction(scopeID, {
@@ -176,7 +209,8 @@ export default function ActionsPage() {
           duration_ms: durationMs,
           reason: reason.trim(),
           reference: reference.trim(),
-          target: target.trim()
+          target: targetPayload.map((item) => item.value).join(", "),
+          targets: targetPayload
         });
       } else {
         await postEndpointAction(scopeID, {
@@ -185,14 +219,16 @@ export default function ActionsPage() {
           duration_ms: durationMs,
           reason: reason.trim(),
           reference: reference.trim(),
-          target: target.trim(),
+          target: targetPayload.map((item) => item.value).join(", "),
+          targets: targetPayload,
           target_agent_id: scopeID
         });
       }
       setActionMsg(`Action launched: ${selectedAction.label}`);
       setReason("");
       setReference("");
-      setTarget("");
+      setTarget(targetPayload.map((item) => item.value).join(", "));
+      setTargets([{ kind: "ip", value: "", port: undefined, protocol: "" }]);
       await load({ page: 1 });
       await loadScopeCatalog();
     } catch (e) {
@@ -228,6 +264,50 @@ export default function ActionsPage() {
       }
     } catch (e) {
       setActionMsg(`Clear failed: ${(e as Error).message}`);
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  const clearActiveScopeActions = async () => {
+    const scopeID = launchScopeID.trim();
+    if (!scopeID) {
+      setActionMsg("Load an incident or endpoint scope first.");
+      return;
+    }
+    try {
+      setActionBusy(true);
+      const scopeRes =
+        launchScopeType === "incident" ? await getIncidentActions(scopeID) : await getEndpointActions(scopeID);
+      const clearable = (scopeRes.items || []).filter((item) => {
+        if (!item.clear_supported || item.bucket !== "active") return false;
+        if (launchScopeType === "incident") return item.scope_type === "incident" && item.run_id === scopeID;
+        return item.scope_type === "endpoint" && item.node_id === scopeID;
+      });
+      if (clearable.length === 0) {
+        setActionMsg("No active clearable actions found for the loaded scope.");
+        return;
+      }
+      for (const item of clearable) {
+        if (item.scope_type === "incident" && item.run_id) {
+          await clearIncidentAction(item.run_id, item.action_id, {
+            actor,
+            reason: reason.trim() || "manual clear from actions page",
+            reference: reference.trim()
+          });
+        } else if (item.scope_type === "endpoint" && item.node_id) {
+          await clearEndpointAction(item.node_id, item.action_id, {
+            actor,
+            reason: reason.trim() || "manual clear from actions page",
+            reference: reference.trim()
+          });
+        }
+      }
+      setActionMsg(`Cleared ${clearable.length} active action${clearable.length === 1 ? "" : "s"} for ${scopeID}.`);
+      await load({ page });
+      await loadScopeCatalog();
+    } catch (e) {
+      setActionMsg(`Bulk clear failed: ${(e as Error).message}`);
     } finally {
       setActionBusy(false);
     }
@@ -303,18 +383,40 @@ export default function ActionsPage() {
           />
           <input
             className="rounded-lg border border-ink-700 bg-ink-950/70 px-3 py-2 text-sm outline-none focus:border-cyan-500"
-            placeholder="target override (optional)"
+            placeholder="target summary (auto-derived from explicit targets)"
             value={target}
             onChange={(e) => setTarget(e.target.value)}
+            readOnly
           />
           <button className="rounded-lg bg-cyan-500 px-3 py-2 text-sm font-semibold text-slate-950 disabled:opacity-50" disabled={actionBusy || !selectedAction || !selectedAction.available} onClick={() => void launchAction()}>
             Launch
           </button>
         </div>
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <button
+            className="rounded-lg border border-amber-700/60 bg-amber-950/30 px-3 py-2 text-xs font-medium text-amber-100 disabled:opacity-50"
+            disabled={actionBusy || !launchScopeID.trim()}
+            onClick={() => void clearActiveScopeActions()}
+          >
+            Clear active scope actions
+          </button>
+        </div>
         {selectedAction ? (
           <p className="mt-2 text-xs text-ink-300">
             {selectedAction.description} Mode: <span className="text-ink-100">{selectedAction.execution_mode}</span>.
+            {selectedAction.requires_targets ? " Explicit targets are required for this action." : ""}
           </p>
+        ) : null}
+        {selectedAction?.requires_targets ? (
+          <div className="mt-3">
+            <ResponseTargetBuilder
+              title="Explicit targets"
+              description="Enter one or more IPs, CIDRs, DNS names, hostnames, and optional port/protocol details."
+              targets={targets}
+              onChange={setTargets}
+              disabled={actionBusy}
+            />
+          </div>
         ) : null}
         {availableActions.length > 0 ? (
           <div className="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
@@ -330,6 +432,7 @@ export default function ActionsPage() {
                   </span>
                 </div>
                 <div className="mt-1 text-ink-300">{item.description}</div>
+                {item.requires_targets ? <div className="mt-1 text-ink-400">Requires explicit targets entered by the operator.</div> : null}
                 {!item.available && item.unavailable_reason ? (
                   <div className="mt-2 text-amber-100">{item.unavailable_reason}</div>
                 ) : null}
@@ -429,6 +532,7 @@ export default function ActionsPage() {
                     </td>
                     <td className="p-2 text-ink-200">
                       <div>{item.target || "-"}</div>
+                      {item.targets && item.targets.length > 0 ? <div className="mt-1 text-xs text-ink-400">{renderTargetSummary(item.targets)}</div> : null}
                       <div className="text-xs text-ink-400">{item.direction || "-"}</div>
                       <div className="mt-1 text-xs text-ink-500 break-all">{item.reason || "-"}</div>
                     </td>
@@ -443,7 +547,7 @@ export default function ActionsPage() {
                     <td className="p-2 text-sm">
                       <div className="flex flex-col gap-1">
                         {item.run_id ? (
-                          <Link className="text-cyan-300 underline decoration-cyan-700 underline-offset-2" href={`/open_run_id=${encodeURIComponent(item.run_id)}`}>
+                          <Link className="text-cyan-300 underline decoration-cyan-700 underline-offset-2" href={`/incidents/${encodeURIComponent(item.run_id)}`}>
                             Open incident
                           </Link>
                         ) : null}

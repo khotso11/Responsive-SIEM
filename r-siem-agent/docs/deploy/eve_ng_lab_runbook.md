@@ -10,28 +10,46 @@ This runbook is the defense-time procedure for bringing up the emulated R-SIEM i
 - UI page: `/infrastructure/topology`
 - UI runbook page: `/infrastructure/runbook`
 
+## Current deployment boundary
+
+Current validated state:
+
+- Ubuntu host runs the R-SIEM stack locally
+- EVE-NG Community Edition runs inside VMware Workstation Pro
+- current working EVE IP: `192.168.59.128`
+- current working web path: `http://192.168.59.128`
+- current working EVE network mode: VMware NAT
+- EVE is not running in Docker
+
 ## EVE-NG runtime prerequisites
 
 Set these on the host running `ui-api` before starting the UI stack:
 
 ```bash
-export RSIEM_EVE_NG_UI_URL='https://192.168.1.50/'
-export RSIEM_EVE_NG_API_BASE_URL='https://192.168.1.50'
+export RSIEM_EVE_NG_UI_URL='http://192.168.59.128/'
+export RSIEM_EVE_NG_API_BASE_URL='http://192.168.59.128'
 export RSIEM_EVE_NG_API_LAB_PATH='/R-SIEM/rsiem-infrastructure.unl'
 export RSIEM_EVE_NG_USERNAME='admin'
-export RSIEM_EVE_NG_PASSWORD='eve-password'
-export RSIEM_EVE_NG_ALLOW_INSECURE_TLS='true'
+export RSIEM_EVE_NG_PASSWORD='<eve-web-password>'
+export RSIEM_EVE_NG_ALLOW_INSECURE_TLS='false'
+export RSIEM_INFRA_HOST_COLLECTOR_IP='<host-ip-reachable-from-eve>'
 ```
 
-These values override the placeholder provider values from `configs/labs/emulated_infrastructure_lab.yaml`. Use env overrides for the defense instead of editing the placeholder host repeatedly.
+`RSIEM_INFRA_HOST_COLLECTOR_IP` rewrites the logical collector address `10.10.0.10` to the real Ubuntu host address that the EVE VM can reach.
 
-If EVE-NG uses a self-signed certificate, `RSIEM_EVE_NG_ALLOW_INSECURE_TLS='true'` keeps the runtime query path working.
+Under VMware NAT this is usually the host-side `vmnet8` address. Confirm it on the Ubuntu host instead of guessing:
+
+```bash
+ip -4 addr show | grep '192.168.59.'
+```
+
+Keep `RSIEM_EVE_NG_ALLOW_INSECURE_TLS='false'` for the current HTTP-only deployment. Enable it only if you later move the EVE VM to HTTPS with a self-signed certificate.
 
 ## Topology summary
 
 The emulated lab contains:
 
-- `rsiem-master-01`: management plane node for R-SIEM
+- `rsiem-master-01`: logical management anchor representing the host-side R-SIEM stack
 - `edge-rtr-01`: router
 - `fw-01`: firewall / gateway / NetFlow exporter
 - `sw-core-01`: switch segment
@@ -55,10 +73,10 @@ Open EVE-NG, load the lab, and start nodes in this order:
 
 1. `edge-rtr-01`
    - verify management reachability
-   - verify syslog / SNMP exporter targets point to `10.10.0.10`
+   - verify syslog / SNMP exporter targets point to the host collector IP rendered in `/infrastructure/topology`
 2. `fw-01`
    - verify DMZ and red-team facing interfaces are up
-   - verify syslog / NetFlow / SNMP exporters point to `10.10.0.10`
+   - verify syslog / NetFlow / SNMP exporters point to the host collector IP rendered in `/infrastructure/topology`
 3. `sw-core-01`
    - verify link-state notifications can be emitted
 4. `linux-endpoint-01`
@@ -85,11 +103,13 @@ Keep `/infrastructure/topology` open and show:
 
 ## Telemetry destinations
 
-Configured collector endpoints on `rsiem-master-01`:
+Configured collector endpoints on the host-side R-SIEM management anchor:
 
-- Syslog UDP: `10.10.0.10:5140`
-- NetFlow v5: `10.10.0.10:2055`
-- SNMP trap: `10.10.0.10:9162`
+- Syslog UDP: `<RSIEM_INFRA_HOST_COLLECTOR_IP>:5140`
+- NetFlow v5: `<RSIEM_INFRA_HOST_COLLECTOR_IP>:2055`
+- SNMP trap: `<RSIEM_INFRA_HOST_COLLECTOR_IP>:9162`
+
+If `RSIEM_INFRA_HOST_COLLECTOR_IP` is not set, the lab model keeps the logical placeholder `10.10.0.10`. For the live VMware NAT lab, set the override before starting `ui-api` so the topology page and runbook render the real host collector address.
 
 ## Demonstration sequence
 
@@ -128,10 +148,11 @@ Check in order:
 
 1. `RSIEM_EVE_NG_UI_URL`, `RSIEM_EVE_NG_API_BASE_URL`, and `RSIEM_EVE_NG_API_LAB_PATH`
 2. `RSIEM_EVE_NG_USERNAME` and `RSIEM_EVE_NG_PASSWORD`
-3. whether the EVE-NG host is reachable from the `ui-api` host
-4. whether the same EVE account is already logged in elsewhere and has invalidated the current session
-5. `./scripts/verify_eve_ng_runtime_ui.sh`
+3. `./scripts/verify_eve_ng_vm_integration.sh`
+4. whether the EVE-NG host is reachable from the `ui-api` host
+5. whether the same EVE account is already logged in elsewhere and has invalidated the current session
+6. `./scripts/verify_eve_ng_runtime_ui.sh`
 
 ## Current integration boundary
 
-The current implementation reads runtime node state from EVE-NG, imports the `.unl` lab topology, and exposes admin-only `start`, `stop`, and `wipe` node controls from the R-SIEM UI. It does not yet manage full lab lifecycle operations such as creating labs or importing images.
+The current implementation reads runtime node state from the EVE VM, imports the `.unl` lab topology, rewrites host collector destinations through `RSIEM_INFRA_HOST_COLLECTOR_IP`, and exposes admin-only `start`, `stop`, and `wipe` node controls from the R-SIEM UI. It does not yet manage full lab lifecycle operations such as creating labs or importing images.

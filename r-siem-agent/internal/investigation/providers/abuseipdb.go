@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"time"
@@ -33,14 +34,13 @@ func (p *AbuseIPDBProvider) Supports(kind investigation.ObservableKind) bool {
 }
 
 func (p *AbuseIPDBProvider) Enrich(ctx context.Context, obs investigation.Observable) (investigation.ProviderResult, error) {
+	if ip := net.ParseIP(obs.Value); ip != nil {
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsMulticast() || ip.IsUnspecified() || isDocumentationIPv4(ip) {
+			return localProviderFallback(p.Name(), obs, p.apiKey == ""), nil
+		}
+	}
 	if p.apiKey == "" {
-		return investigation.ProviderResult{
-			Provider: p.Name(),
-			Status:   "skipped_no_api_key",
-			Verdict:  "unknown",
-			Summary:  "ABUSEIPDB_API_KEY not set",
-			Data:     map[string]any{},
-		}, nil
+		return localProviderFallback(p.Name(), obs, true), nil
 	}
 
 	url := "https://api.abuseipdb.com/api/v2/check?ipAddress=" + obs.Value + "&maxAgeInDays=90"

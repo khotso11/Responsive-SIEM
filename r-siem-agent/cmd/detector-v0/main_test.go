@@ -497,3 +497,50 @@ func TestInfrastructurePostContainmentBlockVerificationMatches(t *testing.T) {
 		t.Fatalf("lane=%q want %q", match.Lane, networkObserveLane)
 	}
 }
+
+func TestHoneypotProbeBurstEscalatesBySourceIP(t *testing.T) {
+	cfg, err := config.LoadDetector("../../configs/detector.yaml")
+	if err != nil {
+		t.Fatalf("load detector config: %v", err)
+	}
+	resetDetectorRegressionState(cfg)
+
+	base := rawEvent{
+		EventType:        "auth_failed",
+		SourceType:       "deception",
+		NodeID:           "honeypot-local",
+		Host:             "honeypot-local",
+		SrcIP:            "10.66.12.250",
+		User:             "honeypot-admin",
+		ObservedAtUnixMs: 0,
+	}
+	msg := "ALERT invalid user=honeypot-admin src=10.66.12.250 attack=deception_tripwire service=decoy-admin-http protocol=http"
+
+	for i := 0; i < deceptionBurstSrcThreshold-1; i++ {
+		evt := base
+		evt.ObservedAtUnixMs = int64((i + 1) * 1000)
+		match, ok := matchRule(msg, evt)
+		if !ok {
+			t.Fatalf("expected tripwire match before escalation at i=%d", i)
+		}
+		if match.RuleID != fr03DeceptionRuleID {
+			t.Fatalf("rule_id=%q want %q before escalation", match.RuleID, fr03DeceptionRuleID)
+		}
+	}
+
+	final := base
+	final.ObservedAtUnixMs = int64(deceptionBurstSrcThreshold * 1000)
+	match, ok := matchRule(msg, final)
+	if !ok {
+		t.Fatal("expected deception burst escalation match")
+	}
+	if match.RuleID != deceptionBurstSrcRuleID {
+		t.Fatalf("rule_id=%q want %q", match.RuleID, deceptionBurstSrcRuleID)
+	}
+	if match.GroupKey != "10.66.12.250" {
+		t.Fatalf("group_key=%q want 10.66.12.250", match.GroupKey)
+	}
+	if match.ConfidenceScore != 98 {
+		t.Fatalf("confidence=%d want 98", match.ConfidenceScore)
+	}
+}

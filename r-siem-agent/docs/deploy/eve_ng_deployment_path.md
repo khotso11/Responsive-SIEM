@@ -1,6 +1,6 @@
 # EVE-NG Deployment Path For This Machine
 
-This document chooses the practical EVE-NG deployment model for the current R-SIEM development machine and gives the exact integration steps.
+This document records the current EVE-NG deployment model for the R-SIEM development and defense machine and gives the exact integration steps.
 
 ## Host profile used for the decision
 
@@ -25,30 +25,22 @@ This host is already used to run:
 
 ## Chosen deployment path
 
-For this machine, the recommended path is:
+For the current machine, the chosen path is:
 
-- **Primary recommendation:** run EVE-NG on a separate VM or second host with a fixed IP
-- **Fallback option:** run a compact EVE-NG VM locally only if the lab is kept small
+- R-SIEM stack on the Ubuntu host
+- EVE-NG Community Edition inside a dedicated VMware Workstation Pro VM
+- VMware NAT networking for the current operational phase
 
-This is the correct choice because a full EVE-NG topology plus the full R-SIEM stack on the same 15 GiB laptop will compete for RAM and make the live defense less stable.
+This keeps the control plane and the emulated lab separated while still allowing the laptop to host both sides of the demo.
 
-## What "separate EVE host" means here
+## Current validated VM state
 
-Use one of these:
+- EVE VM IP: `192.168.59.128`
+- web UI path: `http://192.168.59.128`
+- transport currently used by R-SIEM: HTTP
+- nested virtualization inside the EVE guest: working
 
-1. Another laptop or workstation on the same LAN
-2. A dedicated VM on a second machine
-3. A local hypervisor VM with strict memory limits and a compact lab
-
-If you use a second host, give it:
-
-- a fixed IP address
-- HTTPS enabled
-- reachable management access from the R-SIEM host
-
-Example:
-
-- EVE host IP: `192.168.1.50`
+Bridged networking was tested earlier and did not obtain IPv4. NAT is the current known-good operating mode and should be treated as the active baseline until a later static-IP revisit.
 
 ## Required integration values
 
@@ -59,72 +51,68 @@ R-SIEM does not need EVE-NG to live in this repo. It only needs the following va
 - `RSIEM_EVE_NG_API_LAB_PATH`
 - `RSIEM_EVE_NG_USERNAME`
 - `RSIEM_EVE_NG_PASSWORD`
+- `RSIEM_INFRA_HOST_COLLECTOR_IP`
 
 ## Recommended environment setup
 
 Set these before starting the R-SIEM stack:
 
 ```bash
-export RSIEM_EVE_NG_UI_URL='https://192.168.1.50/'
-export RSIEM_EVE_NG_API_BASE_URL='https://192.168.1.50'
+export RSIEM_EVE_NG_UI_URL='http://192.168.59.128/'
+export RSIEM_EVE_NG_API_BASE_URL='http://192.168.59.128'
 export RSIEM_EVE_NG_API_LAB_PATH='/R-SIEM/rsiem-infrastructure.unl'
 export RSIEM_EVE_NG_USERNAME='admin'
-export RSIEM_EVE_NG_PASSWORD='your-eve-password'
-export RSIEM_EVE_NG_ALLOW_INSECURE_TLS='true'
+export RSIEM_EVE_NG_PASSWORD='<eve-web-password>'
+export RSIEM_EVE_NG_ALLOW_INSECURE_TLS='false'
+export RSIEM_INFRA_HOST_COLLECTOR_IP='<host-ip-reachable-from-eve>'
 ```
 
-The UI API now supports these environment overrides directly, so you do not need to keep editing the placeholder `eve-ng.local` values in `configs/labs/emulated_infrastructure_lab.yaml`.
+The UI API supports these environment overrides directly, and the infrastructure topology loader supports `RSIEM_INFRA_HOST_COLLECTOR_IP` so the management anchor and collector destinations reflect the real Ubuntu host address visible from the EVE VM.
 
 ## Bring-up sequence
 
-1. Start or verify the EVE-NG server
+1. Start or verify the EVE VM
 2. Confirm the lab exists at:
    - `/R-SIEM/rsiem-infrastructure.unl`
-3. Confirm the R-SIEM host can reach the EVE host:
+3. Confirm the Ubuntu host can reach the EVE VM:
 
 ```bash
-curl -k https://192.168.1.50
+curl http://192.168.59.128
 ```
 
-4. Export the EVE runtime variables
-5. Start the R-SIEM stack:
+4. Confirm the Ubuntu host address that the EVE VM can reach:
+
+```bash
+ip -4 addr show | grep '192.168.59.'
+```
+
+5. Export the EVE runtime variables
+6. Start the R-SIEM stack:
 
 ```bash
 cd ~/projects/r-siem-agent
 REAL_SYSTEM=1 UI_WEB_PORT=3100 ./scripts/demo_local_endpoint_clean_start.sh
 ```
 
-6. Validate the integration:
+7. Validate the integration:
 
 ```bash
+./scripts/verify_eve_ng_vm_integration.sh
 ./scripts/verify_eve_ng_runtime_ui.sh
 ```
 
-7. Open:
+8. Open:
 
 - `/infrastructure/topology`
 - `/infrastructure/runbook`
-
-## If you insist on local EVE on this laptop
-
-Keep the lab compact:
-
-- `rsiem-master-01`
-- `edge-rtr-01`
-- `fw-01`
-- `sw-core-01`
-- `linux-endpoint-01`
-- `win-endpoint-01`
-- `attacker-01`
-
-Do not try to run a larger lab plus the full R-SIEM stack plus a browser workload without reducing concurrency and memory pressure.
 
 ## Operational rule for the defense
 
 The stable demonstration model is:
 
-- R-SIEM stack on this laptop
-- EVE-NG lab on a separate reachable host or VM
+- R-SIEM stack on the laptop host
+- EVE-NG lab inside the VMware VM at `192.168.59.128`
 - topology and control through the R-SIEM UI using EVE runtime integration
+- telemetry exported from the EVE lab back to the host-side collectors
 
-That is the most defensible and least fragile setup.
+That is the current working architecture and the one the repo should now reflect.

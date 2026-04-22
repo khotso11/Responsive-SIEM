@@ -45,8 +45,8 @@ import {
   ResponseHistoryResponse,
   StepResult
 } from "@/lib/types";
-import { infrastructureBadgeClass, infrastructureDescription, infrastructureLabel, isInfrastructureIncident } from "@/lib/infrastructure";
 import { EmptyState, LaneBadge, LoadingState, StatusBadge, ValueRow, unixMsToLocal } from "@/components/ui";
+import { ResponseTargetBuilder } from "@/components/response-target-builder";
 
 type DrawerTab = "overview" | "steps" | "timeline" | "entities" | "evidence" | "actions" | "logic";
 
@@ -255,20 +255,6 @@ function providerMeta(provider?: string): { label: string; mark: string; cardCla
         cardClass: "border-emerald-800/70 bg-emerald-950/20",
         markClass: "border-emerald-700/70 bg-emerald-950/70 text-emerald-100"
       };
-    case "greynoise":
-      return {
-        label: "GreyNoise",
-        mark: "GN",
-        cardClass: "border-fuchsia-800/70 bg-fuchsia-950/20",
-        markClass: "border-fuchsia-700/70 bg-fuchsia-950/70 text-fuchsia-100"
-      };
-    case "urlscan":
-      return {
-        label: "urlscan",
-        mark: "US",
-        cardClass: "border-amber-800/70 bg-amber-950/20",
-        markClass: "border-amber-700/70 bg-amber-950/70 text-amber-100"
-      };
     default:
       return {
         label: provider || "provider",
@@ -385,7 +371,6 @@ export function IncidentDrawer({
   const [responseActions, setResponseActions] = useState<ResponseActionListResponse | null>(null);
   const [responseActionsLoading, setResponseActionsLoading] = useState(false);
   const [responseActionsError, setResponseActionsError] = useState("");
-  const [linkedAction, setLinkedAction] = useState<ResponseActionView | null>(null);
   const [entityUserProfile, setEntityUserProfile] = useState<EntityProfileResponse | null>(null);
   const [entitySrcProfile, setEntitySrcProfile] = useState<EntityProfileResponse | null>(null);
   const [entityDstProfile, setEntityDstProfile] = useState<EntityProfileResponse | null>(null);
@@ -420,7 +405,9 @@ export function IncidentDrawer({
   const [manualActionDurationMs, setManualActionDurationMs] = useState<number>(ACTION_DURATION_PRESETS[0].value);
   const [manualActionReason, setManualActionReason] = useState("");
   const [manualActionReference, setManualActionReference] = useState("");
-  const [manualActionTarget, setManualActionTarget] = useState("");
+  const [manualActionTargets, setManualActionTargets] = useState<Array<{ kind: "ip" | "dns" | "hostname" | "cidr"; value: string; port?: number; protocol?: "tcp" | "udp" | "any" | "" }>>([
+    { kind: "ip", value: "", port: undefined, protocol: "" }
+  ]);
   const advancedSearchHref = useMemo(() => {
     const params = new URLSearchParams();
     if (fromMs) params.set("from", String(fromMs));
@@ -443,7 +430,6 @@ export function IncidentDrawer({
       const user = auth?.user || null;
       setRun(detail.run);
       setSteps(detail.steps || []);
-      setLinkedAction(detail.linked_action || null);
       setAuthUser(user);
       setUIState(detail.ui_state || { notes: [], assignment: "", reviewed: false });
       setAnnotations(detail.annotations || []);
@@ -608,7 +594,7 @@ export function IncidentDrawer({
     setManualActionDurationMs(ACTION_DURATION_PRESETS[0].value);
     setManualActionReason("");
     setManualActionReference("");
-    setManualActionTarget("");
+    setManualActionTargets([{ kind: "ip", value: "", port: undefined, protocol: "" }]);
     setInvestigation(null);
     setInvestigationError("");
     setInvestigationLoading(false);
@@ -621,7 +607,6 @@ export function IncidentDrawer({
     setResponseActions(null);
     setResponseActionsError("");
     setResponseActionsLoading(false);
-    setLinkedAction(null);
     setEntityUserProfile(null);
     setEntitySrcProfile(null);
     setEntityDstProfile(null);
@@ -716,7 +701,6 @@ export function IncidentDrawer({
     [run]
   );
   const actionGroups = useMemo(() => groupResponseActions(responseActions?.items), [responseActions?.items]);
-  const isInfrastructureRun = useMemo(() => isInfrastructureIncident(run), [run]);
   const selectedManualAction = useMemo(
     () =>
       responseActions?.available_actions?.find((item) => item.id === manualActionName) ||
@@ -725,6 +709,18 @@ export function IncidentDrawer({
       null,
     [manualActionName, responseActions?.available_actions]
   );
+
+  useEffect(() => {
+    if (!open) return;
+    setManualActionTargets([{ kind: "ip", value: "", port: undefined, protocol: "" }]);
+  }, [open, selectedManualAction?.id]);
+
+  useEffect(() => {
+    if (!open) return;
+    if (!selectedManualAction?.requires_targets) return;
+    setManualActionTargets((current) => (current.length > 0 ? current : [{ kind: "ip", value: "", port: undefined, protocol: "" }]));
+  }, [open, selectedManualAction?.id, selectedManualAction?.requires_targets]);
+
   const policySummary = useMemo(() => policyHighlights(run), [run]);
   const selectedTabMeta = useMemo(() => TAB_META.find((item) => item.id === tab) || TAB_META[0], [tab]);
 
@@ -891,6 +887,18 @@ export function IncidentDrawer({
       setDecisionMsg(selectedManualAction.unavailable_reason || "Selected response action is not available for this incident.");
       return;
     }
+    const targetPayload = manualActionTargets
+      .map((item) => ({
+        kind: item.kind,
+        value: item.value.trim(),
+        port: item.port,
+        protocol: item.protocol
+      }))
+      .filter((item) => item.value.length > 0);
+    if (selectedManualAction.requires_targets && targetPayload.length === 0) {
+      setDecisionMsg("This response action requires at least one explicit target.");
+      return;
+    }
     try {
       setActionBusy(true);
       await postIncidentAction(run.run_id, {
@@ -899,13 +907,14 @@ export function IncidentDrawer({
         duration_ms: manualActionDurationMs,
         reason: manualActionReason.trim(),
         reference: manualActionReference.trim(),
-        target: manualActionTarget.trim(),
-        target_agent_id: run.target_agent_id || run.node_id || ""
+        target: targetPayload.map((item) => item.value).join(", "),
+        target_agent_id: run.target_agent_id || run.node_id || "",
+        targets: targetPayload
       });
       setDecisionMsg(`Response action launched: ${selectedManualAction.label}`);
       setManualActionReason("");
       setManualActionReference("");
-      setManualActionTarget("");
+      setManualActionTargets([{ kind: "ip", value: "", port: undefined, protocol: "" }]);
       await Promise.all([load(), loadResponseActionsData(), loadResponseHistoryData()]);
       emitIncidentMutated(run.run_id);
       emitIncidentsUpdated({ runID: run.run_id });
@@ -1020,27 +1029,6 @@ export function IncidentDrawer({
           <span className="font-medium text-ink-100">{selectedTabMeta.label}:</span> {selectedTabMeta.detail}
         </div>
 
-        {hasLoadedOnce && run && isInfrastructureRun ? (
-          <div className={`mb-3 rounded border px-3 py-3 ${infrastructureBadgeClass(run.rule_id)}`}>
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="rounded-full border border-current/40 px-2 py-0.5 text-[10px] uppercase tracking-[0.2em]">
-                Infrastructure
-              </span>
-              <span className="text-sm font-semibold">{infrastructureLabel(run.rule_id)}</span>
-            </div>
-            <div className="mt-1 text-xs opacity-90">{infrastructureDescription(run.rule_id)}</div>
-            <div className="mt-2 text-xs opacity-80">
-              Source: {run.source_type || "-"} · Event: {run.event_type || "-"} · Target agent: {run.target_agent_id || "not set"}
-            </div>
-            {linkedAction ? (
-              <div className="mt-2 rounded border border-current/25 bg-black/10 px-2 py-2 text-xs opacity-90">
-                Ledger action: {linkedAction.action_id} · Status: {linkedAction.status || "-"} · Bucket: {linkedAction.bucket || "-"} · Target:{" "}
-                {linkedAction.target || "-"} · Control point: {linkedAction.target_agent_id || linkedAction.node_id || "not set"}
-              </div>
-            ) : null}
-          </div>
-        ) : null}
-
         {loading && !hasLoadedOnce ? <LoadingState /> : null}
         {hasLoadedOnce && run && (policyBadge(run.approval_policy_reason) || policySummary.length > 0) ? (
           <div className="mb-3 rounded border border-cyan-900/70 bg-cyan-950/20 px-3 py-3">
@@ -1083,13 +1071,6 @@ export function IncidentDrawer({
               <div className="rounded border border-ink-800 bg-ink-900/50 p-3 text-sm">
                 <div className="text-[11px] uppercase tracking-[0.12em] text-ink-400">Rule</div>
                 <div className="mt-2 font-medium text-ink-100">{run.rule_id || "-"}</div>
-                {isInfrastructureRun ? (
-                  <div className="mt-2">
-                    <span className={`rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-[0.18em] ${infrastructureBadgeClass(run.rule_id)}`}>
-                      {infrastructureLabel(run.rule_id)}
-                    </span>
-                  </div>
-                ) : null}
               </div>
               <div className="rounded border border-ink-800 bg-ink-900/50 p-3 text-sm">
                 <div className="text-[11px] uppercase tracking-[0.12em] text-ink-400">Playbook</div>
@@ -1925,6 +1906,7 @@ export function IncidentDrawer({
                   <div className="mt-1 flex flex-wrap gap-2">
                     <span className="badge-info">mode:{selectedManualAction.execution_mode}</span>
                     <span className="badge-info">clear:{selectedManualAction.clear_supported ? "supported" : "expiry only"}</span>
+                    {selectedManualAction.requires_targets ? <span className="badge-info">targets:required</span> : null}
                     <span className="badge-info">default:{humanDuration(selectedManualAction.default_duration_ms)}</span>
                   </div>
                   {!selectedManualAction.available ? (
@@ -1933,6 +1915,15 @@ export function IncidentDrawer({
                     </div>
                   ) : null}
                 </div>
+              ) : null}
+              {selectedManualAction?.requires_targets ? (
+                <ResponseTargetBuilder
+                  title="Explicit block targets"
+                  description="Add one or more IPs, CIDRs, DNS names, or hostnames. The endpoint will block only the targets you enter."
+                  targets={manualActionTargets}
+                  onChange={setManualActionTargets}
+                  disabled={actionBusy}
+                />
               ) : null}
               {(responseActions?.available_actions || []).length > 0 ? (
                 <div className="mt-2 grid gap-2 lg:grid-cols-2">
@@ -1955,12 +1946,6 @@ export function IncidentDrawer({
                   ))}
                 </div>
               ) : null}
-              <input
-                value={manualActionTarget}
-                onChange={(e) => setManualActionTarget(e.target.value)}
-                className="input-field mt-2 w-full"
-                placeholder="optional target override (for example dst_ip)"
-              />
               <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
                 <input
                   value={manualActionReference}
@@ -1990,12 +1975,19 @@ export function IncidentDrawer({
                     {(actionGroups[bucket] || []).map((item) => (
                       <div key={item.action_id} className={`rounded border px-3 py-2 text-xs ${responseActionTone(item.bucket)}`}>
                         <div className="flex items-start justify-between gap-2">
-                          <div>
+                        <div>
                             <div className="font-medium">{item.label}</div>
                             <div className="text-ink-300">
                               {item.target || run?.node_id || "-"} • {item.action_type}
                               {item.execution_mode ? ` • ${item.execution_mode}` : ""}
                             </div>
+                            {Array.isArray(item.targets) && item.targets.length > 0 ? (
+                              <div className="mt-1 text-ink-400">
+                                targets: {item.targets
+                                  .map((target) => [target.kind, target.value, target.port ? `:${target.port}` : "", target.protocol ? `/${target.protocol}` : ""].join(""))
+                                  .join(", ")}
+                              </div>
+                            ) : null}
                           </div>
                           <span className="rounded border border-current/40 px-2 py-0.5 uppercase tracking-[0.24em]">{item.status}</span>
                         </div>

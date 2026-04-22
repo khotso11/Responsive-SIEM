@@ -5,8 +5,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"r-siem-agent/internal/investigation"
@@ -37,14 +39,19 @@ func (p *VirusTotalProvider) Supports(kind investigation.ObservableKind) bool {
 }
 
 func (p *VirusTotalProvider) Enrich(ctx context.Context, obs investigation.Observable) (investigation.ProviderResult, error) {
+	if obs.Kind == investigation.ObservableIP {
+		if ip := net.ParseIP(obs.Value); ip != nil && (ip.IsLoopback() || ip.IsPrivate() || ip.IsMulticast() || ip.IsUnspecified() || isDocumentationIPv4(ip)) {
+			return localProviderFallback(p.Name(), obs, p.apiKey == ""), nil
+		}
+	}
+	if obs.Kind == investigation.ObservableDomain || obs.Kind == investigation.ObservableURL {
+		value := strings.ToLower(strings.TrimSpace(obs.Value))
+		if strings.Contains(value, ".local") || strings.Contains(value, ".internal") || strings.Contains(value, ".lan") || strings.Contains(value, "localhost") {
+			return localProviderFallback(p.Name(), obs, p.apiKey == ""), nil
+		}
+	}
 	if p.apiKey == "" {
-		return investigation.ProviderResult{
-			Provider: p.Name(),
-			Status:   "skipped_no_api_key",
-			Verdict:  "unknown",
-			Summary:  "VT_API_KEY not set",
-			Data:     map[string]any{},
-		}, nil
+		return localProviderFallback(p.Name(), obs, true), nil
 	}
 
 	path := ""

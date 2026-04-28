@@ -19,6 +19,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/mail"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -54,6 +55,7 @@ const (
 	defaultApprovalsSubj     = "rsiem.response.approvals"
 	defaultNATSURL           = "nats://127.0.0.1:4222"
 	defaultMasterConfig      = "configs/master.yaml"
+	defaultLabConfig         = "configs/labs/eve_ng_soc_lab.yaml"
 	defaultStepFastSubject   = "rsiem.response.steps.fast"
 	defaultInvestigationSubj = "rsiem.investigation.enrich.requested"
 	defaultAgentCommandSub   = "rsiem.agent.command"
@@ -84,6 +86,7 @@ type masterROEConfig struct {
 type serverConfig struct {
 	Addr           string
 	MasterConfig   string
+	LabConfig      string
 	RunsPath       string
 	StepsPath      string
 	MasterLogPath  string
@@ -131,11 +134,17 @@ type app struct {
 }
 
 type assetInventoryEntry struct {
-	Environment string
-	Criticality string
-	Owner       string
-	Team        string
-	Role        string
+	Environment       string
+	Criticality       string
+	Owner             string
+	Team              string
+	Role              string
+	Zone              string
+	LabID             string
+	ResponseTarget    bool
+	LogSource         bool
+	TrafficSource     bool
+	AttackerSimulator bool
 }
 
 type identityInventoryEntry struct {
@@ -215,13 +224,19 @@ type dashboardHintsConfig struct {
 		Assets struct {
 			DefaultEnvironment string `yaml:"default_environment"`
 			Nodes              []struct {
-				NodeID        string `yaml:"node_id"`
-				TargetAgentID string `yaml:"target_agent_id"`
-				Environment   string `yaml:"environment"`
-				Criticality   string `yaml:"criticality"`
-				Owner         string `yaml:"owner"`
-				Team          string `yaml:"team"`
-				Role          string `yaml:"role"`
+				NodeID            string `yaml:"node_id"`
+				TargetAgentID     string `yaml:"target_agent_id"`
+				Environment       string `yaml:"environment"`
+				Criticality       string `yaml:"criticality"`
+				Owner             string `yaml:"owner"`
+				Team              string `yaml:"team"`
+				Role              string `yaml:"role"`
+				Zone              string `yaml:"zone"`
+				LabID             string `yaml:"lab_id"`
+				ResponseTarget    bool   `yaml:"response_target"`
+				LogSource         bool   `yaml:"log_source"`
+				TrafficSource     bool   `yaml:"traffic_source"`
+				AttackerSimulator bool   `yaml:"attacker_simulator"`
 			} `yaml:"nodes"`
 		} `yaml:"assets"`
 		Identity struct {
@@ -969,10 +984,12 @@ type auditEntry struct {
 }
 
 type uiUser struct {
-	Username     string `json:"username"`
-	PasswordHash string `json:"password_hash"`
-	Role         string `json:"role"`
-	Disabled     bool   `json:"disabled,omitempty"`
+	Username            string `json:"username"`
+	PasswordHash        string `json:"password_hash"`
+	Role                string `json:"role"`
+	Email               string `json:"email,omitempty"`
+	NotificationEnabled bool   `json:"notifications_enabled,omitempty"`
+	Disabled            bool   `json:"disabled,omitempty"`
 }
 
 type authClaims struct {
@@ -1028,6 +1045,7 @@ func main() {
 	cfg := serverConfig{}
 	flag.StringVar(&cfg.Addr, "addr", defaultAPIAddr, "UI API listen address")
 	flag.StringVar(&cfg.MasterConfig, "master-config", defaultMasterConfig, "Path to master config")
+	flag.StringVar(&cfg.LabConfig, "lab-config", defaultLabConfig, "Path to lab config")
 	flag.StringVar(&cfg.RunsPath, "runs-path", defaultRunsPath, "Path to roe runs JSONL")
 	flag.StringVar(&cfg.StepsPath, "steps-path", defaultStepsPath, "Path to roe steps JSONL")
 	flag.StringVar(&cfg.MasterLogPath, "master-log-path", defaultMasterLogPath, "Path to master log JSONL")
@@ -1109,6 +1127,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	mailSettings := loadMailSettings()
+	notifier, nErr := newNotificationManager(a, logger, mailSettings)
+	if nErr != nil {
+		logger.Warn("ui_notifications_unavailable", slog.String("error", nErr.Error()))
+	} else if notifier != nil {
+		go notifier.Run(context.Background())
+	}
+
 	if cfg.DBDSN != "" {
 		db, dErr := sql.Open("postgres", cfg.DBDSN)
 		if dErr == nil {
@@ -1169,6 +1195,11 @@ func main() {
 	mux.HandleFunc("GET /api/honeypot/profile", a.withAuthRole(a.handleHoneypotProfile, "analyst"))
 	mux.HandleFunc("GET /api/infrastructure/topology", a.withAuthRole(a.handleInfrastructureTopology, "analyst"))
 	mux.HandleFunc("POST /api/infrastructure/eve/nodes/{node_id}/{action}", a.withAuthRole(a.handleInfrastructureEveNodeAction, "admin"))
+	mux.HandleFunc("GET /api/labs", a.withAuthRole(a.handleLabCatalog, "analyst"))
+	mux.HandleFunc("GET /api/labs/{lab_id}", a.withAuthRole(a.handleLabTopology, "analyst"))
+	mux.HandleFunc("GET /api/labs/{lab_id}/events", a.withAuthRole(a.handleLabEvents, "analyst"))
+	mux.HandleFunc("GET /api/labs/{lab_id}/incidents", a.withAuthRole(a.handleLabIncidents, "analyst"))
+	mux.HandleFunc("GET /api/labs/{lab_id}/actions", a.withAuthRole(a.handleLabActions, "analyst"))
 	mux.HandleFunc("GET /api/entities/ip/{ip}", a.withAuthRole(a.handleEntityIP, "analyst"))
 	mux.HandleFunc("GET /api/entities/user/{user}", a.withAuthRole(a.handleEntityUser, "analyst"))
 	mux.HandleFunc("GET /api/stream", a.withAuthRole(a.handleStream, "analyst"))
@@ -1398,11 +1429,17 @@ func loadDashboardHints(path string) (
 	assetByTargetAgent := make(map[string]assetInventoryEntry, len(cfg.Policies.Assets.Nodes))
 	for _, node := range cfg.Policies.Assets.Nodes {
 		entry := assetInventoryEntry{
-			Environment: strings.TrimSpace(node.Environment),
-			Criticality: strings.TrimSpace(node.Criticality),
-			Owner:       strings.TrimSpace(node.Owner),
-			Team:        strings.TrimSpace(node.Team),
-			Role:        strings.TrimSpace(node.Role),
+			Environment:       strings.TrimSpace(node.Environment),
+			Criticality:       strings.TrimSpace(node.Criticality),
+			Owner:             strings.TrimSpace(node.Owner),
+			Team:              strings.TrimSpace(node.Team),
+			Role:              strings.TrimSpace(node.Role),
+			Zone:              strings.TrimSpace(node.Zone),
+			LabID:             strings.TrimSpace(node.LabID),
+			ResponseTarget:    node.ResponseTarget,
+			LogSource:         node.LogSource,
+			TrafficSource:     node.TrafficSource,
+			AttackerSimulator: node.AttackerSimulator,
 		}
 		if key := normalizeInventoryKey(node.NodeID); key != "" {
 			assetByNodeID[key] = entry
@@ -1736,8 +1773,10 @@ func (a *app) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true,
 		"user": map[string]any{
-			"username": user.Username,
-			"role":     user.Role,
+			"username":              user.Username,
+			"role":                  user.Role,
+			"email":                 user.Email,
+			"notifications_enabled": user.NotificationEnabled,
 		},
 		"token": token,
 	})
@@ -1760,8 +1799,10 @@ func (a *app) handleAuthMe(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true,
 		"user": map[string]any{
-			"username": roleCtx.Username,
-			"role":     roleCtx.Role,
+			"username":              roleCtx.Username,
+			"role":                  roleCtx.Role,
+			"email":                 a.userEmail(roleCtx.Username),
+			"notifications_enabled": a.userNotificationEnabled(roleCtx.Username),
 		},
 	})
 }
@@ -1800,6 +1841,11 @@ func (a *app) handleMeta(w http.ResponseWriter, _ *http.Request) {
 			{"method": "GET", "path": "/api/search/events", "summary": "Fielded analyst search across normalized events", "query": []string{"q", "from", "to", "node_id", "user_name", "src_ip", "dst_ip", "dst_port", "protocol_family", "source_type", "event_type", "rule_id", "severity", "comm", "exec_path", "cmdline", "dns_name", "file_sha256", "exec_sha256", "event_idem_key", "raw_line_sha256", "page", "limit", "sort"}},
 			{"method": "GET", "path": "/api/infrastructure/topology", "summary": "Emulated infrastructure topology with live incident, event, collector, and action overlays", "query": []string{"from", "to"}},
 			{"method": "POST", "path": "/api/infrastructure/eve/nodes/{node_id}/{action}", "summary": "Admin-only EVE-NG node control action", "path_params": []string{"node_id", "action"}},
+			{"method": "GET", "path": "/api/labs", "summary": "List configured emulated labs"},
+			{"method": "GET", "path": "/api/labs/{lab_id}", "summary": "Lab topology, node state, recent incidents, actions, and detections", "path_params": []string{"lab_id"}, "query": []string{"from", "to"}},
+			{"method": "GET", "path": "/api/labs/{lab_id}/events", "summary": "Lab-scoped event search with topology enrichment", "path_params": []string{"lab_id"}, "query": []string{"from", "to", "zone", "node_id", "src_node_id", "dst_node_id", "source_type", "event_type", "severity", "protocol_family", "service", "traffic_class", "rule_id", "q", "page", "limit", "sort"}},
+			{"method": "GET", "path": "/api/labs/{lab_id}/incidents", "summary": "Lab-scoped incidents and alerts", "path_params": []string{"lab_id"}, "query": []string{"from", "to", "node_id", "zone", "severity", "status", "limit"}},
+			{"method": "GET", "path": "/api/labs/{lab_id}/actions", "summary": "Lab-scoped response action ledger", "path_params": []string{"lab_id"}, "query": []string{"from", "to", "node_id", "status", "action_name", "limit"}},
 			{"method": "GET", "path": "/api/models", "summary": "List editable rule/playbook/approval models (admin only)"},
 			{"method": "GET", "path": "/api/models/{kind}/{id}", "summary": "Load editable model detail (admin only)"},
 			{"method": "POST", "path": "/api/models/{kind}/{id}/validate", "summary": "Validate a staged model change (admin only)"},
@@ -6138,6 +6184,7 @@ func (a *app) collectAuditEntries(roleCtx roleContext, q string, fromMs, toMs in
 	entries = append(entries, parseAuditLog(a.cfg.MasterLogPath, "master")...)
 	entries = append(entries, parseAuditLog(a.cfg.UIAPILogPath, "ui-api")...)
 	entries = append(entries, a.parseUIStateAudit()...)
+	entries = append(entries, a.parseNotificationAudit()...)
 	entries = append(entries, a.parseResponseActionAudit()...)
 	filtered := make([]auditEntry, 0, len(entries))
 	for _, entry := range entries {
@@ -7132,9 +7179,11 @@ func (a *app) handleAdminUsersList(w http.ResponseWriter, _ *http.Request) {
 	items := make([]map[string]any, 0, len(a.users))
 	for _, user := range a.users {
 		items = append(items, map[string]any{
-			"username": user.Username,
-			"role":     user.Role,
-			"disabled": user.Disabled,
+			"username":              user.Username,
+			"role":                  user.Role,
+			"email":                 user.Email,
+			"notifications_enabled": user.NotificationEnabled,
+			"disabled":              user.Disabled,
 		})
 	}
 	sort.SliceStable(items, func(i, j int) bool { return strVal(items[i]["username"]) < strVal(items[j]["username"]) })
@@ -7143,10 +7192,12 @@ func (a *app) handleAdminUsersList(w http.ResponseWriter, _ *http.Request) {
 
 func (a *app) handleAdminUsersUpsert(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
-		Role     string `json:"role"`
-		Disabled bool   `json:"disabled"`
+		Username            string `json:"username"`
+		Password            string `json:"password"`
+		Role                string `json:"role"`
+		Email               string `json:"email"`
+		NotificationEnabled bool   `json:"notifications_enabled"`
+		Disabled            bool   `json:"disabled"`
 	}
 	if err := decodeJSONBody(r.Body, &body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
@@ -7162,10 +7213,25 @@ func (a *app) handleAdminUsersUpsert(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "role must be admin or analyst"})
 		return
 	}
+	email := strings.TrimSpace(body.Email)
+	if email != "" {
+		addr, err := mail.ParseAddress(email)
+		if err != nil || strings.TrimSpace(addr.Address) == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "email is invalid"})
+			return
+		}
+		email = strings.ToLower(strings.TrimSpace(addr.Address))
+	}
+	if body.NotificationEnabled && email == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "email is required when notifications are enabled"})
+		return
+	}
 	a.usersMu.Lock()
 	user, exists := a.users[username]
 	user.Username = username
 	user.Role = role
+	user.Email = email
+	user.NotificationEnabled = body.NotificationEnabled
 	user.Disabled = body.Disabled
 	if strings.TrimSpace(body.Password) != "" {
 		hash, err := bcrypt.GenerateFromPassword([]byte(body.Password), bcrypt.DefaultCost)
@@ -7186,8 +7252,8 @@ func (a *app) handleAdminUsersUpsert(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-	a.logger.Info("ui_user_upserted", "username", username, "role", role, "disabled", body.Disabled, "actor", roleFromRequest(r).Username)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "username": username, "role": role, "disabled": body.Disabled})
+	a.logger.Info("ui_user_upserted", "username", username, "role", role, "email", email, "notifications_enabled", body.NotificationEnabled, "disabled", body.Disabled, "actor", roleFromRequest(r).Username)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "username": username, "role": role, "email": email, "notifications_enabled": body.NotificationEnabled, "disabled": body.Disabled})
 }
 
 func (a *app) handleAdminUsersDisable(w http.ResponseWriter, r *http.Request) {
@@ -7347,6 +7413,7 @@ func (a *app) loadUsers() error {
 		}
 		u.Username = name
 		u.Role = role
+		u.Email = strings.ToLower(strings.TrimSpace(u.Email))
 		a.users[name] = u
 	}
 	if len(a.users) == 0 {
@@ -7374,6 +7441,24 @@ func (a *app) saveUsers() error {
 		return err
 	}
 	return os.WriteFile(a.cfg.UsersPath, append(data, '\n'), 0o644)
+}
+
+func (a *app) userEmail(username string) string {
+	a.usersMu.RLock()
+	defer a.usersMu.RUnlock()
+	if user, ok := a.users[strings.ToLower(strings.TrimSpace(username))]; ok {
+		return user.Email
+	}
+	return ""
+}
+
+func (a *app) userNotificationEnabled(username string) bool {
+	a.usersMu.RLock()
+	defer a.usersMu.RUnlock()
+	if user, ok := a.users[strings.ToLower(strings.TrimSpace(username))]; ok {
+		return user.NotificationEnabled
+	}
+	return false
 }
 
 func (a *app) signSessionToken(claims authClaims) (string, error) {
@@ -7645,6 +7730,52 @@ func (a *app) parseResponseActionAudit() []auditEntry {
 				"status_detail": strVal(obj["status_detail"]),
 			},
 			Source: "ui-response-actions",
+		})
+	})
+	return entries
+}
+
+func (a *app) notificationsStatePath() string {
+	return filepath.Join(a.cfg.UIStateDir, "notifications.jsonl")
+}
+
+func (a *app) parseNotificationAudit() []auditEntry {
+	entries := make([]auditEntry, 0, 128)
+	_ = scanJSONLines(a.notificationsStatePath(), func(obj map[string]any) {
+		trigger := strVal(obj["trigger"])
+		if trigger == "" {
+			return
+		}
+		outcome := strVal(obj["outcome"])
+		msg := "ui_notification_" + outcome
+		entries = append(entries, auditEntry{
+			TS:       strVal(obj["ts"]),
+			Msg:      msg,
+			RunID:    strVal(obj["run_id"]),
+			Actor:    strVal(obj["recipient"]),
+			Decision: strVal(obj["trigger"]),
+			Status:   strVal(obj["status"]),
+			Details: map[string]any{
+				"email":                     strVal(obj["email"]),
+				"role":                      strVal(obj["role"]),
+				"trigger":                   strVal(obj["trigger"]),
+				"reason":                    strVal(obj["reason"]),
+				"severity":                  strVal(obj["severity"]),
+				"rule_id":                   strVal(obj["rule_id"]),
+				"playbook_id":               strVal(obj["playbook_id"]),
+				"node_id":                   strVal(obj["node_id"]),
+				"target_agent_id":           strVal(obj["target_agent_id"]),
+				"summary":                   strVal(obj["summary"]),
+				"link":                      strVal(obj["link"]),
+				"subject":                   strVal(obj["subject"]),
+				"outcome":                   outcome,
+				"dedupe_key":                strVal(obj["dedupe_key"]),
+				"approval_required":         boolVal(obj["approval_required"], false),
+				"manual_follow_up_required": boolVal(obj["manual_follow_up_required"], false),
+				"provider":                  strVal(obj["provider"]),
+				"error":                     strVal(obj["error"]),
+			},
+			Source: "ui-notifications",
 		})
 	})
 	return entries

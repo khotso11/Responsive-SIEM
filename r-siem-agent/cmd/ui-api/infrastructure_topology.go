@@ -654,6 +654,10 @@ func loadEveNGTopology(spec infrastructureLabFile, specPath string) (eveNGTopolo
 		return eveNGTopologyImport{}, provider
 	}
 	provider.SourceStatus = "configured"
+	if status, detail := infrastructureCollectorOverrideStatus(spec); status != "" {
+		provider.SourceStatus = status
+		provider.SourceDetail = detail
+	}
 	if !strings.EqualFold(provider.Kind, "eve_ng") {
 		provider.SourceDetail = "provider configured but not EVE-NG"
 		return eveNGTopologyImport{}, provider
@@ -721,7 +725,52 @@ func loadEveNGTopology(spec infrastructureLabFile, specPath string) (eveNGTopolo
 	sort.SliceStable(imported.Links, func(i, j int) bool { return imported.Links[i].ID < imported.Links[j].ID })
 	provider.SourceStatus = "imported"
 	provider.SourceDetail = importPath
+	if status, detail := infrastructureCollectorOverrideStatus(spec); status != "" {
+		provider.SourceStatus = status
+		if provider.SourceDetail != "" {
+			provider.SourceDetail = provider.SourceDetail + "; " + detail
+		} else {
+			provider.SourceDetail = detail
+		}
+	}
 	return imported, provider
+}
+
+func infrastructureCollectorOverrideStatus(spec infrastructureLabFile) (string, string) {
+	needsOverride := false
+	check := func(value string) {
+		if strings.Contains(value, defaultInfrastructureCollectorHost) {
+			needsOverride = true
+		}
+	}
+	check(spec.ManagementPlane.Master.IP)
+	check(spec.ManagementPlane.Master.MgmtIP)
+	for _, ip := range spec.ManagementPlane.Master.DataIPs {
+		check(ip)
+	}
+	for _, endpoint := range spec.ManagementPlane.Master.CollectorTargets {
+		check(endpoint)
+	}
+	for _, node := range spec.Nodes {
+		check(node.IP)
+		check(node.MgmtIP)
+		for _, ip := range node.DataIPs {
+			check(ip)
+		}
+		for _, endpoint := range node.CollectorTargets {
+			check(endpoint)
+		}
+		for _, export := range node.TelemetryExports {
+			check(export.Destination)
+		}
+	}
+	if !needsOverride {
+		return "", ""
+	}
+	if strings.TrimSpace(os.Getenv("RSIEM_INFRA_HOST_COLLECTOR_IP")) != "" {
+		return "", ""
+	}
+	return "needs_host_collector_ip", "set RSIEM_INFRA_HOST_COLLECTOR_IP to rewrite the logical collector anchor 10.10.0.10 to the real host IP reachable from EVE-NG"
 }
 
 func mergeEveRuntime(live infrastructureTopologyNodeLive, node infrastructureTopologyNodeView, runtime eveNGRuntimeView) infrastructureTopologyNodeLive {

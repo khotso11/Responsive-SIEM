@@ -164,6 +164,17 @@ func main() {
 	)
 	triggerDedupe := pipeline.NewTriggerDedupe(triggerDedupeCfg, time.Now().UnixMilli)
 
+	dbSink, err := newNormalizedEventDBSink(logger, cfg.DB)
+	if err != nil {
+		logger.Error("normalized_event_db_init_failed", slog.String("error", err.Error()))
+		if cfg.DB.FailClosed {
+			os.Exit(1)
+		}
+	}
+	if dbSink != nil {
+		defer dbSink.Close()
+	}
+
 	rceCfg, err := loadRCEConfig(*configPath)
 	if err != nil {
 		logger.Error("rce_config_load_failed", slog.String("error", err.Error()))
@@ -231,7 +242,7 @@ func main() {
 			wg.Add(1)
 			go func(p consumerParams, sub *nats.Subscription) {
 				defer wg.Done()
-				runWorker(ctx, logger, sub, p.lane, cfg.JetStream.Stream, rce, cfg.Consumer.PullBatch, time.Duration(cfg.Consumer.PullTimeoutMs)*time.Millisecond)
+				runWorker(ctx, logger, sub, p.lane, cfg.JetStream.Stream, rce, dbSink, cfg.Consumer.PullBatch, time.Duration(cfg.Consumer.PullTimeoutMs)*time.Millisecond)
 			}(p, sub)
 		}
 	}
@@ -252,7 +263,7 @@ func ensureConsumer(js nats.JetStreamContext, stream, subject, durable string) e
 	return nil
 }
 
-func runWorker(ctx context.Context, logger *slog.Logger, sub *nats.Subscription, lane string, stream string, rce *RCE, batch int, timeout time.Duration) {
+func runWorker(ctx context.Context, logger *slog.Logger, sub *nats.Subscription, lane string, stream string, rce *RCE, dbSink *normalizedEventDBSink, batch int, timeout time.Duration) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -270,12 +281,12 @@ func runWorker(ctx context.Context, logger *slog.Logger, sub *nats.Subscription,
 		}
 
 		for _, msg := range msgs {
-			processMsg(logger, msg, lane, stream, rce)
+			processMsg(logger, msg, lane, stream, rce, dbSink)
 		}
 	}
 }
 
-func processMsg(logger *slog.Logger, msg *nats.Msg, lane string, stream string, rce *RCE) {
+func processMsg(logger *slog.Logger, msg *nats.Msg, lane string, stream string, rce *RCE, dbSink *normalizedEventDBSink) {
 	meta, err := msg.Metadata()
 	jsSeqVal := uint64(0)
 	var jsSeq *uint64
@@ -307,7 +318,7 @@ func processMsg(logger *slog.Logger, msg *nats.Msg, lane string, stream string, 
 		slog.String("subject", msg.Subject),
 	)
 
-	if err := emitNormalizedEvents(logger, msg.Subject, stream, jsSeq, lane, &batch, rce); err != nil {
+	if err := emitNormalizedEvents(logger, msg.Subject, stream, jsSeq, lane, &batch, rce, dbSink); err != nil {
 		return
 	}
 
@@ -320,7 +331,7 @@ func processMsg(logger *slog.Logger, msg *nats.Msg, lane string, stream string, 
 	}
 }
 
-func emitNormalizedEvents(logger *slog.Logger, subject string, stream string, jsSeq *uint64, fallbackLane string, batch *pb.Batch, rce *RCE) error {
+func emitNormalizedEvents(logger *slog.Logger, subject string, stream string, jsSeq *uint64, fallbackLane string, batch *pb.Batch, rce *RCE, dbSink *normalizedEventDBSink) error {
 	lane := deriveLane(batch.GetLane(), subject, fallbackLane)
 	seqStart := batch.GetSeqStart()
 	seqEnd := batch.GetSeqEnd()
@@ -359,6 +370,13 @@ func emitNormalizedEvents(logger *slog.Logger, subject string, stream string, js
 		}
 		if preview, ok := previewText(record, 200); ok {
 			normalized["preview"] = preview
+		}
+
+		if dbSink != nil {
+			dbRec := buildNormalizedEventDBRecord(record, observedAt, agentID, lane, stream, subject, seqStart, seqEnd, i, eventCount, recordType, jsonTS, jsonFields)
+			if err := dbSink.Insert(dbRec); err != nil {
+				return err
+			}
 		}
 
 		fields := []slog.Attr{

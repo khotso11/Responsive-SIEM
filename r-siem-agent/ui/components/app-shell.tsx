@@ -12,6 +12,7 @@ const NAV = [
   { href: "/", label: "Dashboard", icon: BarChart3 },
   { href: "/incidents", label: "Incidents", icon: ListChecks },
   { href: "/endpoints", label: "Endpoints", icon: Activity },
+  { href: "/lab", label: "Lab", icon: Clock3 },
   { href: "/actions", label: "Actions", icon: Zap },
   { href: "/search", label: "Search", icon: Search },
   { href: "/audit", label: "Audit", icon: ShieldCheck }

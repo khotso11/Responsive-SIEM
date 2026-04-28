@@ -1,0 +1,472 @@
+provider:
+  kind: eve_ng
+  name: eve-ng-soc-lab
+  ui_url: ""
+  api_base_url: ""
+  api_lab_path: /R-SIEM.unl
+  username_env: RSIEM_EVE_NG_USERNAME
+  password_env: RSIEM_EVE_NG_PASSWORD
+  allow_insecure_tls: false
+  project_path: ""
+  lab_file: ""
+  topology_import_path: configs/labs/eve_ng_rsiem_infrastructure.unl
+  notes: >-
+    Emulated SOC lab for R-SIEM. The topology is managed through YAML and
+    overlaid on the existing R-SIEM UI. Configure the EVE-NG URL and lab path
+    through environment variables when runtime polling is available.
+
+lab:
+  id: eve-ng-soc-lab-v1
+  name: EVE-NG SOC Emulated Lab
+  description: >-
+    Segmented emulated network with firewall, DMZ web host, internal server,
+    user workstation, and future attacker/scanner support.
+  status: active
+  version: v1
+
+zones:
+  - id: wan
+    name: WAN / UNTRUSTED
+    cidr: 10.10.10.0/24
+    purpose: Untrusted ingress, hostile or external traffic, and firewall outside interface.
+    color: "#7c2d12"
+    order: 1
+  - id: dmz
+    name: DMZ
+    cidr: 10.10.20.0/24
+    purpose: Exposed web services and perimeter-facing assets.
+    color: "#7c3aed"
+    order: 2
+  - id: users
+    name: USERS
+    cidr: 10.10.30.0/24
+    purpose: User workstation activity and lateral movement starting point.
+    color: "#0f766e"
+    order: 3
+  - id: servers
+    name: SERVERS
+    cidr: 10.10.40.0/24
+    purpose: Internal application services and east-west test targets.
+    color: "#1d4ed8"
+    order: 4
+
+nodes:
+  - id: FW-EDGE-1
+    label: FW-EDGE-1
+    eve_node_name: FW-EDGE-1
+    role: firewall_gateway
+    zone: wan
+    os: opnsense
+    state: running
+    service_state: unknown
+    ip: 10.10.10.1/24
+    ips:
+      - 10.10.20.1/24
+      - 10.10.30.1/24
+      - 10.10.40.1/24
+    position_left: 180
+    position_top: 130
+    notes: OPNsense gateway between all lab zones.
+    services:
+      - name: firewall_policy
+        protocol: tcp
+        port: 443
+        exposure: management
+        notes: Web GUI and policy enforcement point.
+      - name: syslog
+        protocol: udp
+        port: 514
+        exposure: log_source
+        notes: Firewall logs are forwarded to the R-SIEM collector.
+    data_roles:
+      - policy_enforcement
+      - gateway
+      - firewall_logs
+    expected_behaviors:
+      - zone routing
+      - deny logging
+      - policy enforcement
+    connectivity:
+      - wan
+      - dmz
+      - users
+      - servers
+    source_roles:
+      - firewall_log_source
+      - control_plane_device
+    response_target: true
+    log_source: true
+    traffic_source: true
+    managed: true
+    enabled: true
+
+  - id: DMZ-WEB-1
+    label: DMZ-WEB-1
+    eve_node_name: DMZ-WEB-1
+    role: dmz_web_host
+    zone: dmz
+    os: ubuntu
+    state: running
+    service_state: running
+    ip: 10.10.20.10/24
+    position_left: 420
+    position_top: 55
+    notes: DMZ web host running a simple HTTP service on port 8080.
+    services:
+      - name: http
+        protocol: tcp
+        port: 8080
+        path: /
+        exposure: dmz_service
+        expected_sources:
+          - users
+          - wan
+        notes: Used for web access, directory listing, and simple service logging.
+    data_roles:
+      - web_service
+      - auth_log_source
+      - system_log_source
+    expected_behaviors:
+      - accept user web access
+      - emit web access logs
+      - emit system/auth logs
+    connectivity:
+      - fw-edge-1
+      - srv-app-1
+    source_roles:
+      - web_log_source
+      - system_log_source
+    response_target: true
+    log_source: true
+    traffic_source: false
+    managed: true
+    enabled: true
+
+  - id: SRV-APP-1
+    label: SRV-APP-1
+    eve_node_name: SRV-APP-1
+    role: internal_server
+    zone: servers
+    os: ubuntu
+    state: running
+    service_state: running
+    ip: 10.10.40.10/24
+    position_left: 650
+    position_top: 235
+    notes: Internal server host running a simple HTTP service on port 8080.
+    services:
+      - name: http
+        protocol: tcp
+        port: 8080
+        path: /
+        exposure: internal_service
+        expected_sources:
+          - users
+          - dmz
+        notes: Used for internal service access and temporary scanner/probing activity.
+    data_roles:
+      - application_service
+      - system_log_source
+      - auth_log_source
+    expected_behaviors:
+      - serve internal HTTP
+      - emit system/auth logs
+      - support temporary scan activity
+    connectivity:
+      - fw-edge-1
+      - dmz-web-1
+    source_roles:
+      - app_log_source
+      - system_log_source
+      - temporary_scan_host
+    response_target: true
+    log_source: true
+    traffic_source: true
+    managed: true
+    enabled: true
+
+  - id: USR-WS-1
+    label: USR-WS-1
+    eve_node_name: USR-WS-1
+    role: user_workstation
+    zone: users
+    os: vpcs
+    state: running
+    service_state: limited
+    ip: 10.10.30.10/24
+    position_left: 420
+    position_top: 320
+    notes: VPCS workstation with limited host telemetry; best represented through synthetic activity.
+    data_roles:
+      - user_workstation
+      - icmp_source
+      - synthetic_event_source
+    expected_behaviors:
+      - ping gateway
+      - generate simple connectivity activity
+      - produce synthetic workstation events
+    connectivity:
+      - fw-edge-1
+      - dmz-web-1
+      - srv-app-1
+    source_roles:
+      - icmp_source
+      - synthetic_log_source
+      - traffic_source
+    response_target: true
+    log_source: false
+    traffic_source: true
+    managed: false
+    enabled: true
+
+  - id: ATTACKER-SCAN-1
+    label: ATTACKER-SCAN-1
+    eve_node_name: ATTACKER-SCAN-1
+    role: attacker_simulator
+    zone: wan
+    os: ubuntu
+    state: planned
+    service_state: unavailable
+    ip: 10.10.10.50/24
+    position_left: 80
+    position_top: 220
+    notes: Future lightweight attacker/scanner node. Keep disabled until resources permit.
+    data_roles:
+      - attacker
+      - scan_source
+    expected_behaviors:
+      - host discovery
+      - repeated port probing
+      - basic scan bursts
+    connectivity:
+      - fw-edge-1
+      - dmz-web-1
+      - srv-app-1
+    source_roles:
+      - attacker_simulator
+      - reconnaissance_source
+    response_target: false
+    log_source: false
+    traffic_source: true
+    attacker_simulator: true
+    managed: false
+    enabled: false
+
+links:
+  - id: wan-edge
+    label: WAN to edge firewall
+    zone: wan
+    kind: policy_boundary
+    endpoints:
+      - FW-EDGE-1
+      - ATTACKER-SCAN-1
+  - id: dmz-edge
+    label: DMZ to edge firewall
+    zone: dmz
+    kind: service_path
+    endpoints:
+      - FW-EDGE-1
+      - DMZ-WEB-1
+  - id: users-edge
+    label: Users to edge firewall
+    zone: users
+    kind: service_path
+    endpoints:
+      - FW-EDGE-1
+      - USR-WS-1
+  - id: servers-edge
+    label: Servers to edge firewall
+    zone: servers
+    kind: service_path
+    endpoints:
+      - FW-EDGE-1
+      - SRV-APP-1
+  - id: dmz-internal
+    label: DMZ to server path
+    zone: dmz
+    kind: east_west
+    endpoints:
+      - DMZ-WEB-1
+      - SRV-APP-1
+
+collection:
+  - node_id: FW-EDGE-1
+    collector: collector-syslog
+    transport: syslog
+    endpoint: 10.10.0.10:5140
+    source_type: syslog
+    event_types:
+      - syslog
+    required: true
+    status: active
+    notes: Firewall syslog feed from OPNsense.
+  - node_id: FW-EDGE-1
+    collector: collector-netflowv5
+    transport: netflow_v5
+    endpoint: 10.10.0.10:2055
+    source_type: netflow_v5
+    event_types:
+      - netflow_flow
+    required: true
+    status: active
+    notes: Flow telemetry from firewall interfaces.
+  - node_id: FW-EDGE-1
+    collector: collector-snmptrap
+    transport: snmp_trap
+    endpoint: 10.10.0.10:9162
+    source_type: snmp_trap
+    event_types:
+      - snmp_trap
+    required: true
+    status: active
+    notes: Interface and device state traps.
+  - node_id: DMZ-WEB-1
+    collector: rsiem-agent
+    transport: agent
+    endpoint: 10.10.0.10:7777
+    source_type: auditd_exec
+    event_types:
+      - auth
+      - process_exec
+      - file_change
+      - syslog
+    required: true
+    status: planned
+    notes: Ubuntu agent and simple log forwarding when package access is available.
+  - node_id: SRV-APP-1
+    collector: rsiem-agent
+    transport: agent
+    endpoint: 10.10.0.10:7777
+    source_type: auditd_exec
+    event_types:
+      - auth
+      - process_exec
+      - file_change
+      - syslog
+    required: true
+    status: planned
+    notes: Internal server telemetry and temporary scanner support.
+  - node_id: USR-WS-1
+    collector: synthetic-lab-events
+    transport: synthetic
+    endpoint: synthetic
+    source_type: synthetic
+    event_types:
+      - icmp_ping
+      - connectivity
+    required: true
+    status: active
+    notes: VPCS nodes are represented by inferred synthetic signals rather than rich host logs.
+  - node_id: ATTACKER-SCAN-1
+    collector: rsiem-agent
+    transport: agent
+    endpoint: 10.10.0.10:7777
+    source_type: auditd_exec
+    event_types:
+      - recon
+      - netflow_flow
+      - syslog
+    required: false
+    status: planned
+    notes: Optional future attacker/scanner node for richer reconnaissance signals.
+
+signals:
+  - id: host-discovery
+    label: Host discovery / ping sweep
+    description: Repeated pinging or discovery-style connectivity checks from USERS or a future attacker node.
+    severity: medium
+    status: ready
+    zone: users
+    source_node: USR-WS-1
+    dst_node: DMZ-WEB-1
+    source_types:
+      - synthetic
+      - icmp
+    event_types:
+      - icmp_ping
+      - connectivity
+    protocols:
+      - icmp
+    service: icmp
+  - id: port-probing
+    label: TCP port probing
+    description: Repeated access attempts to common ports on DMZ or internal hosts.
+    severity: high
+    status: ready
+    zone: users
+    source_node: SRV-APP-1
+    dst_node: DMZ-WEB-1
+    source_types:
+      - netflow_v5
+      - syslog
+      - synthetic
+    event_types:
+      - netflow_flow
+      - syslog
+    protocols:
+      - tcp
+    service: http
+  - id: users-to-dmz-http
+    label: Users to DMZ HTTP
+    description: Normal HTTP access from the USERS zone to the DMZ web host.
+    severity: low
+    status: expected
+    zone: users
+    source_node: USR-WS-1
+    dst_node: DMZ-WEB-1
+    source_types:
+      - synthetic
+      - netflow_v5
+    event_types:
+      - netflow_flow
+      - connectivity
+    protocols:
+      - tcp
+    service: http
+  - id: users-to-server-admin
+    label: Users to internal server admin ports
+    description: Unexpected user-zone access toward internal server admin or management ports.
+    severity: high
+    status: suspicious
+    zone: users
+    source_node: USR-WS-1
+    dst_node: SRV-APP-1
+    source_types:
+      - netflow_v5
+      - synthetic
+    event_types:
+      - netflow_flow
+      - connectivity
+    protocols:
+      - tcp
+    service: ssh
+  - id: firewall-deny-burst
+    label: Firewall deny burst
+    description: Repeated firewall deny telemetry from OPNsense when policy blocks traffic.
+    severity: high
+    status: ready
+    node_id: FW-EDGE-1
+    source_types:
+      - syslog
+    event_types:
+      - syslog
+    protocols:
+      - tcp
+      - udp
+    service: firewall
+  - id: east-west-recon
+    label: East-west reconnaissance
+    description: Internal scanning or probing between users, DMZ, and servers.
+    severity: high
+    status: ready
+    zone: servers
+    source_node: SRV-APP-1
+    dst_node: DMZ-WEB-1
+    source_types:
+      - netflow_v5
+      - synthetic
+    event_types:
+      - netflow_flow
+    protocols:
+      - tcp
+    service: scan

@@ -596,6 +596,239 @@ export type InfrastructureEveNodeActionResponse = {
   result: InfrastructureEveNodeActionResult;
 };
 
+export type LabZone = {
+  id: string;
+  name: string;
+  cidr: string;
+  purpose: string;
+  color?: string;
+  order?: number;
+  node_ids?: string[];
+};
+
+export type LabService = {
+  name: string;
+  protocol: string;
+  port: number;
+  path?: string;
+  exposure?: string;
+  expected_sources?: string[];
+  notes?: string;
+};
+
+export type LabNodeLive = {
+  status: string;
+  service_state?: string;
+  last_seen_unix_ms?: number;
+  recent_event_count: number;
+  detection_count: number;
+  incident_count: number;
+  open_incident_count: number;
+  active_action_count: number;
+  seen_source_types?: string[];
+  seen_event_types?: string[];
+  seen_zones?: string[];
+  runtime_status?: string;
+  runtime_detail?: string;
+};
+
+export type LabNode = {
+  id: string;
+  label: string;
+  eve_node_name?: string;
+  role: string;
+  zone: string;
+  os?: string;
+  state?: string;
+  service_state?: string;
+  ip?: string;
+  ips?: string[];
+  position_left?: number;
+  position_top?: number;
+  notes?: string;
+  services?: LabService[];
+  data_roles?: string[];
+  expected_behaviors?: string[];
+  connectivity?: string[];
+  source_roles?: string[];
+  response_target?: boolean;
+  log_source?: boolean;
+  traffic_source?: boolean;
+  attacker_simulator?: boolean;
+  managed?: boolean;
+  enabled?: boolean;
+  zone_name?: string;
+  zone_cidr?: string;
+  live: LabNodeLive;
+};
+
+export type LabLink = {
+  id: string;
+  label?: string;
+  zone?: string;
+  endpoints: string[];
+  kind?: string;
+};
+
+export type LabCollectionLive = {
+  recent_event_count: number;
+  last_seen_unix_ms?: number;
+  active: boolean;
+};
+
+export type LabCollection = {
+  node_id: string;
+  collector: string;
+  transport: string;
+  endpoint?: string;
+  source_type: string;
+  event_types?: string[];
+  notes?: string;
+  required?: boolean;
+  status?: string;
+  live: LabCollectionLive;
+};
+
+export type LabSignal = {
+  id: string;
+  label: string;
+  description: string;
+  severity?: string;
+  status?: string;
+  zone?: string;
+  node_id?: string;
+  source_node?: string;
+  dst_node?: string;
+  source_ip?: string;
+  dst_ip?: string;
+  source_types?: string[];
+  event_types?: string[];
+  protocols?: string[];
+  service?: string;
+};
+
+export type LabActivity = {
+  kind: string;
+  ts_unix_ms: number;
+  label: string;
+  status?: string;
+  rule_id?: string;
+  run_id?: string;
+  node_id?: string;
+  source_type?: string;
+  action_id?: string;
+  zone?: string;
+};
+
+export type LabCatalogEntry = {
+  id: string;
+  name: string;
+  description: string;
+  status: string;
+  zone_count: number;
+  node_count: number;
+  response_target_count: number;
+  log_source_count: number;
+  traffic_source_count: number;
+  recent_event_count: number;
+  last_seen_unix_ms?: number;
+  config_path?: string;
+};
+
+export type LabCatalogResponse = {
+  items: LabCatalogEntry[];
+  count: number;
+  source: string;
+};
+
+export type LabEventView = EventRow & {
+  lab_id: string;
+  lab_name: string;
+  zone?: string;
+  source_node_id?: string;
+  source_node_label?: string;
+  source_zone?: string;
+  source_role?: string;
+  destination_node_id?: string;
+  destination_node_label?: string;
+  destination_zone?: string;
+  destination_role?: string;
+  service?: string;
+  traffic_class?: string;
+  expected?: boolean;
+  suspicious?: boolean;
+  policy_violation?: boolean;
+  reconnaissance?: boolean;
+  allowed?: boolean;
+  source_context?: string;
+  destination_context?: string;
+};
+
+export type LabTopologySummary = {
+  window_from_unix_ms: number;
+  window_to_unix_ms: number;
+  zone_count: number;
+  node_count: number;
+  response_target_count: number;
+  log_source_count: number;
+  traffic_source_count: number;
+  attacker_simulator_count: number;
+  recent_event_count: number;
+  recent_incident_count: number;
+  recent_action_count: number;
+  reachable_node_count: number;
+  runnable_node_count: number;
+  expected_service_count: number;
+};
+
+export type LabTopologyResponse = {
+  lab: { id: string; name: string; description: string; status: string; version?: string };
+  provider: InfrastructureTopologyProvider;
+  zones: LabZone[];
+  nodes: LabNode[];
+  links: LabLink[];
+  collection: LabCollection[];
+  signals: LabSignal[];
+  summary: LabTopologySummary;
+  recent_events: LabEventView[];
+  recent_incidents: Incident[];
+  recent_actions: ResponseActionView[];
+  activity: LabActivity[];
+  source: string;
+};
+
+export type LabEventSearchQuery = {
+  q?: string;
+  from?: number;
+  to?: number;
+  zone?: string;
+  node_id?: string;
+  src_node_id?: string;
+  dst_node_id?: string;
+  source_type?: string;
+  event_type?: string;
+  severity?: string;
+  protocol_family?: string;
+  service?: string;
+  traffic_class?: string;
+  rule_id?: string;
+  page?: number;
+  limit?: number;
+  sort?: "recv_desc" | "recv_asc" | "event_desc" | "event_asc";
+};
+
+export type LabEventSearchResponse = {
+  items: LabEventView[];
+  count: number;
+  total: number;
+  page: number;
+  limit: number;
+  sort: string;
+  source: string;
+  available_filters: string[];
+  query: LabEventSearchQuery & { from: number; to: number; page: number; limit: number; sort: string };
+};
+
 export type AuditEntry = {
   ts: string;
   msg: string;
@@ -658,6 +891,16 @@ export type EventSearchResponse = {
 export type AuthUser = {
   username: string;
   role: "admin" | "analyst";
+  email?: string;
+  notifications_enabled?: boolean;
+};
+
+export type AdminUser = {
+  username: string;
+  role: "admin" | "analyst";
+  email?: string;
+  notifications_enabled?: boolean;
+  disabled: boolean;
 };
 
 export type DashboardSummary = {

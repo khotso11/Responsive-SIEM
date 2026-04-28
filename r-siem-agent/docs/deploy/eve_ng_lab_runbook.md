@@ -32,10 +32,15 @@ export RSIEM_EVE_NG_API_LAB_PATH='/R-SIEM/rsiem-infrastructure.unl'
 export RSIEM_EVE_NG_USERNAME='admin'
 export RSIEM_EVE_NG_PASSWORD='<eve-web-password>'
 export RSIEM_EVE_NG_ALLOW_INSECURE_TLS='false'
-export RSIEM_INFRA_HOST_COLLECTOR_IP='<host-ip-reachable-from-eve>'
+export RSIEM_INFRA_HOST_COLLECTOR_IP='192.168.59.1'
 ```
 
 `RSIEM_INFRA_HOST_COLLECTOR_IP` rewrites the logical collector address `10.10.0.10` to the real Ubuntu host address that the EVE VM can reach.
+
+Current validated VMware NAT value:
+
+- host collector IP: `192.168.59.1`
+- EVE VM IP: `192.168.59.128`
 
 Under VMware NAT this is usually the host-side `vmnet8` address. Confirm it on the Ubuntu host instead of guessing:
 
@@ -109,7 +114,7 @@ Configured collector endpoints on the host-side R-SIEM management anchor:
 - NetFlow v5: `<RSIEM_INFRA_HOST_COLLECTOR_IP>:2055`
 - SNMP trap: `<RSIEM_INFRA_HOST_COLLECTOR_IP>:9162`
 
-If `RSIEM_INFRA_HOST_COLLECTOR_IP` is not set, the lab model keeps the logical placeholder `10.10.0.10`. For the live VMware NAT lab, set the override before starting `ui-api` so the topology page and runbook render the real host collector address.
+If `RSIEM_INFRA_HOST_COLLECTOR_IP` is not set, the lab model keeps the logical placeholder `10.10.0.10`. For the live VMware NAT lab in this environment, set the override to `192.168.59.1` before starting `ui-api` so the topology page and runbook render the real host collector address.
 
 ## Demonstration sequence
 

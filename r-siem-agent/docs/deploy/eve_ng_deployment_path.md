@@ -64,7 +64,7 @@ export RSIEM_EVE_NG_API_LAB_PATH='/R-SIEM/rsiem-infrastructure.unl'
 export RSIEM_EVE_NG_USERNAME='admin'
 export RSIEM_EVE_NG_PASSWORD='<eve-web-password>'
 export RSIEM_EVE_NG_ALLOW_INSECURE_TLS='false'
-export RSIEM_INFRA_HOST_COLLECTOR_IP='<host-ip-reachable-from-eve>'
+export RSIEM_INFRA_HOST_COLLECTOR_IP='192.168.59.1'
 ```
 
 The UI API supports these environment overrides directly, and the infrastructure topology loader supports `RSIEM_INFRA_HOST_COLLECTOR_IP` so the management anchor and collector destinations reflect the real Ubuntu host address visible from the EVE VM.

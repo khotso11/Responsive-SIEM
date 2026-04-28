@@ -1218,6 +1218,67 @@ policies:
         owner: "soc"
         team: "security-operations"
         role: "admin-tooling"
+      - node_id: "FW-EDGE-1"
+        target_agent_id: "FW-EDGE-1"
+        environment: "lab"
+        criticality: "high"
+        owner: "soc"
+        team: "security-operations"
+        role: "firewall_gateway"
+        zone: "wan"
+        lab_id: "eve-ng-soc-lab-v1"
+        response_target: true
+        log_source: true
+        traffic_source: true
+      - node_id: "DMZ-WEB-1"
+        target_agent_id: "DMZ-WEB-1"
+        environment: "lab"
+        criticality: "high"
+        owner: "soc"
+        team: "security-operations"
+        role: "dmz_web_host"
+        zone: "dmz"
+        lab_id: "eve-ng-soc-lab-v1"
+        response_target: true
+        log_source: true
+        traffic_source: false
+      - node_id: "SRV-APP-1"
+        target_agent_id: "SRV-APP-1"
+        environment: "lab"
+        criticality: "high"
+        owner: "soc"
+        team: "security-operations"
+        role: "internal_server"
+        zone: "servers"
+        lab_id: "eve-ng-soc-lab-v1"
+        response_target: true
+        log_source: true
+        traffic_source: true
+      - node_id: "USR-WS-1"
+        target_agent_id: "USR-WS-1"
+        environment: "lab"
+        criticality: "medium"
+        owner: "soc"
+        team: "security-operations"
+        role: "user_workstation"
+        zone: "users"
+        lab_id: "eve-ng-soc-lab-v1"
+        response_target: true
+        log_source: false
+        traffic_source: true
+      - node_id: "ATTACKER-SCAN-1"
+        target_agent_id: "ATTACKER-SCAN-1"
+        environment: "lab"
+        criticality: "high"
+        owner: "soc"
+        team: "security-operations"
+        role: "attacker_simulator"
+        zone: "wan"
+        lab_id: "eve-ng-soc-lab-v1"
+        response_target: false
+        log_source: false
+        traffic_source: true
+        attacker_simulator: true
 
   identity:
     privileged_users:

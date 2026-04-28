@@ -18,15 +18,21 @@ import {
   InvestigationProvidersResponse,
   InfrastructureTopologyResponse,
   InfrastructureEveNodeActionResponse,
+  LabCatalogResponse,
+  LabEventSearchQuery,
+  LabEventSearchResponse,
+  LabTopologyResponse,
   InvestigationResponse,
   ModelCatalogResponse,
   ModelDetailResponse,
   ModelEditorPatch,
   ModelProposalsResponse,
   ModelValidationResponse,
+  AdminUser,
   ResponseHistoryResponse,
   ResponseActionFleetResponse,
   ResponseActionListResponse,
+  ResponseActionView,
   ResponseActionTargetDraft,
   SearchResponse,
   StepResult
@@ -394,6 +400,50 @@ export async function getInfrastructureTopology(from?: number, to?: number): Pro
   return apiFetch(`/api/infrastructure/topology${qs.toString() ? `?${qs.toString()}` : ""}`);
 }
 
+export async function getLabCatalog(from?: number, to?: number): Promise<LabCatalogResponse> {
+  const qs = new URLSearchParams();
+  if (from) qs.set("from", String(from));
+  if (to) qs.set("to", String(to));
+  return apiFetch(`/api/labs${qs.toString() ? `?${qs.toString()}` : ""}`);
+}
+
+export async function getLabTopology(labID: string, from?: number, to?: number): Promise<LabTopologyResponse> {
+  const qs = new URLSearchParams();
+  if (from) qs.set("from", String(from));
+  if (to) qs.set("to", String(to));
+  return apiFetch(`/api/labs/${encodeURIComponent(labID)}${qs.toString() ? `?${qs.toString()}` : ""}`);
+}
+
+export async function getLabEvents(labID: string, query: LabEventSearchQuery = {}): Promise<LabEventSearchResponse> {
+  const qs = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) {
+    if (value !== undefined && value !== null && String(value).trim() !== "") {
+      qs.set(key, String(value));
+    }
+  }
+  return apiFetch(`/api/labs/${encodeURIComponent(labID)}/events${qs.toString() ? `?${qs.toString()}` : ""}`);
+}
+
+export async function getLabIncidents(labID: string, query: Record<string, string | number | undefined> = {}): Promise<{ items: Incident[]; count: number; total: number; from: number; to: number; source: string }> {
+  const qs = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) {
+    if (value !== undefined && value !== null && String(value).trim() !== "") {
+      qs.set(key, String(value));
+    }
+  }
+  return apiFetch(`/api/labs/${encodeURIComponent(labID)}/incidents${qs.toString() ? `?${qs.toString()}` : ""}`);
+}
+
+export async function getLabActions(labID: string, query: Record<string, string | number | undefined> = {}): Promise<{ items: ResponseActionView[]; count: number; total: number; from: number; to: number; source: string }> {
+  const qs = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) {
+    if (value !== undefined && value !== null && String(value).trim() !== "") {
+      qs.set(key, String(value));
+    }
+  }
+  return apiFetch(`/api/labs/${encodeURIComponent(labID)}/actions${qs.toString() ? `?${qs.toString()}` : ""}`);
+}
+
 export async function postInfrastructureEveNodeAction(
   nodeID: string,
   action: "start" | "stop" | "wipe"
@@ -535,7 +585,7 @@ export async function getArtifacts(
   return apiFetch(`/api/artifacts?${qs.toString()}`);
 }
 
-export async function getAdminUsers(): Promise<{ items: Array<{ username: string; role: string; disabled: boolean }>; count: number }> {
+export async function getAdminUsers(): Promise<{ items: AdminUser[]; count: number }> {
   return apiFetch("/api/users");
 }
 
@@ -597,7 +647,14 @@ export async function applyModelProposal(
   });
 }
 
-export async function upsertAdminUser(payload: { username: string; role: string; disabled?: boolean; password?: string }): Promise<{ ok: boolean }> {
+export async function upsertAdminUser(payload: {
+  username: string;
+  role: string;
+  disabled?: boolean;
+  password?: string;
+  email?: string;
+  notifications_enabled?: boolean;
+}): Promise<{ ok: boolean }> {
   return apiFetch("/api/users", {
     method: "POST",
     body: JSON.stringify(payload)

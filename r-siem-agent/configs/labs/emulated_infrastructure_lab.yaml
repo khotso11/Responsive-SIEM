@@ -3,12 +3,12 @@ provider:
   name: rsiem-eve-ng-lab
   ui_url: http://192.168.59.128/
   api_base_url: http://192.168.59.128
-  api_lab_path: /R-SIEM/rsiem-infrastructure.unl
+  api_lab_path: /R-SIEM.unl
   username_env: RSIEM_EVE_NG_USERNAME
   password_env: RSIEM_EVE_NG_PASSWORD
   allow_insecure_tls: false
   project_path: /opt/unetlab/labs/R-SIEM/
-  lab_file: /opt/unetlab/labs/R-SIEM/rsiem-infrastructure.unl
+  lab_file: /opt/unetlab/labs/R-SIEM.unl
   topology_import_path: eve_ng_rsiem_infrastructure.unl
   notes: >-
     EVE-NG is the emulated lab source of truth. R-SIEM imports the lab topology file

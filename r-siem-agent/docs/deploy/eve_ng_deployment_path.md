@@ -91,7 +91,7 @@ ip -4 addr show | grep '192.168.59.'
 
 ```bash
 cd ~/projects/r-siem-agent
-REAL_SYSTEM=1 UI_WEB_PORT=3100 ./scripts/demo_local_endpoint_clean_start.sh
+REAL_SYSTEM=1 UI_WEB_PORT=3200 ./scripts/demo_local_endpoint_clean_start.sh
 ```
 
 7. Validate the integration:

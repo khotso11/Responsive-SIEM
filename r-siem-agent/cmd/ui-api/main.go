@@ -20,6 +20,7 @@ import (
 	"net"
 	"net/http"
 	"net/mail"
+	"net/smtp"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -105,6 +106,30 @@ type serverConfig struct {
 	SessionSecret  string
 }
 
+type mailSettings struct {
+	Enabled          bool
+	Provider         string
+	SMTPHost         string
+	SMTPPort         int
+	SMTPUser         string
+	SMTPPass         string
+	SMTPFrom         string
+	UIBaseURL        string
+	SubjectPrefix    string
+	PollInterval     time.Duration
+	StatePath        string
+	RequireFASTLane  bool
+}
+
+type notificationManager struct {
+	app      *app
+	logger   *slog.Logger
+	settings mailSettings
+
+	mu   sync.Mutex
+	sent map[string]int64
+}
+
 type app struct {
 	cfg    serverConfig
 	logger *slog.Logger
@@ -131,6 +156,10 @@ type app struct {
 	assetByNodeID      map[string]assetInventoryEntry
 	assetByTargetAgent map[string]assetInventoryEntry
 	identityByUser     map[string]identityInventoryEntry
+}
+
+type approvalNotificationState struct {
+	Sent map[string]int64 `json:"sent"`
 }
 
 type assetInventoryEntry struct {
@@ -1127,14 +1156,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	mailSettings := loadMailSettings()
+	mailSettings := loadMailSettings(cfg)
 	notifier, nErr := newNotificationManager(a, logger, mailSettings)
 	if nErr != nil {
 		logger.Warn("ui_notifications_unavailable", slog.String("error", nErr.Error()))
 	} else if notifier != nil {
 		go notifier.Run(context.Background())
 	}
-
 	if cfg.DBDSN != "" {
 		db, dErr := sql.Open("postgres", cfg.DBDSN)
 		if dErr == nil {
@@ -1244,6 +1272,250 @@ func main() {
 		logger.Error("ui_api_stopped", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
+}
+
+func loadMailSettings(cfg serverConfig) mailSettings {
+	enabled := boolEnv("RSIEM_MAIL_ENABLED", false)
+	provider := strings.ToLower(strings.TrimSpace(os.Getenv("RSIEM_MAIL_PROVIDER")))
+	if provider == "" {
+		provider = "smtp"
+	}
+	host := strings.TrimSpace(os.Getenv("RSIEM_SMTP_HOST"))
+	port := int(parseInt64(os.Getenv("RSIEM_SMTP_PORT"), 0))
+	user := strings.TrimSpace(os.Getenv("RSIEM_SMTP_USER"))
+	pass := strings.TrimSpace(os.Getenv("RSIEM_SMTP_PASS"))
+	from := strings.TrimSpace(os.Getenv("RSIEM_SMTP_FROM"))
+	if provider == "gmail" {
+		if host == "" {
+			host = "smtp.gmail.com"
+		}
+		if port == 0 {
+			port = 587
+		}
+		if user == "" {
+			user = from
+		}
+	}
+	if port == 0 {
+		port = 587
+	}
+	uiBaseURL := strings.TrimSpace(os.Getenv("RSIEM_UI_BASE_URL"))
+	if uiBaseURL == "" {
+		uiBaseURL = "http://127.0.0.1:3200"
+	}
+	subjectPrefix := strings.TrimSpace(os.Getenv("RSIEM_MAIL_SUBJECT_PREFIX"))
+	if subjectPrefix == "" {
+		subjectPrefix = "[R-SIEM]"
+	}
+	pollSeconds := parseInt64(os.Getenv("RSIEM_MAIL_POLL_SECONDS"), 15)
+	if pollSeconds <= 0 {
+		pollSeconds = 15
+	}
+	return mailSettings{
+		Enabled:         enabled,
+		Provider:        provider,
+		SMTPHost:        host,
+		SMTPPort:        port,
+		SMTPUser:        user,
+		SMTPPass:        pass,
+		SMTPFrom:        from,
+		UIBaseURL:       strings.TrimRight(uiBaseURL, "/"),
+		SubjectPrefix:   subjectPrefix,
+		PollInterval:    time.Duration(pollSeconds) * time.Second,
+		StatePath:       filepath.Join(cfg.RetainedRoot, cfg.UIStateDir, "approval_notifications.json"),
+		RequireFASTLane: !boolEnv("RSIEM_MAIL_NOTIFY_ALL_APPROVALS", false),
+	}
+}
+
+func newNotificationManager(app *app, logger *slog.Logger, settings mailSettings) (*notificationManager, error) {
+	if !settings.Enabled {
+		return nil, nil
+	}
+	if strings.TrimSpace(settings.SMTPHost) == "" {
+		return nil, fmt.Errorf("smtp host is required")
+	}
+	if settings.SMTPPort <= 0 {
+		return nil, fmt.Errorf("smtp port is required")
+	}
+	if strings.TrimSpace(settings.SMTPFrom) == "" {
+		return nil, fmt.Errorf("smtp from is required")
+	}
+	if strings.TrimSpace(settings.SMTPUser) == "" {
+		return nil, fmt.Errorf("smtp user is required")
+	}
+	if strings.TrimSpace(settings.SMTPPass) == "" {
+		return nil, fmt.Errorf("smtp password is required")
+	}
+	m := &notificationManager{
+		app:      app,
+		logger:   logger,
+		settings: settings,
+		sent:     map[string]int64{},
+	}
+	if err := m.loadState(); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func (m *notificationManager) Run(ctx context.Context) {
+	m.scanAndSend()
+	ticker := time.NewTicker(m.settings.PollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.scanAndSend()
+		}
+	}
+}
+
+func (m *notificationManager) scanAndSend() {
+	runs, stepsByRun, _ := m.app.loadState()
+	recipients := m.recipientEmails()
+	if len(recipients) == 0 {
+		return
+	}
+	for _, run := range runs {
+		if strings.ToUpper(strings.TrimSpace(run.Status)) != "WAITING_APPROVAL" {
+			continue
+		}
+		lane := m.app.deriveLane(run, stepsByRun[run.RunID])
+		if m.settings.RequireFASTLane && !strings.EqualFold(strings.TrimSpace(lane), "FAST") {
+			continue
+		}
+		if run.ApprovalRequestedAtMs <= 0 {
+			continue
+		}
+		key := fmt.Sprintf("%s:%d", strings.TrimSpace(run.RunID), run.ApprovalRequestedAtMs)
+		if m.wasSent(key) {
+			continue
+		}
+		if err := m.sendApprovalEmail(run, lane, recipients); err != nil {
+			m.logger.Warn("ui_approval_email_failed", slog.String("run_id", run.RunID), slog.String("error", err.Error()))
+			continue
+		}
+		m.markSent(key, time.Now().UnixMilli())
+		m.logger.Info("ui_approval_email_sent", slog.String("run_id", run.RunID), slog.String("lane", lane), slog.Int("recipients", len(recipients)))
+	}
+}
+
+func (m *notificationManager) recipientEmails() []string {
+	m.app.usersMu.RLock()
+	defer m.app.usersMu.RUnlock()
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(m.app.users))
+	for _, user := range m.app.users {
+		if user.Disabled || !user.NotificationEnabled {
+			continue
+		}
+		email := strings.ToLower(strings.TrimSpace(user.Email))
+		if email == "" {
+			continue
+		}
+		if _, ok := seen[email]; ok {
+			continue
+		}
+		seen[email] = struct{}{}
+		out = append(out, email)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (m *notificationManager) sendApprovalEmail(run incident, lane string, recipients []string) error {
+	hostPort := net.JoinHostPort(m.settings.SMTPHost, strconv.Itoa(m.settings.SMTPPort))
+	auth := smtp.PlainAuth("", m.settings.SMTPUser, m.settings.SMTPPass, m.settings.SMTPHost)
+	for _, recipient := range recipients {
+		body := m.formatApprovalEmail(run, lane, recipient)
+		if err := smtp.SendMail(hostPort, auth, m.settings.SMTPFrom, []string{recipient}, []byte(body)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *notificationManager) formatApprovalEmail(run incident, lane, recipient string) string {
+	subject := fmt.Sprintf("%s FAST approval required: %s", m.settings.SubjectPrefix, strings.TrimSpace(run.RunID))
+	incidentURL := fmt.Sprintf("%s/incidents/%s", m.settings.UIBaseURL, url.PathEscape(strings.TrimSpace(run.RunID)))
+	severity := chooseNonEmpty(strings.ToUpper(strings.TrimSpace(run.Severity)), "UNKNOWN")
+	target := chooseNonEmpty(strings.TrimSpace(run.Target), strings.TrimSpace(run.DstIP))
+	userValue := chooseNonEmpty(strings.TrimSpace(run.User), "-")
+	nodeValue := chooseNonEmpty(strings.TrimSpace(run.NodeID), "-")
+	ruleValue := chooseNonEmpty(strings.TrimSpace(run.RuleID), "-")
+	playbookValue := chooseNonEmpty(strings.TrimSpace(run.PlaybookID), "-")
+	policyReason := chooseNonEmpty(strings.TrimSpace(run.ApprovalPolicyReason), "FAST approval requested by policy")
+	return strings.Join([]string{
+		fmt.Sprintf("To: %s", recipient),
+		fmt.Sprintf("From: %s", m.settings.SMTPFrom),
+		fmt.Sprintf("Subject: %s", subject),
+		"MIME-Version: 1.0",
+		"Content-Type: text/plain; charset=UTF-8",
+		"",
+		"R-SIEM approval required.",
+		"",
+		fmt.Sprintf("Run ID: %s", run.RunID),
+		fmt.Sprintf("Lane: %s", chooseNonEmpty(strings.ToUpper(strings.TrimSpace(lane)), "FAST")),
+		fmt.Sprintf("Status: %s", run.Status),
+		fmt.Sprintf("Severity: %s", severity),
+		fmt.Sprintf("Rule: %s", ruleValue),
+		fmt.Sprintf("Playbook: %s", playbookValue),
+		fmt.Sprintf("Node: %s", nodeValue),
+		fmt.Sprintf("User: %s", userValue),
+		fmt.Sprintf("Target: %s", chooseNonEmpty(target, "-")),
+		fmt.Sprintf("Reason: %s", policyReason),
+		"",
+		fmt.Sprintf("Open incident: %s", incidentURL),
+		"",
+		"Approve or reject this FAST-lane response from the incident view.",
+		"",
+	}, "\r\n")
+}
+
+func (m *notificationManager) loadState() error {
+	data, err := os.ReadFile(m.settings.StatePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	var state approvalNotificationState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return err
+	}
+	if state.Sent != nil {
+		m.sent = state.Sent
+	}
+	return nil
+}
+
+func (m *notificationManager) saveState() error {
+	state := approvalNotificationState{Sent: m.sent}
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(m.settings.StatePath), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(m.settings.StatePath, append(data, '\n'), 0o644)
+}
+
+func (m *notificationManager) wasSent(key string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.sent[key]
+	return ok
+}
+
+func (m *notificationManager) markSent(key string, sentAt int64) {
+	m.mu.Lock()
+	m.sent[key] = sentAt
+	_ = m.saveState()
+	m.mu.Unlock()
 }
 
 func loadROESettings(path string) (approvalsSubject string, natsURL string) {
@@ -5681,7 +5953,7 @@ func (a *app) handleHoneypotProfile(w http.ResponseWriter, r *http.Request) {
 		PlaybookID:            "PB-DECEPTION-HONEYPOT-TRIAGE",
 		EscalationPlaybookID:  "PB-DECEPTION-HONEYPOT-SOURCE-CONTAIN",
 		VerifyScript:          "./scripts/verify_fr04.sh",
-		StartCommand:          "START_HONEYPOT=1 REAL_SYSTEM=1 UI_WEB_PORT=3100 ./scripts/demo_local_endpoint_clean_start.sh",
+		StartCommand:          "START_HONEYPOT=1 REAL_SYSTEM=1 UI_WEB_PORT=3200 ./scripts/demo_local_endpoint_clean_start.sh",
 		ProbeCommand:          "curl -sS -o /dev/null -H 'X-RSIEM-Source-IP: 10.66.12.250' -H 'Content-Type: application/x-www-form-urlencoded' --data 'username=honeypot-admin&password=bad' http://127.0.0.1:18081/admin/login?probe=demo",
 		Source:                "config",
 	}
@@ -6295,6 +6567,18 @@ func (a *app) handleArtifacts(w http.ResponseWriter, r *http.Request) {
 	}
 	st, err := os.Stat(path)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"items":     []map[string]any{},
+				"count":     0,
+				"total":     0,
+				"page":      page,
+				"limit":     limit,
+				"has_more":  false,
+				"scan_path": filepath.ToSlash(prefix),
+			})
+			return
+		}
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "prefix not found"})
 		return
 	}
@@ -8157,6 +8441,18 @@ func parseInt64(s string, fallback int64) int64 {
 		return ts.UnixMilli()
 	}
 	return fallback
+}
+
+func boolEnv(name string, fallback bool) bool {
+	value := strings.TrimSpace(strings.ToLower(os.Getenv(name)))
+	switch value {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return fallback
+	}
 }
 
 func parseWindowMs(s string, fallback time.Duration) int64 {

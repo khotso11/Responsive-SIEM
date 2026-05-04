@@ -48,7 +48,7 @@ This is used by the email notification subsystem to determine who receives secur
 Expected output:
 
 - `PASS: FR-06 UI services started`
-- `UI_WEB_URL=http://127.0.0.1:3000`
+- `UI_WEB_URL=http://127.0.0.1:3200`
 - `UI_API_URL=http://127.0.0.1:8090`
 
 ## Stop
@@ -84,7 +84,7 @@ RSIEM_MAIL_PROVIDER=smtp \
 RSIEM_SMTP_HOST=127.0.0.1 \
 RSIEM_SMTP_PORT=1025 \
 RSIEM_SMTP_FROM=alerts@rsiem.local \
-RSIEM_UI_BASE_URL=http://127.0.0.1:3100 \
+RSIEM_UI_BASE_URL=http://127.0.0.1:3200 \
 RSIEM_MAIL_DEV_SINK=true \
 go run ./cmd/ui-api
 ```

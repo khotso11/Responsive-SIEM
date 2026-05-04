@@ -87,7 +87,7 @@ Optional integration with the local endpoint demo start:
 
 ```bash
 cd ~/projects/r-siem-agent
-START_HONEYPOT=1 REAL_SYSTEM=1 UI_WEB_PORT=3100 ./scripts/demo_local_endpoint_clean_start.sh
+START_HONEYPOT=1 REAL_SYSTEM=1 UI_WEB_PORT=3200 ./scripts/demo_local_endpoint_clean_start.sh
 ```
 
 ## Verifying It

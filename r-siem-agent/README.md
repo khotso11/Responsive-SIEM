@@ -1,9 +1,35 @@
-# R-SIEM Agent
+# R-SIEM
 
 ## Project Overview
 R-SIEM is a response-capable SIEM pipeline built around deterministic ingestion, detection, approval-gated response orchestration, and proof-driven verification. This repository is evidence-first: delivery is validated by running canonical verifier scripts, checking required `PASS:` lines, and collecting machine-readable proof artifacts under `demo_artifacts/<timestamp>/...`.
 
-The current implementation includes telemetry collectors (tail/syslog/netflow/snmp trap), detector rules/correlation proofs, ROE response workflows, mTLS and key-management proofs, retention/query/export proofs, signing/rotation proofs, and optional Timescale-backed store proofs used by FR-01/FR-02 acceptance scripts.
+The current implementation includes:
+
+- telemetry collectors for tail, syslog, NetFlow v5, SNMP trap, auditd, inotify, `/proc/net`, and DNS
+- endpoint agent transport with batching, WAL durability, and gRPC mTLS delivery
+- detector rules, incident creation, and response orchestration
+- analyst and admin UI workflows through `cmd/ui-api` and `ui/`
+- retention, export, signing, rotation, and evidence-backed verifier scripts
+
+## Core Manuals
+
+For consolidated operational documentation, use:
+
+- `docs/system_manual.md`
+- `docs/system_testing_manual.md`
+
+These two documents are the recommended starting point for:
+
+- system setup and daily operation
+- live-demo preparation
+- functional verification and evidence capture
+
+Additional public-facing references:
+
+- `docs/deploy/master_setup.md`
+- `docs/deploy/linux_endpoint_setup.md`
+- `docs/deploy/windows_endpoint_setup.md`
+- `docs/fr06_ui.md`
 
 ## High-Level Architecture & Data Flow
 ```text
@@ -24,10 +50,18 @@ Key components:
 - `cmd/collector-syslog`
 - `cmd/collector-netflowv5`
 - `cmd/collector-snmptrap`
+- `cmd/collector-auditd`
+- `cmd/collector-inotify`
+- `cmd/collector-procnet`
+- `cmd/collector-dns`
 - `cmd/detector-v0`
+- `cmd/master`
+- `cmd/master-consume`
 - `cmd/master-roe`
 - `cmd/master-roe-worker`
 - `cmd/agent`
+- `cmd/ui-api`
+- `ui/`
 - `cmd/retention-query`
 - `scripts/db_up.sh` / `scripts/db_down.sh` (Timescale Docker for DB proofs)
 
@@ -46,6 +80,12 @@ Evidence locations:
 - `jq`
 - `openssl` (FR-02 TLS proof)
 - `tcpdump` (FR-04 and FR-02 TLS pcap proof)
+- `systemd` for Linux endpoint service flows
+
+Optional but commonly used for live endpoint and demo proofs:
+
+- `nmap`
+- `openssh-server`
 
 ### Start/Stop Stack
 ```bash
@@ -57,6 +97,21 @@ cd ~/projects/r-siem-agent
 Notes:
 - `demo_up.sh` expects NATS reachable on `127.0.0.1:4222`.
 - Proof scripts write logs and artifacts deterministically; do not delete active artifacts mid-run.
+
+### Start/Stop UI
+
+```bash
+./scripts/ui_up.sh
+./scripts/ui_down.sh
+```
+
+Expected startup output:
+
+```text
+PASS: FR-06 UI services started
+UI_WEB_URL=http://127.0.0.1:3200
+UI_API_URL=http://127.0.0.1:8090
+```
 
 ## Proof-Driven Workflow
 Definition of done for each FR proof:
@@ -162,7 +217,7 @@ Run:
 
 Expected lines:
 ```text
-PASS: FR-04 deception+pcap+chain_of_custody completed
+PASS: FR-04 live honeypot+pcap+chain_of_custody completed
 FR04_PROOF_JSON=demo_artifacts/.../fr04/fr04_proof.json
 ```
 
@@ -253,9 +308,27 @@ Example retention query:
 go run -mod=vendor ./cmd/retention-query query --type runs --status FAILED_SAFE --format jsonl
 ```
 
-### FR-06 — Frontend (NOT IMPLEMENTED IN THIS REPO)
-- FR-06 UI/dashboard scope is not delivered in this backend repository.
-- Submission scope here is backend pipeline + deterministic proofs.
+### FR-06 — SOC UI + API (COMPLETE)
+Run:
+```bash
+./scripts/ui_up.sh
+./scripts/verify_fr06_ui_smoke.sh
+```
+
+Expected lines:
+```text
+PASS: FR-06 UI services started
+PASS: FR-06 UI smoke completed
+FR06_UI_PROOF_JSON=demo_artifacts/.../fr06_ui/fr06_ui_proof.json
+```
+
+Proof artifact key(s):
+- `FR06_UI_PROOF_JSON=...`
+
+UI/API reference:
+- `cmd/ui-api`
+- `ui/`
+- `docs/fr06_ui.md`
 
 ## Full End-to-End Demo (One Command)
 Run:
@@ -320,6 +393,10 @@ pkill -f 'master-roe|master-roe-worker|detector-v0|collector-tail|agent' || true
 ### Safe cleanup guidance
 - Do not remove active `demo_artifacts/<timestamp>/...` during a running proof.
 - Prefer creating new runs and preserving prior artifacts for audit traceability.
+
+### UI ports
+- The current default UI web port is `3200`.
+- The current default UI API address is `127.0.0.1:8090`.
 
 ## Repo Navigation
 - Commands/binaries: `cmd/*`

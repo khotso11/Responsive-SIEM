@@ -4,21 +4,21 @@
       "username": "admin",
       "password_hash": "$2a$10$Yl6dBZwH3Imo0mT6hFmz.Ovt/ND2NsU7b7K7ANGMXQhOqc5WO0wKi",
       "role": "admin",
-      "email": "mkhotso835@gmail.com",
+      "email": "mkhotso3@gmail.com",
       "notifications_enabled": true
     },
     {
       "username": "analyst",
       "password_hash": "$2a$10$ZpeNToBT9gVPF5rbkX.FvejpvT1PDY8BHGa78pZeENffRMBbbuKwO",
       "role": "analyst",
-      "email": "mkhotso837@gmail.com",
+      "email": "mkhotso2@gmail.com",
       "notifications_enabled": true
     },
     {
       "username": "khotso",
       "password_hash": "$2a$10$ao4LRRJUAf4agO6bEg48teyc0Lbjs7c0AJJSGy8ISPzoIwAFm683O",
       "role": "admin",
-      "email": "mkhotso835@gmail.com",
+      "email": "mkhotso1@gmail.com",
       "notifications_enabled": true
     },
     {

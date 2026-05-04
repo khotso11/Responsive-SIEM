@@ -10,7 +10,7 @@ Expected output:
 
 ```text
 PASS: FR-06 UI services started
-UI_WEB_URL=http://127.0.0.1:3000
+UI_WEB_URL=http://127.0.0.1:3200
 UI_API_URL=http://127.0.0.1:8090
 ```
 

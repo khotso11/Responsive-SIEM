@@ -24,7 +24,7 @@ echo "[1/7] ensure stack"
 
 echo "[2/7] restart ui"
 ./scripts/ui_down.sh >/dev/null 2>&1 || true
-UI_WEB_PORT="${UI_WEB_PORT:-3100}"
+UI_WEB_PORT="${UI_WEB_PORT:-3200}"
 UI_UP_OUT="$(UI_WEB_PORT="$UI_WEB_PORT" ./scripts/ui_up.sh)"
 printf '%s\n' "$UI_UP_OUT" > "$ART_DIR/ui_up.out"
 

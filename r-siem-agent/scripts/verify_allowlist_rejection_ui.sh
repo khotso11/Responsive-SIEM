@@ -6,7 +6,7 @@ cd "$ROOT_DIR"
 
 NATS_URL="${NATS_URL:-nats://127.0.0.1:4222}"
 UI_API_URL="${UI_API_URL:-http://127.0.0.1:8090}"
-UI_WEB_URL="${UI_WEB_URL:-http://127.0.0.1:3100}"
+UI_WEB_URL="${UI_WEB_URL:-http://127.0.0.1:3200}"
 EXPECTED_DENY_RULE="${EXPECTED_DENY_RULE:-deny_proc_first_seen_other_agent_commands}"
 TEMP_CONFIG="${TEMP_CONFIG:-tmp/master_lan_db.allowlist_reject.yaml}"
 PROCESS_WAIT_SECS="${PROCESS_WAIT_SECS:-6}"

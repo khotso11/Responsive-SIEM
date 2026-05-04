@@ -16,7 +16,7 @@ for cmd in curl jq rg sudo; do
 done
 
 UI_API_URL="${UI_API_URL:-http://127.0.0.1:8090}"
-UI_WEB_URL="${UI_WEB_URL:-http://127.0.0.1:3100}"
+UI_WEB_URL="${UI_WEB_URL:-http://127.0.0.1:3200}"
 OUTBOUND_URL="${OUTBOUND_URL:-https://example.com}"
 SLEEP_AFTER_EVENT_SEC="${SLEEP_AFTER_EVENT_SEC:-3}"
 INCIDENT_LIMIT="${INCIDENT_LIMIT:-50}"

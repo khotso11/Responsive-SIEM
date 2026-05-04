@@ -72,9 +72,11 @@ export default function AuditPage() {
   const [typeFilter, setTypeFilter] = useState("");
 
   const [authUser, setAuthUser] = useState<AuthUser | null>(null);
-  const [users, setUsers] = useState<Array<{ username: string; role: string; disabled: boolean }>>([]);
+  const [users, setUsers] = useState<Array<{ username: string; role: string; email?: string; notifications_enabled?: boolean; disabled: boolean }>>([]);
   const [newUser, setNewUser] = useState("new.analyst");
   const [newRole, setNewRole] = useState("analyst");
+  const [newEmail, setNewEmail] = useState("");
+  const [newNotificationsEnabled, setNewNotificationsEnabled] = useState(false);
   const [newPass, setNewPass] = useState("");
   const [userMsg, setUserMsg] = useState("");
   const [pendingDeleteUser, setPendingDeleteUser] = useState<string | null>(null);
@@ -178,10 +180,19 @@ export default function AuditPage() {
 
   const createUser = async () => {
     try {
-      await upsertAdminUser({ username: newUser.trim(), role: newRole, password: newPass.trim(), disabled: false });
+      await upsertAdminUser({
+        username: newUser.trim(),
+        role: newRole,
+        password: newPass.trim(),
+        email: newEmail.trim(),
+        notifications_enabled: newNotificationsEnabled,
+        disabled: false,
+      });
       setUserMsg(`User upserted: ${newUser.trim()}`);
       pushToast("success", `User saved: ${newUser.trim()}`);
       setNewPass("");
+      setNewEmail("");
+      setNewNotificationsEnabled(false);
       const userRes = await getAdminUsers();
       setUsers(userRes.items || []);
     } catch (e) {
@@ -329,13 +340,22 @@ export default function AuditPage() {
       {authUser?.role === "admin" ? (
         <div className="panel-elevated space-y-3 p-4">
           <h3 className="text-[16px] font-semibold">User Management (Admin)</h3>
-          <div className="grid grid-cols-1 gap-2 md:grid-cols-4">
+          <div className="grid grid-cols-1 gap-2 md:grid-cols-6">
             <input className="input-field" value={newUser} onChange={(e) => setNewUser(e.target.value)} placeholder="username" />
             <select className="select-field" value={newRole} onChange={(e) => setNewRole(e.target.value)}>
               <option value="analyst">analyst</option>
               <option value="admin">admin</option>
             </select>
+            <input className="input-field" value={newEmail} onChange={(e) => setNewEmail(e.target.value)} placeholder="email@example.com" />
             <input className="input-field" type="password" value={newPass} onChange={(e) => setNewPass(e.target.value)} placeholder="password" />
+            <label className="flex items-center gap-2 rounded border border-ink-700 bg-ink-950/60 px-3 py-2 text-sm text-ink-200">
+              <input
+                type="checkbox"
+                checked={newNotificationsEnabled}
+                onChange={(e) => setNewNotificationsEnabled(e.target.checked)}
+              />
+              Notifications
+            </label>
             <button className="btn-primary" onClick={createUser}>Create/Update</button>
           </div>
           {userMsg ? <div className="rounded bg-ink-900 px-2 py-2 text-xs text-ink-300">{userMsg}</div> : null}
@@ -346,6 +366,8 @@ export default function AuditPage() {
                 <tr>
                   <th className="table-head p-2">Username</th>
                   <th className="table-head p-2">Role</th>
+                  <th className="table-head p-2">Email</th>
+                  <th className="table-head p-2">Notifications</th>
                   <th className="table-head p-2">Disabled</th>
                   <th className="table-head p-2">Actions</th>
                 </tr>
@@ -355,6 +377,8 @@ export default function AuditPage() {
                   <tr key={u.username} className="border-t border-ink-800/80">
                     <td className="p-2">{u.username}</td>
                     <td className="p-2">{u.role}</td>
+                    <td className="p-2">{u.email || "-"}</td>
+                    <td className="p-2">{u.notifications_enabled ? "enabled" : "off"}</td>
                     <td className="p-2">{u.disabled ? "yes" : "no"}</td>
                     <td className="p-2">
                       <button className="btn-danger px-2 py-1 text-xs disabled:opacity-50" disabled={u.disabled} onClick={() => disableSelectedUser(u.username)}>

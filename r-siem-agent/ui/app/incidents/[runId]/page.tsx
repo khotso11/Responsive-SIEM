@@ -39,10 +39,14 @@ export default function IncidentDetailPage({ params }: { params: { runId: string
       const ev = await getIncidentEvents(runID, { windowSeconds: 900 });
       setEvents(ev.items || []);
       const collected: Array<{ path: string; is_dir: boolean; size: number; modified: string }> = [];
-      for (let p = 1; p <= 3; p++) {
-        const art = await getArtifacts("demo_artifacts", { q: "/fr04/", page: p, limit: 200 });
-        collected.push(...(art.items || []));
-        if (!art.has_more) break;
+      try {
+        for (let p = 1; p <= 3; p++) {
+          const art = await getArtifacts("demo_artifacts", { q: "/fr04/", page: p, limit: 200 });
+          collected.push(...(art.items || []));
+          if (!art.has_more) break;
+        }
+      } catch {
+        // Artifact proofs are optional; do not fail the page if the folder is missing.
       }
       setArtifacts(collected.filter((a) => a.path.includes("/fr04/") || a.path.endsWith("chain_of_custody.json") || a.path.endsWith("capture.pcap")));
     } catch (e) {

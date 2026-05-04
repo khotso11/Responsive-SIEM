@@ -457,10 +457,14 @@ export function IncidentDrawer({
       });
       setEvents(ev.items || []);
       const collected: Array<{ path: string; is_dir: boolean; size: number; modified: string }> = [];
-      for (let p = 1; p <= 3; p++) {
-        const art = await getArtifacts("demo_artifacts", { q: "/fr04/", page: p, limit: 200 });
-        collected.push(...(art.items || []));
-        if (!art.has_more) break;
+      try {
+        for (let p = 1; p <= 3; p++) {
+          const art = await getArtifacts("demo_artifacts", { q: "/fr04/", page: p, limit: 200 });
+          collected.push(...(art.items || []));
+          if (!art.has_more) break;
+        }
+      } catch {
+        // Artifact proofs are optional; keep the investigation workspace available.
       }
       setArtifactMap(
         collected.filter((a) => a.path.includes("/fr04/") || a.path.endsWith("capture.pcap") || a.path.endsWith("chain_of_custody.json"))

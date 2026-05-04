@@ -6,7 +6,7 @@ CATALOG_PATH="$ROOT_DIR/scripts/adversary_emulation_catalog.json"
 cd "$ROOT_DIR"
 
 NATS_URL="${NATS_URL:-nats://127.0.0.1:4222}"
-UI_BASE_URL="${UI_BASE_URL:-http://127.0.0.1:3100}"
+UI_BASE_URL="${UI_BASE_URL:-http://127.0.0.1:3200}"
 APPROVAL_ACTOR="${APPROVAL_ACTOR:-adversary_harness}"
 HOST_NODE_ID="${HOST_NODE_ID:-$(hostname)}"
 ARTIFACTS_ROOT_DEFAULT="$ROOT_DIR/retained/reports/adversary_emulation"

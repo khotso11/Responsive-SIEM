@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 UI_API_ADDR="${UI_API_ADDR:-127.0.0.1:8090}"
-UI_WEB_PORT="${UI_WEB_PORT:-3000}"
+UI_WEB_PORT="${UI_WEB_PORT:-3200}"
 
 stop_pid() {
   local name="$1" pid_file="$2"
